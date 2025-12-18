@@ -1,24 +1,46 @@
 # Medical RAG Pipeline Dependencies
 # Python 3.10+ required
 
-# Qdrant Vector Database
+# =============================================================================
+# Vector Database
+# =============================================================================
 qdrant-client>=1.7.0
 
+# =============================================================================
+# LLM & Embeddings
+# =============================================================================
+openai>=1.0.0                    # OpenRouter client
+cohere>=5.0.0                    # Cohere reranking
+
+# =============================================================================
 # Data Processing
-lxml>=4.9.0
-tqdm>=4.65.0
-requests>=2.31.0
+# =============================================================================
+lxml>=4.9.0                      # XML parsing
+tqdm>=4.65.0                     # Progress bars
+requests>=2.31.0                 # HTTP client
+pandas>=2.0.0                    # DataFrames
+anyascii>=0.3.0                  # Unicode normalization
 
-# Environment Configuration
-python-dotenv>=1.0.0
+# =============================================================================
+# API Server
+# =============================================================================
+fastapi>=0.100.0                 # API framework
+uvicorn>=0.23.0                  # ASGI server
+pydantic>=2.0.0                  # Data validation
 
-# XML Processing (included in standard library, but specifying for clarity)
-# xml.etree.ElementTree is built-in
+# =============================================================================
+# Configuration
+# =============================================================================
+python-dotenv>=1.0.0             # Environment variables
+PyYAML>=6.0                      # YAML parsing
 
-# Optional: For enhanced XML parsing with getparent/getprevious
-# lxml is used for table extraction with context
+# =============================================================================
+# Optional: Local Embeddings (if not using Cloud Inference)
+# =============================================================================
+# sentence-transformers>=2.2.0   # Local embedding models
+# torch>=2.0.0                   # PyTorch backend
 
-# AWS CLI should be installed separately:
-# pip install awscli
-# or: brew install awscli (macOS)
-
+# =============================================================================
+# Optional: SPLADE Sparse Vectors
+# =============================================================================
+# transformers>=4.30.0           # SPLADE model loading
