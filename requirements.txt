@@ -1,0 +1,24 @@
+# Medical RAG Pipeline Dependencies
+# Python 3.10+ required
+
+# Qdrant Vector Database
+qdrant-client>=1.7.0
+
+# Data Processing
+lxml>=4.9.0
+tqdm>=4.65.0
+requests>=2.31.0
+
+# Environment Configuration
+python-dotenv>=1.0.0
+
+# XML Processing (included in standard library, but specifying for clarity)
+# xml.etree.ElementTree is built-in
+
+# Optional: For enhanced XML parsing with getparent/getprevious
+# lxml is used for table extraction with context
+
+# AWS CLI should be installed separately:
+# pip install awscli
+# or: brew install awscli (macOS)
+
