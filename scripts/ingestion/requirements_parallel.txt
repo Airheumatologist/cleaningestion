@@ -1,0 +1,11 @@
+# Additional requirements for parallel processing scripts
+
+# For parallel abstract download
+aiohttp>=3.9.0  # Async HTTP client for parallel API requests
+
+# Already in main requirements:
+# qdrant-client>=1.7.0
+# torch>=2.0.0  # For SPLADE
+# transformers>=4.30.0  # For SPLADE
+# sentence-transformers>=2.2.0  # For local embeddings (fallback)
+
