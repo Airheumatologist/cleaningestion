@@ -283,7 +283,6 @@ class MedicalQdrantClient:
                         "pmid": hit.payload.get("pmid"),
                         "title": hit.payload.get("title"),
                         "abstract": hit.payload.get("abstract"),
-                        "full_text": hit.payload.get("full_text", ""),
                         "journal": hit.payload.get("journal"),
                         "year": hit.payload.get("year"),
                         "article_type": hit.payload.get("article_type"),

@@ -10,9 +10,10 @@ Implements retrieval from Qdrant Vector Database with:
 
 import logging
 from abc import ABC, abstractmethod
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue, Range, SparseVector, IsNullCondition
+from qdrant_client.models import Filter, FieldCondition, MatchValue, Range, SparseVector
 from qdrant_client.http.models import Document
 
 from .config import QDRANT_URL, QDRANT_API_KEY, COLLECTION_NAME, SCORE_THRESHOLD, EMBEDDING_MODEL, QDRANT_CLOUD_INFERENCE
@@ -71,8 +72,8 @@ class QdrantRetriever(AbstractRetriever):
     
     def __init__(
         self,
-        n_retrieval: int = 100,
-        n_keyword_search: int = 20,
+        n_retrieval: int = 150,
+        n_keyword_search: int = 30,
         score_threshold: float = SCORE_THRESHOLD
     ):
         """
@@ -277,7 +278,7 @@ class QdrantRetriever(AbstractRetriever):
                 # DailyMed schema mapping
                 passage = self._transform_dailymed_payload(point.payload, point.score)
             else:
-                # Standard PMC schema
+                # Standard PMC schema - abstracts only (no full text)
                 passage = {
                     "corpus_id": point.payload.get("pmcid", ""),
                     "pmcid": point.payload.get("pmcid", ""),
@@ -285,8 +286,7 @@ class QdrantRetriever(AbstractRetriever):
                     "title": point.payload.get("title", ""),
                     "text": point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
-                    "full_text": point.payload.get("full_text", ""),
-                    "section_title": "abstract",  # Primary section
+                    "section_title": "abstract",
                     "journal": point.payload.get("journal", ""),
                     "venue": point.payload.get("journal", ""),
                     "year": point.payload.get("year"),
@@ -295,11 +295,6 @@ class QdrantRetriever(AbstractRetriever):
                     "score": point.score,
                     "stype": "vector_search"
                 }
-
-                # Add full text as additional passage if available
-                if passage["full_text"] and len(passage["full_text"]) > 500:
-                    passage["text"] = passage["full_text"][:2000]  # Truncate for processing
-                    passage["section_title"] = "full_text"
 
             passages.append(passage)
 
@@ -445,6 +440,7 @@ class QdrantRetriever(AbstractRetriever):
                 passage["sparse_score"] = sparse_scores.get(pmcid, 0)
                 passage["stype"] = "hybrid_search"
             else:
+                # Standard PMC schema - abstracts only (no full text)
                 passage = {
                     "corpus_id": point.payload.get("pmcid", ""),
                     "pmcid": point.payload.get("pmcid", ""),
@@ -452,7 +448,6 @@ class QdrantRetriever(AbstractRetriever):
                     "title": point.payload.get("title", ""),
                     "text": point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
-                    "full_text": point.payload.get("full_text", ""),
                     "section_title": "abstract",
                     "journal": point.payload.get("journal", ""),
                     "venue": point.payload.get("journal", ""),
@@ -464,10 +459,6 @@ class QdrantRetriever(AbstractRetriever):
                     "sparse_score": sparse_scores.get(pmcid, 0),
                     "stype": "hybrid_search"
                 }
-                
-                if passage["full_text"] and len(passage["full_text"]) > 500:
-                    passage["text"] = passage["full_text"][:2000]
-                    passage["section_title"] = "full_text"
             
             passages.append(passage)
         
@@ -534,6 +525,7 @@ class QdrantRetriever(AbstractRetriever):
                     paper = self._transform_dailymed_payload(point.payload, point.score)
                     paper["stype"] = "keyword_search"
                 else:
+                    # Standard PMC schema - abstracts only (no full text)
                     paper = {
                         "corpus_id": point.payload.get("pmcid", ""),
                         "pmcid": point.payload.get("pmcid", ""),
@@ -541,7 +533,6 @@ class QdrantRetriever(AbstractRetriever):
                         "title": point.payload.get("title", ""),
                         "text": point.payload.get("abstract", ""),
                         "abstract": point.payload.get("abstract", ""),
-                        "full_text": point.payload.get("full_text", ""),
                         "section_title": "abstract",
                         "journal": point.payload.get("journal", ""),
                         "venue": point.payload.get("journal", ""),
@@ -675,13 +666,12 @@ class QdrantRetriever(AbstractRetriever):
         
         scores = []
         for passage in passages:
-            # Combine title, abstract, and text
+            # Combine title, abstract, and text (abstracts only - no full text)
             title = str(passage.get("title", "")).lower()
             abstract = str(passage.get("abstract", "")).lower()
             text = str(passage.get("text", "")).lower()
-            full_text = str(passage.get("full_text", "")).lower()
             
-            doc_text = f"{title} {abstract} {text} {full_text}".lower()
+            doc_text = f"{title} {abstract} {text}".lower()
             
             # Tokenize document
             doc_terms = Counter(re.findall(r'\b\w+\b', doc_text))
@@ -715,7 +705,8 @@ class QdrantRetriever(AbstractRetriever):
         DailyMed fields: set_id, drug_name, title, indications, dosage, 
                          contraindications, warnings, adverse_reactions, manufacturer
         
-        PMC fields needed: pmcid, abstract, full_text, journal, venue, year, authors
+        PMC fields needed: pmcid, abstract, journal, venue, year, authors
+        Note: Drug label content is stored in abstract field (not full_text)
         """
         set_id = payload.get("set_id", "")
         drug_name = payload.get("drug_name", payload.get("title", "Unknown Drug"))
@@ -745,42 +736,44 @@ class QdrantRetriever(AbstractRetriever):
         
         abstract = "\n".join(abstract_parts)
         
-        # Build full text from all available sections
-        full_text_parts = []
+        # Build extended abstract from all available sections (drug label content)
+        extended_abstract_parts = []
         if drug_name:
-            full_text_parts.append(f"# {drug_name}")
+            extended_abstract_parts.append(f"# {drug_name}")
         if manufacturer:
-            full_text_parts.append(f"Manufacturer: {manufacturer}")
+            extended_abstract_parts.append(f"Manufacturer: {manufacturer}")
         if active_ingredients:
             if isinstance(active_ingredients, list):
-                full_text_parts.append(f"\n## Active Ingredients\n{', '.join(active_ingredients)}")
+                extended_abstract_parts.append(f"\n## Active Ingredients\n{', '.join(active_ingredients)}")
             else:
-                full_text_parts.append(f"\n## Active Ingredients\n{active_ingredients}")
+                extended_abstract_parts.append(f"\n## Active Ingredients\n{active_ingredients}")
         if indications:
-            full_text_parts.append(f"\n## Indications and Usage\n{indications}")
+            extended_abstract_parts.append(f"\n## Indications and Usage\n{indications}")
         if dosage:
-            full_text_parts.append(f"\n## Dosage and Administration\n{dosage}")
+            extended_abstract_parts.append(f"\n## Dosage and Administration\n{dosage}")
         if contraindications:
-            full_text_parts.append(f"\n## Contraindications\n{contraindications}")
+            extended_abstract_parts.append(f"\n## Contraindications\n{contraindications}")
         if warnings:
-            full_text_parts.append(f"\n## Warnings and Precautions\n{warnings}")
+            extended_abstract_parts.append(f"\n## Warnings and Precautions\n{warnings}")
         if adverse_reactions:
-            full_text_parts.append(f"\n## Adverse Reactions\n{adverse_reactions}")
+            extended_abstract_parts.append(f"\n## Adverse Reactions\n{adverse_reactions}")
         
-        full_text = "\n".join(full_text_parts)
+        extended_abstract = "\n".join(extended_abstract_parts)
+        
+        # Use extended abstract as main content (drug labels don't have traditional abstracts)
+        final_abstract = extended_abstract if extended_abstract else abstract
         
         return {
             "corpus_id": f"dailymed_{set_id}" if set_id else "",
             "pmcid": f"dailymed_{set_id}" if set_id else "",
             "pmid": None,
             "title": drug_name or payload.get("title", ""),
-            "text": abstract[:2000] if abstract else "",
-            "abstract": abstract,
-            "full_text": full_text,
+            "text": final_abstract[:2000] if final_abstract else "",
+            "abstract": final_abstract,
             "section_title": "drug_label",
             "journal": "DailyMed",
             "venue": "FDA Drug Label",
-            "year": 2024,  # DailyMed labels are current
+            "year": datetime.now().year,  # DailyMed labels are current FDA-approved info
             "authors": [{"name": manufacturer}] if manufacturer else [],
             "article_type": "drug_label",
             "score": score,

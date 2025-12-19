@@ -326,15 +326,15 @@ class PaperFinderWithReranker:
         logger.info(f"Reranking {len(retrieved_ctxs)} passages...")
         
         # Format documents as YAML for optimal Cohere reranking (best practice)
+        # Using abstracts only (no full text)
         passages = []
         for doc in retrieved_ctxs:
             title = doc.get("title", "")
             abstract = doc.get("abstract", "")
             text = doc.get("text", "")
-            full_text = doc.get("full_text", "")
             
-            # Use full text if available, otherwise use abstract/text
-            content = full_text if full_text else (text if text else abstract)
+            # Use abstract/text only (no full text)
+            content = abstract if abstract else text
             
             # Format as YAML for better performance
             if isinstance(self.reranker_engine, CohereReranker):
@@ -417,10 +417,9 @@ class PaperFinderWithReranker:
             title = str(doc.get("title", "")).lower()
             abstract = str(doc.get("abstract", "")).lower()
             text = str(doc.get("text", "")).lower()
-            full_text = str(doc.get("full_text", "")).lower()
             
-            # Combine text for searching
-            doc_text = f"{title} {abstract} {text} {full_text}".lower()
+            # Combine text for searching (abstracts only - no full text)
+            doc_text = f"{title} {abstract} {text}".lower()
             
             # Count entity matches
             matches = 0

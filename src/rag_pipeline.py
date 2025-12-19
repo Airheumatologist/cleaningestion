@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Generator
 from dataclasses import asdict
 from openai import OpenAI
 
-from .config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL, BULK_RETRIEVAL_LIMIT
+from .config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL, BULK_RETRIEVAL_LIMIT, MAX_ABSTRACTS, MAX_DAILYMED_PER_DRUG
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
 from .reranker import PaperFinderWithReranker
@@ -40,7 +40,7 @@ class MedicalRAGPipeline:
     def __init__(
         self,
         model: str = OPENROUTER_MODEL,
-        n_retrieval: int = 100,
+        n_retrieval: int = 150,
         n_rerank: int = -1,  # -1 = no limit
         context_threshold: float = 0.0
     ):
@@ -155,7 +155,7 @@ class MedicalRAGPipeline:
             # Convert passages to the expected format for aggregation
             reranked = passages[:self.retriever.n_retrieval]  # Limit to n_retrieval
 
-            # Create a basic DataFrame-like structure
+            # Create a basic DataFrame-like structure (abstracts only - no full text)
             import pandas as pd
             papers_df = pd.DataFrame([{
                 'pmcid': p.get('pmcid', ''),
@@ -167,7 +167,6 @@ class MedicalRAGPipeline:
                 'doi': p.get('doi', ''),
                 'article_type': p.get('article_type', ''),
                 'relevance_score': p.get('relevance_judgement', 0),
-                'relevance_judgment_input_expanded': p.get('full_text', p.get('text', '')),
                 'abstract': p.get('abstract', ''),
                 'corpus_id': p.get('corpus_id', '')
             } for p in reranked])
@@ -180,10 +179,108 @@ class MedicalRAGPipeline:
 
         logger.info(f"   Aggregated to {len(papers_df)} papers")
         
+        # Deduplicate DailyMed entries (keep max per drug)
+        papers_df = self._deduplicate_dailymed(papers_df)
+        
         # Post-retrieval filtering: filter out papers that don't contain key medical entities
         papers_df = self._filter_by_entities(query, papers_df)
         
         return papers_df, reranked
+    
+    def _deduplicate_dailymed(self, papers_df) -> Any:
+        """
+        Deduplicate DailyMed entries to keep only top entries per drug.
+        
+        Multiple manufacturers may have the same drug info, so we keep only
+        the top MAX_DAILYMED_PER_DRUG entries per normalized drug name.
+        
+        Args:
+            papers_df: DataFrame of papers
+            
+        Returns:
+            Deduplicated DataFrame
+        """
+        if papers_df.empty:
+            return papers_df
+        
+        import pandas as pd
+        import re
+        
+        logger.info("🔄 Deduplicating DailyMed entries...")
+        
+        # Track DailyMed entries by normalized drug name
+        dailymed_by_drug = {}  # drug_name -> list of (index, relevance_score)
+        non_dailymed_indices = []
+        
+        for idx, row in papers_df.iterrows():
+            pmcid = str(row.get('pmcid', '') or row.get('corpus_id', ''))
+            article_type = str(row.get('article_type', ''))
+            venue = str(row.get('venue', '') or row.get('journal', ''))
+            
+            is_dailymed = (
+                pmcid.startswith('dailymed_') or 
+                article_type == 'drug_label' or
+                'dailymed' in venue.lower() or
+                'fda drug label' in venue.lower()
+            )
+            
+            if is_dailymed:
+                # Extract and normalize drug name from title
+                title = str(row.get('title', ''))
+                # Remove trailing form descriptors (Tablets, Injection, etc.)
+                # Use \s+ (one or more whitespace) to ensure form words only match
+                # when preceded by drug name, not at the start of the title
+                normalized_name = re.sub(
+                    r'\s+(?:tablets?|capsules?|injection|solution|oral|intravenous|iv|im|powder|suspension|syrup|cream|ointment|gel|patch|spray)\b.*$',
+                    '',
+                    title,
+                    flags=re.IGNORECASE
+                ).strip().lower()
+                
+                # Further normalize: remove manufacturer info in parentheses
+                normalized_name = re.sub(r'\s*\([^)]*\)\s*$', '', normalized_name).strip()
+                
+                # If normalized name is empty, use pmcid as unique key to avoid
+                # incorrectly grouping different drugs with missing/invalid titles
+                if not normalized_name:
+                    normalized_name = f"__unique_{pmcid}"
+                
+                relevance = row.get('relevance_judgement', row.get('relevance_score', 0))
+                
+                if normalized_name not in dailymed_by_drug:
+                    dailymed_by_drug[normalized_name] = []
+                dailymed_by_drug[normalized_name].append((idx, relevance))
+            else:
+                non_dailymed_indices.append(idx)
+        
+        # Keep only top MAX_DAILYMED_PER_DRUG per drug
+        kept_dailymed_indices = []
+        removed_count = 0
+        
+        for drug_name, entries in dailymed_by_drug.items():
+            # Sort by relevance score (descending)
+            sorted_entries = sorted(entries, key=lambda x: x[1], reverse=True)
+            
+            # Keep top entries
+            kept = sorted_entries[:MAX_DAILYMED_PER_DRUG]
+            removed = sorted_entries[MAX_DAILYMED_PER_DRUG:]
+            
+            kept_dailymed_indices.extend([idx for idx, _ in kept])
+            removed_count += len(removed)
+            
+            if len(sorted_entries) > MAX_DAILYMED_PER_DRUG:
+                logger.info(f"   Drug '{drug_name}': kept {len(kept)}/{len(sorted_entries)} DailyMed entries")
+        
+        if removed_count > 0:
+            logger.info(f"   Removed {removed_count} duplicate DailyMed entries (keeping max {MAX_DAILYMED_PER_DRUG} per drug)")
+            
+            # Combine non-DailyMed + kept DailyMed indices, then sort to preserve original ranking
+            all_kept_indices = sorted(non_dailymed_indices + kept_dailymed_indices)
+            papers_df = papers_df.loc[all_kept_indices].reset_index(drop=True)
+        else:
+            logger.info("   No duplicate DailyMed entries found")
+        
+        return papers_df
     
     def _filter_by_entities(self, query: str, papers_df) -> Any:
         """
@@ -222,10 +319,9 @@ class MedicalRAGPipeline:
         for idx, row in papers_df.iterrows():
             title = str(row.get('title', '')).lower()
             abstract = str(row.get('abstract', '')).lower()
-            full_text = str(row.get('relevance_judgment_input_expanded', '')).lower()
             
-            # Combine text for searching
-            paper_text = f"{title} {abstract} {full_text}".lower()
+            # Combine title and abstract for searching (abstracts only - no full text)
+            paper_text = f"{title} {abstract}".lower()
             
             # Check if paper contains at least one key entity
             has_entity = False
@@ -321,32 +417,28 @@ class MedicalRAGPipeline:
         if papers_df.empty:
             return ("No relevant evidence found for your query.", [], [])
 
-        # Context configuration: Enhanced for more detailed responses
+        # Context configuration: Abstracts only (no full text)
         from .specialty_journals import PRIORITY_JOURNALS
 
         HIGH_VALUE_TYPES = {'review_article', 'clinical_trial', 'systematic_review', 'meta_analysis', 'guideline'}
-        MAX_FULL_TEXT_ARTICLES = 5     # Decreased from 8 to 5 for more focused responses
-        MAX_ABSTRACT_ARTICLES = 100    # Next 100 articles get abstracts
-        FULL_TEXT_LIMIT = 12000        # Increased from 8000 to 12000 chars per full-text article
-        ABSTRACT_LIMIT = 800           # Chars per abstract article
+        ABSTRACT_LIMIT = 1200  # Chars per abstract (increased since no full text)
 
         # Build context from reranked papers with journal prioritization
         context_parts = []
-        full_text_count = 0
         abstract_count = 0
-        full_text_articles = []  # Track which articles received full text
 
         # First pass: prioritize high-value articles from priority journals
         priority_journal_papers = []
         other_papers = []
 
-        for idx, row in papers_df.head(MAX_FULL_TEXT_ARTICLES + MAX_ABSTRACT_ARTICLES).iterrows():
+        for idx, row in papers_df.head(MAX_ABSTRACTS).iterrows():
             corpus_id = row.get('corpus_id', '')
-            is_priority_journal = corpus_id in PRIORITY_JOURNALS
+            journal = row.get('journal', '') or row.get('venue', '')
+            is_priority_journal = journal in PRIORITY_JOURNALS
             article_type = row.get('article_type', 'other')
             is_high_value = article_type in HIGH_VALUE_TYPES
 
-            if is_priority_journal and is_high_value:
+            if is_priority_journal or is_high_value:
                 priority_journal_papers.append((idx, row))
             else:
                 other_papers.append((idx, row))
@@ -356,7 +448,7 @@ class MedicalRAGPipeline:
 
         used_papers = []  # Track order for reference generation
 
-        for idx, row in all_papers[:MAX_FULL_TEXT_ARTICLES + MAX_ABSTRACT_ARTICLES]:
+        for idx, row in all_papers[:MAX_ABSTRACTS]:
             article_type = row.get('article_type', 'other')
             source_num = len(context_parts) + 1
 
@@ -374,46 +466,14 @@ class MedicalRAGPipeline:
                 paper_info += f" ({row.get('year')})"
             paper_info += f" [{article_type}]"
 
-            # Determine if this article gets full text or abstract
-            corpus_id = row.get('corpus_id', '')
-            is_priority_journal = corpus_id in PRIORITY_JOURNALS
-            is_high_value = article_type in HIGH_VALUE_TYPES
-
-            # Prioritize full-text for: (priority journal + high-value) OR (just high-value if slots remain)
-            use_full_text = (is_high_value or is_priority_journal) and full_text_count < MAX_FULL_TEXT_ARTICLES
-
-            if use_full_text:
-                # Full text for high-value or priority journal articles
-                content = row.get('relevance_judgment_input_expanded', row.get('full_text', row.get('text', '')))
-                paper_info += f"\n{content[:FULL_TEXT_LIMIT]}"
-                full_text_count += 1
-                priority_flag = "📌 " if is_priority_journal else ""
-                logger.info(f"   [{source_num}] {priority_flag}{article_type}: FULL TEXT ({len(content)} chars) - {row.get('title', 'Untitled')[:60]}...")
-                # Track full-text articles with their source number
-                full_text_articles.append({
-                    'source_num': source_num,
-                    'title': row.get('title', 'Untitled'),
-                    'journal': row.get('venue') or row.get('journal', ''),
-                    'year': row.get('year'),
-                    'article_type': article_type,
-                    'is_priority_journal': is_priority_journal,
-                    'chars': len(content)
-                })
-            else:
-                # Abstract only for remaining articles
-                abstract = row.get('abstract', '')
-                if not abstract:
-                    content = row.get('relevance_judgment_input_expanded', row.get('text', ''))
-                    abstract = content[:ABSTRACT_LIMIT]
-                paper_info += f"\n{abstract[:ABSTRACT_LIMIT]}"
-                abstract_count += 1
-                logger.debug(f"   [{source_num}] {article_type}: abstract only")
+            # Use abstract only (no full text)
+            abstract = row.get('abstract', '') or row.get('text', '')
+            paper_info += f"\n{abstract[:ABSTRACT_LIMIT]}"
+            abstract_count += 1
 
             context_parts.append(paper_info)
 
-        logger.info(f"   Context: {full_text_count} full-text + {abstract_count} abstracts = {len(context_parts)} total articles")
-        full_text_summary = [f"[{a['source_num']}] {a['title'][:50]}..." for a in full_text_articles]
-        logger.info(f"   Full-text articles: {full_text_summary}")
+        logger.info(f"   Context: {abstract_count} abstracts = {len(context_parts)} total articles")
         context = "\n\n---\n\n".join(context_parts)
 
         user_prompt = f"""Analyze and synthesize the following medical literature to create a detailed, clinically-focused response for healthcare professionals.
@@ -421,7 +481,7 @@ class MedicalRAGPipeline:
 **Clinical Query**: {query}
 
 **Instructions**:
-1. **Extract specific clinical details** from the full-text articles below:
+1. **Extract specific clinical details** from the abstracts below:
    - Classification/staging systems (e.g., Hurley staging, TNM staging) with criteria for each level
    - Specific medications with brand/generic names, dosing protocols, administration routes, and durations
    - Surgical approaches and procedural techniques with specific indications
@@ -440,20 +500,12 @@ class MedicalRAGPipeline:
 
 4. **Depth requirement**: This should read like a detailed clinical review or practice guideline section, with sufficient technical detail for physician decision-making.
 
-5. **Enhanced detail extraction**: For the full-text articles (marked as **[1]** through **[{full_text_count}]**), extract:
-   - Complete treatment protocols with step-by-step procedures
-   - Detailed dosing schedules including loading doses, maintenance doses, tapering protocols
-   - Complete diagnostic criteria including all inclusion/exclusion criteria
-   - Full adverse event profiles with incidence rates and severity
-   - Comprehensive mechanism of action explanations
-   - Complete trial methodology including endpoints, follow-up duration, and statistical methods
-   - All contraindications, warnings, and precautions
-   - Complete surgical/procedural techniques with specific equipment and approaches
+5. **Citation requirement**: Use inline citations **[1]**, **[2]**, etc. to cite specific articles that support each claim.
 
-**Source Literature**:
+**Source Literature** ({abstract_count} abstracts):
 {context}
 
-Generate a comprehensive, evidence-based clinical response that thoroughly mines the above sources for specific details. Prioritize information from the full-text articles for the most detailed and complete clinical guidance."""
+Generate a comprehensive, evidence-based clinical response that synthesizes findings across the {abstract_count} abstracts provided. Cross-reference multiple sources to identify consensus and note any conflicting evidence."""
 
         try:
             response = self.openai_client.responses.create(
@@ -477,12 +529,12 @@ Generate a comprehensive, evidence-based clinical response that thoroughly mines
             answer = response.output_text.strip()
 
             logger.info(f"   Generated response ({len(answer)} chars)")
-            # Return both answer and metadata about full-text articles
-            return answer, full_text_articles, used_papers
+            # Return answer and used papers (no full_text_articles tracking)
+            return answer, used_papers
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
-            return (f"Error generating response: {str(e)}", [], [])
+            return (f"Error generating response: {str(e)}", [])
     
     # =========================================================================
     # PDF Availability Check via Europe PMC
@@ -692,17 +744,16 @@ Generate a comprehensive, evidence-based clinical response that thoroughly mines
         # Step 4: Direct LLM Synthesis
         result = self.run_generation(query, papers_df)
         
-        # Handle tuple return (answer, full_text_articles, used_papers) or error string
+        # Handle tuple return (answer, used_papers) or error string
         if isinstance(result, tuple):
-            if len(result) == 3:
-                answer, full_text_articles, used_papers = result
+            if len(result) == 2:
+                answer, used_papers = result
             else:
-                answer, full_text_articles = result
+                answer = result[0]
                 used_papers = []
         else:
             # Error case
             answer = result
-            full_text_articles = []
             used_papers = []
         
         # Step 5: Check PDF availability via Europe PMC for all used papers
@@ -714,11 +765,10 @@ Generate a comprehensive, evidence-based clinical response that thoroughly mines
             "answer": answer,
             "sections": [],  # Direct synthesis - no sections
             "sources": sources_with_pdf,
-            "full_text_articles": full_text_articles,  # Track which articles got full text
             "retrieval_stats": {
                 "passages_retrieved": len(passages),
                 "papers_after_aggregation": len(papers_df),
-                "full_text_count": len(full_text_articles)
+                "abstracts_used": len(used_papers)
             },
             "status": "success"
         }
@@ -764,16 +814,15 @@ Generate a comprehensive, evidence-based clinical response that thoroughly mines
         yield {"step": "generating", "status": "running", "message": "Synthesizing response..."}
         result = self.run_generation(query, papers_df)
         
-        # Handle tuple return (answer, full_text_articles, used_papers) or error string
+        # Handle tuple return (answer, used_papers) or error string
         if isinstance(result, tuple):
-            if len(result) == 3:
-                answer, full_text_articles, used_papers = result
+            if len(result) == 2:
+                answer, used_papers = result
             else:
-                answer, full_text_articles = result
+                answer = result[0]
                 used_papers = []
         else:
             answer = result
-            full_text_articles = []
             used_papers = []
         
         # Ensure answer is always a string
@@ -804,9 +853,9 @@ Generate a comprehensive, evidence-based clinical response that thoroughly mines
             "status": "success",
             "report_title": "Clinical Response",
             "answer": answer,
-            "full_text_articles": full_text_articles,
             "sections": [],
-            "sources": sources_with_pdf
+            "sources": sources_with_pdf,
+            "abstracts_used": len(used_papers)
         }
         logger.info(f"Final event: answer present={bool(final_event.get('answer'))}, answer_length={len(answer)}")
         yield final_event

@@ -66,11 +66,11 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 # Query Preprocessing Configuration
 # =============================================================================
 QUERY_EXPANSION_COUNT = 4  # Number of expanded query variations
-BULK_RETRIEVAL_LIMIT = 200  # Max candidates before reranking
-BULK_RETRIEVAL_PER_QUERY = 50  # Candidates per expanded query
-RERANK_TOP_K = 20  # Final articles after reranking
-FULL_TEXT_COUNT = 10  # Articles with full text in output
-ABSTRACT_ONLY_COUNT = 10  # Articles with abstract only in output
+BULK_RETRIEVAL_LIMIT = 300  # Max candidates before reranking
+BULK_RETRIEVAL_PER_QUERY = 75  # Candidates per expanded query
+RERANK_TOP_K = 30  # Final articles after reranking
+MAX_ABSTRACTS = 150  # Maximum abstracts to use in context (no full text)
+MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)
 
 # =============================================================================
 # Validation
