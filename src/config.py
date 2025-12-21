@@ -52,10 +52,11 @@ DENSE_WEIGHT = 0.7  # Weight for dense vector scores in hybrid search
 SPARSE_WEIGHT = 0.3  # Weight for sparse vector scores in hybrid search
 
 # =============================================================================
-# Search Configuration
+# Search Configuration - OPTIMIZED FOR 150+ ARTICLES
 # =============================================================================
 TOP_K_RESULTS = 5  # Number of documents to retrieve
-SCORE_THRESHOLD = 0.3  # Minimum similarity score
+SCORE_THRESHOLD = 0.25  # Lowered from 0.3 to capture more relevant papers
+# Lower threshold helps retrieve more candidates before aggressive filtering
 
 # =============================================================================
 # Cohere Rerank Configuration
@@ -63,14 +64,22 @@ SCORE_THRESHOLD = 0.3  # Minimum similarity score
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
 # =============================================================================
-# Query Preprocessing Configuration
+# Query Preprocessing Configuration - SCALED UP FOR 150+ ARTICLES
 # =============================================================================
 QUERY_EXPANSION_COUNT = 4  # Number of expanded query variations
-BULK_RETRIEVAL_LIMIT = 300  # Max candidates before reranking
-BULK_RETRIEVAL_PER_QUERY = 75  # Candidates per expanded query
-RERANK_TOP_K = 30  # Final articles after reranking
-MAX_ABSTRACTS = 150  # Maximum abstracts to use in context (no full text)
+BULK_RETRIEVAL_LIMIT = 600  # Increased from 300 to 600 - Max candidates before reranking
+BULK_RETRIEVAL_PER_QUERY = 100  # Increased from 75 to 100 - Candidates per expanded query
+RERANK_TOP_K = 100  # Increased from 30 to 100 - Final articles after reranking (keep more before aggregation)
+MAX_ABSTRACTS = 150  # Maximum abstracts to use in context (no full text) - TARGET: Use ALL 150
 MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)
+
+# =============================================================================
+# Multi-Stage Generation Configuration - NEW FOR 150+ ARTICLES
+# =============================================================================
+USE_MULTI_STAGE_GENERATION = True  # Enable multi-batch LLM generation
+BATCH_SIZE_FOR_GENERATION = 50  # Abstracts per generation batch
+MAX_GENERATION_BATCHES = 3  # Maximum number of generation batches (50 * 3 = 150 abstracts)
+PROGRESSIVE_SYNTHESIS = True  # Use progressive summarization across batches
 
 # =============================================================================
 # Validation
@@ -110,5 +119,14 @@ if __name__ == "__main__":
         print(f"✅ Embedding Model: {EMBEDDING_MODEL}")
         print(f"✅ Collection Name: {COLLECTION_NAME}")
         print("\n✅ All configuration validated!")
+        
+        # Show optimized settings for 150+ articles
+        print("\n🎯 OPTIMIZED FOR 150+ ARTICLES:")
+        print(f"   - BULK_RETRIEVAL_LIMIT: {BULK_RETRIEVAL_LIMIT} (increased)")
+        print(f"   - RERANK_TOP_K: {RERANK_TOP_K} (increased)")
+        print(f"   - SCORE_THRESHOLD: {SCORE_THRESHOLD} (lowered)")
+        print(f"   - MAX_GENERATION_BATCHES: {MAX_GENERATION_BATCHES}")
+        print(f"   - BATCH_SIZE_FOR_GENERATION: {BATCH_SIZE_FOR_GENERATION}")
+        
     except ValueError as e:
         print(f"❌ Configuration error:\n{e}")

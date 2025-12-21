@@ -17,7 +17,7 @@ Production-ready Retrieval-Augmented Generation (RAG) pipeline for medical liter
 │         ▼                   ▼                   ▼                   ▼           │
 │  • Medical Entity    • Qdrant Vector    • Cohere Rerank    • OpenRouter LLM    │
 │    Expansion (MeSH)    Search (1024-d)   • Evidence Boost    • ELIXIR Prompt   │
-│  • Query Decompose   • Metadata Filter  • Entity Matching   • Abstract Cite   │
+│  • Query Decompose   • Metadata Filter  • Entity Matching   • Full-text Cite  │
 │  • Filter Extract    • Hybrid Scoring   • Paper Aggregate   • PDF Check       │
 │                                                                                  │
 │  Data Layer:                                                                     │
@@ -172,11 +172,10 @@ papers_df = reranker.aggregate_into_dataframe(reranked)
 
 **Features:**
 - **ELIXIR System Prompt** for medical education responses
-- **Priority Journal Handling** (NEJM, Lancet, JAMA prioritized in context)
-- **DailyMed Deduplication** (max 2 entries per drug to avoid redundant labels)
+- **Priority Journal Handling** (NEJM, Lancet, JAMA get full text)
 - **Context Building:**
-  - Up to 150 abstracts (1200 chars each)
-  - Priority/high-value articles listed first
+  - Top 5 articles: Full text (12K chars each)
+  - Next 100 articles: Abstract only (800 chars each)
 - **Structured Output:**
   - Markdown formatting with headers
   - Tables for staging/classification systems
@@ -193,7 +192,7 @@ result = pipeline.answer("management of COPD")
 # {
 #   "answer": "## Overview\n\nCOPD management...[1][2]\n\n## Treatment...",
 #   "sources": [{"pmcid": "PMC123", "title": "...", "pdf_url": "..."}],
-#   "retrieval_stats": {"passages_retrieved": 150, "abstracts_used": 45},
+#   "full_text_articles": [{"source_num": 1, "title": "..."}],
 #   "status": "success"
 # }
 ```
@@ -318,7 +317,8 @@ python -m src.api_server
   "pmid": "12345678",
   "doi": "10.1000/example",
   "title": "Article Title (300 chars max)",
-  "abstract": "Abstract text (used for context building)",
+  "abstract": "Abstract (1000 chars max)",
+  "full_text": "Full article text (10K chars max)",
   
   "year": 2024,
   "journal": "Nature Medicine",
@@ -378,10 +378,9 @@ python -m src.api_server
 |---------|---------|-------------|
 | `TOP_K_RESULTS` | 5 | Documents to retrieve |
 | `SCORE_THRESHOLD` | 0.3 | Minimum similarity score |
-| `BULK_RETRIEVAL_LIMIT` | 300 | Max candidates before reranking |
-| `RERANK_TOP_K` | 30 | Final articles after reranking |
-| `MAX_ABSTRACTS` | 150 | Max abstracts to include in context |
-| `MAX_DAILYMED_PER_DRUG` | 2 | Max DailyMed entries per drug (deduplication) |
+| `BULK_RETRIEVAL_LIMIT` | 200 | Max candidates before reranking |
+| `RERANK_TOP_K` | 20 | Final articles after reranking |
+| `FULL_TEXT_COUNT` | 10 | Articles with full text in output |
 | `DENSE_WEIGHT` | 0.7 | Dense vector weight in hybrid search |
 | `SPARSE_WEIGHT` | 0.3 | Sparse vector weight in hybrid search |
 
