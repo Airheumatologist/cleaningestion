@@ -9,3 +9,6 @@ mesh_cache.json
 # macOS metadata
 ._*
 .DS_Store
+
+# Separate projects
+elixir-ai/
