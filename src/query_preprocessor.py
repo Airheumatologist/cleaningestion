@@ -78,7 +78,18 @@ Components to extract:
    - Preserve medical condition names exactly as they appear
    - Remove only metadata (years, venues) already extracted
 6. Keyword query: Extract key medical terms for keyword matching. Include both acronyms and full terms.
-7. Drug names: List all drug names mentioned. IMPORTANT: Include BOTH brand names and their common generic equivalents if identified (e.g., "Xeljanz" -> ["Xeljanz", "Tofacitinib"]).
+7. Drug names: COMPREHENSIVE drug name extraction. Include:
+   - Generic name AND brand name equivalents (e.g., "tofacitinib" → ["tofacitinib", "Xeljanz"])
+   - FORMULATION-SPECIFIC BRANDS: Many drugs have different brand names for different routes of administration.
+     * If a specific route IS mentioned (infusion, IV, subcutaneous, SC, injection, oral):
+       Include ONLY the brand for that route (e.g., "golimumab infusion" → ["golimumab", "SIMPONI ARIA"])
+     * If NO specific route is mentioned:
+       Include ALL formulation brands for comprehensive coverage (e.g., "golimumab dosing" → ["golimumab", "SIMPONI", "SIMPONI ARIA"])
+   - Common examples of multi-formulation drugs:
+     * Golimumab: SIMPONI (SC injection) vs SIMPONI ARIA (IV infusion)
+     * Rituximab: RITUXAN (IV) vs RITUXAN HYCELA (SC)
+     * Trastuzumab: HERCEPTIN (IV) vs HERCEPTIN HYLECTA (SC)
+     * Tocilizumab: ACTEMRA (both IV and SC, same brand)
 8. Medical conditions: List key diseases or clinical conditions mentioned.
 
 Current year is 2025.
@@ -103,6 +114,40 @@ What are the latest treatments for heart failure with preserved ejection fractio
 </example output>
 
 <example input>
+golimumab infusion dosing for rheumatoid arthritis
+</example input>
+<example output>
+{
+    "earliest_search_year": "",
+    "latest_search_year": "",
+    "venues": "",
+    "authors": [],
+    "field_of_study": "Medicine",
+    "rewritten_query": "golimumab IV infusion dosing rheumatoid arthritis",
+    "rewritten_query_for_keyword_search": "golimumab SIMPONI ARIA infusion IV dosing rheumatoid arthritis RA",
+    "drug_names": ["golimumab", "SIMPONI ARIA"],
+    "medical_conditions": ["rheumatoid arthritis"]
+}
+</example output>
+
+<example input>
+golimumab dosing for RA
+</example input>
+<example output>
+{
+    "earliest_search_year": "",
+    "latest_search_year": "",
+    "venues": "",
+    "authors": [],
+    "field_of_study": "Medicine",
+    "rewritten_query": "golimumab dosing rheumatoid arthritis",
+    "rewritten_query_for_keyword_search": "golimumab SIMPONI dosing rheumatoid arthritis RA",
+    "drug_names": ["golimumab", "SIMPONI", "SIMPONI ARIA"],
+    "medical_conditions": ["rheumatoid arthritis"]
+}
+</example output>
+
+<example input>
 Systematic reviews on SGLT2 inhibitors for diabetes and heart failure from 2020 onwards
 </example input>
 <example output>
@@ -120,19 +165,19 @@ Systematic reviews on SGLT2 inhibitors for diabetes and heart failure from 2020 
 </example output>
 
 <example input>
-What do recent NEJM and Lancet articles say about mRNA vaccine side effects?
+rituximab subcutaneous vs IV administration
 </example input>
 <example output>
 {
-    "earliest_search_year": "2022",
-    "latest_search_year": "2025",
-    "venues": "New England Journal of Medicine,Lancet",
+    "earliest_search_year": "",
+    "latest_search_year": "",
+    "venues": "",
     "authors": [],
     "field_of_study": "Medicine",
-    "rewritten_query": "mRNA vaccine adverse effects side effects safety",
-    "rewritten_query_for_keyword_search": "mRNA vaccine side effects adverse events safety",
-    "drug_names": ["mRNA vaccine"],
-    "medical_conditions": ["vaccine side effects"]
+    "rewritten_query": "rituximab subcutaneous versus intravenous IV administration comparison",
+    "rewritten_query_for_keyword_search": "rituximab RITUXAN RITUXAN HYCELA SC IV subcutaneous intravenous",
+    "drug_names": ["rituximab", "RITUXAN", "RITUXAN HYCELA"],
+    "medical_conditions": []
 }
 </example output>
 </examples>

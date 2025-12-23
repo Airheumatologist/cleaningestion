@@ -13,6 +13,7 @@ interface Source {
   pdf_url?: string;
   article_type?: string;
   dailymed_url?: string;  // DailyMed drug label URL
+  source?: string;  // 'dailymed' or 'pmc'
 }
 
 interface Message {
@@ -20,14 +21,24 @@ interface Message {
   content: string;
   sources?: Source[];
   steps?: { title: string; status: 'pending' | 'loading' | 'complete' }[];
+  activeTab?: 'answer' | 'drugs' | 'references';
 }
+
+// Citation color palette
+const CITATION_COLORS = [
+  '#f97316', // orange
+  '#3b82f6', // blue
+  '#10b981', // green
+  '#8b5cf6', // purple
+  '#f59e0b', // amber
+  '#ec4899', // pink
+];
 
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null); // For embedded PDF viewer
-  const [referencesExpanded, setReferencesExpanded] = useState(true);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
 
@@ -302,172 +313,270 @@ export default function Home() {
                   <p style={{ color: 'var(--secondary)', fontSize: '1.1rem' }}>Ask complex medical questions backed by peer-reviewed evidence.</p>
                 </div>
               ) : (
-                messages.map((msg, idx) => (
-                  <div key={idx} style={{ marginBottom: '2rem', animation: 'fadeIn 0.3s ease-in-out' }}>
-                    <div style={{ fontWeight: 600, color: msg.role === 'user' ? '#1e293b' : 'var(--primary)', marginBottom: '0.5rem' }}>
-                      {msg.role === 'user' ? 'You' : 'Medical Assistant'}
-                    </div>
-                    <div className={msg.role === 'assistant' ? 'glass' : ''} style={{
-                      padding: msg.role === 'assistant' ? '1.5rem' : '0',
-                      borderRadius: '1rem',
-                      whiteSpace: 'pre-wrap'
-                    }}>
-                      {msg.content}
+                messages.map((msg, idx) => {
+                  // Separate DailyMed sources from PMC sources
+                  // STRICT: Only sources with source='dailymed' or pmcid starting with 'dailymed_' 
+                  // are actual DailyMed drug labels
+                  const drugSources = msg.sources?.filter(s =>
+                    s.source === 'dailymed' || s.pmcid?.startsWith('dailymed_')
+                  ) || [];
+                  const allSources = msg.sources || [];
 
-                      {/* Steps indicator */}
-                      {msg.role === 'assistant' && msg.steps && !msg.content && (
-                        <div style={{ display: 'grid', gap: '0.75rem', marginTop: '1rem' }}>
-                          {msg.steps.map((step, sIdx) => (
-                            <div key={sIdx} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', color: step.status === 'pending' ? '#94a3b8' : '#1e293b' }}>
-                              <div style={{
-                                width: '18px', height: '18px', borderRadius: '50%',
-                                border: `2px solid ${step.status === 'loading' ? 'var(--primary)' : step.status === 'complete' ? 'var(--medical-teal)' : '#e2e8f0'}`,
-                                display: 'flex', alignItems: 'center', justifyContent: 'center'
-                              }}>
-                                {step.status === 'loading' && <div className="spinner" style={{ width: '8px', height: '8px', border: '2px solid var(--primary)', borderRightColor: 'transparent', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />}
-                                {step.status === 'complete' && <div style={{ width: '8px', height: '8px', backgroundColor: 'var(--medical-teal)', borderRadius: '50%' }} />}
-                              </div>
-                              <span style={{ fontSize: '0.9rem' }}>{step.title}</span>
-                            </div>
-                          ))}
-                        </div>
+                  // Get current active tab for this message (default to 'answer')
+                  const activeTab = msg.activeTab || 'answer';
+
+                  // Helper to set active tab for this message
+                  const setActiveTab = (tab: 'answer' | 'drugs' | 'references') => {
+                    setMessages(prev => {
+                      const newMessages = [...prev];
+                      newMessages[idx] = { ...newMessages[idx], activeTab: tab };
+                      return newMessages;
+                    });
+                  };
+
+                  // Helper to get article URL
+                  const getArticleUrl = (source: Source) => {
+                    if (source.dailymed_url) return source.dailymed_url;
+                    if (source.doi) {
+                      const cleanDoi = source.doi.replace(/^https?:\/\/doi\.org\//, '');
+                      return `https://doi.org/${cleanDoi}`;
+                    }
+                    if (source.pmcid && !source.pmcid.toLowerCase().includes('dailymed')) {
+                      const pmcid = source.pmcid.toUpperCase().startsWith('PMC') ? source.pmcid : `PMC${source.pmcid}`;
+                      return `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/`;
+                    }
+                    return '#';
+                  };
+
+                  // Render content with colorful citation badges
+                  const renderWithCitations = (content: string) => {
+                    const parts = content.split(/(\[\d+\])/g);
+                    return parts.map((part, i) => {
+                      const match = part.match(/\[(\d+)\]/);
+                      if (match) {
+                        const num = parseInt(match[1]);
+                        const color = CITATION_COLORS[(num - 1) % CITATION_COLORS.length];
+                        return (
+                          <span
+                            key={i}
+                            className="citation-badge"
+                            style={{ backgroundColor: color }}
+                            onClick={() => setActiveTab('references')}
+                            title={allSources[num - 1]?.title || `Reference ${num}`}
+                          >
+                            {num}
+                          </span>
+                        );
+                      }
+                      return part;
+                    });
+                  };
+
+                  return (
+                    <div key={idx} style={{ marginBottom: '2rem', animation: 'fadeIn 0.3s ease-in-out' }}>
+                      <div style={{ fontWeight: 600, color: msg.role === 'user' ? '#1e293b' : 'var(--primary)', marginBottom: '0.5rem' }}>
+                        {msg.role === 'user' ? 'You' : 'Medical Assistant'}
+                      </div>
+
+                      {/* User message - simple display */}
+                      {msg.role === 'user' && (
+                        <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
                       )}
 
-                      {/* References Section - Numbered List Format */}
-                      {msg.sources && msg.sources.length > 0 && (
-                        <div style={{ marginTop: '1.5rem', borderTop: '1px solid var(--border)', paddingTop: '1rem' }}>
-                          <div
-                            onClick={() => setReferencesExpanded(!referencesExpanded)}
-                            style={{
-                              display: 'flex', alignItems: 'center', gap: '0.5rem',
-                              cursor: 'pointer', userSelect: 'none',
-                              marginBottom: referencesExpanded ? '1rem' : 0
-                            }}
-                          >
-                            <span style={{ fontSize: '1.1rem' }}>📋</span>
-                            <span style={{ fontWeight: 600, fontSize: '0.95rem' }}>References</span>
-                            <span style={{ color: 'var(--secondary)', fontSize: '0.85rem' }}>({msg.sources.length})</span>
-                            <span style={{ marginLeft: 'auto', color: 'var(--secondary)' }}>{referencesExpanded ? '▲' : '▼'}</span>
-                          </div>
+                      {/* Assistant message - tabbed display */}
+                      {msg.role === 'assistant' && (
+                        <div className="glass" style={{ padding: '1.5rem', borderRadius: '1rem' }}>
 
-                          {referencesExpanded && (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-                              {msg.sources.map((source, sIdx) => {
-                                const getArticleUrl = () => {
-                                  if (source.dailymed_url) return source.dailymed_url;
-                                  if (source.doi) {
-                                    const cleanDoi = source.doi.replace(/^https?:\/\/doi\.org\//, '');
-                                    return `https://doi.org/${cleanDoi}`;
-                                  }
-                                  if (source.pmcid && !source.pmcid.toLowerCase().includes('dailymed')) {
-                                    const pmcid = source.pmcid.toUpperCase().startsWith('PMC') ? source.pmcid : `PMC${source.pmcid}`;
-                                    return `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/`;
-                                  }
-                                  return '#';
-                                };
+                          {/* Tab Navigation - Only show when there's content or sources */}
+                          {(msg.content || allSources.length > 0) && (
+                            <div className="tab-bar">
+                              <button
+                                className={activeTab === 'answer' ? 'active' : ''}
+                                onClick={() => setActiveTab('answer')}
+                              >
+                                ○ Answer
+                              </button>
+                              {drugSources.length > 0 && (
+                                <button
+                                  className={activeTab === 'drugs' ? 'active' : ''}
+                                  onClick={() => setActiveTab('drugs')}
+                                >
+                                  💊 Drug Information
+                                  <span className="tab-count">{drugSources.length}</span>
+                                </button>
+                              )}
+                              {allSources.length > 0 && (
+                                <button
+                                  className={activeTab === 'references' ? 'active' : ''}
+                                  onClick={() => setActiveTab('references')}
+                                >
+                                  📄 References
+                                  <span className="tab-count">{allSources.length}</span>
+                                </button>
+                              )}
+                            </div>
+                          )}
 
-                                return (
-                                  <div key={sIdx} style={{ display: 'flex', gap: '1rem', position: 'relative' }}>
-                                    {/* Number and Likes */}
-                                    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.5rem', width: '24px', flexShrink: 0 }}>
-                                      <span style={{ fontSize: '0.9rem', color: '#64748b', fontWeight: 500 }}>{sIdx + 1}.</span>
-                                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.4rem', marginTop: '0.2rem' }}>
-                                        <button className="icon-btn-small" style={{ opacity: 0.5 }}>👍</button>
-                                        <button className="icon-btn-small" style={{ opacity: 0.5 }}>👎</button>
+                          {/* ANSWER TAB */}
+                          {activeTab === 'answer' && (
+                            <div>
+                              {/* Steps indicator - show before content */}
+                              {msg.steps && !msg.content && (
+                                <div style={{ display: 'grid', gap: '0.75rem' }}>
+                                  {msg.steps.map((step, sIdx) => (
+                                    <div key={sIdx} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', color: step.status === 'pending' ? '#94a3b8' : '#1e293b' }}>
+                                      <div style={{
+                                        width: '18px', height: '18px', borderRadius: '50%',
+                                        border: `2px solid ${step.status === 'loading' ? 'var(--primary)' : step.status === 'complete' ? 'var(--medical-teal)' : '#e2e8f0'}`,
+                                        display: 'flex', alignItems: 'center', justifyContent: 'center'
+                                      }}>
+                                        {step.status === 'loading' && <div className="spinner" style={{ width: '8px', height: '8px', border: '2px solid var(--primary)', borderRightColor: 'transparent', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />}
+                                        {step.status === 'complete' && <div style={{ width: '8px', height: '8px', backgroundColor: 'var(--medical-teal)', borderRadius: '50%' }} />}
                                       </div>
+                                      <span style={{ fontSize: '0.9rem' }}>{step.title}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+
+                              {/* LLM Response with citations */}
+                              {msg.content && (
+                                <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
+                                  {renderWithCitations(msg.content)}
+                                </div>
+                              )}
+                            </div>
+                          )}
+
+                          {/* DRUG INFORMATION TAB */}
+                          {activeTab === 'drugs' && drugSources.length > 0 && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                              {drugSources.map((source, sIdx) => (
+                                <div key={sIdx} className="drug-info-card">
+                                  <h3>💊 {source.title}</h3>
+                                  <div style={{ fontSize: '0.85rem', color: '#475569', marginBottom: '0.5rem' }}>
+                                    {formatAuthors(source.authors)}
+                                  </div>
+                                  <a
+                                    href={source.dailymed_url || getArticleUrl(source)}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: '0.35rem',
+                                      color: '#166534',
+                                      fontSize: '0.85rem',
+                                      fontWeight: 500
+                                    }}
+                                  >
+                                    📋 View on DailyMed →
+                                  </a>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* REFERENCES TAB */}
+                          {activeTab === 'references' && allSources.length > 0 && (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+                              {allSources.map((source, sIdx) => (
+                                <div key={sIdx} style={{ display: 'flex', gap: '1rem', position: 'relative' }}>
+                                  {/* Number badge */}
+                                  <div style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    width: '24px',
+                                    height: '24px',
+                                    borderRadius: '0.25rem',
+                                    backgroundColor: CITATION_COLORS[sIdx % CITATION_COLORS.length],
+                                    color: 'white',
+                                    fontSize: '0.75rem',
+                                    fontWeight: 600,
+                                    flexShrink: 0
+                                  }}>
+                                    {sIdx + 1}
+                                  </div>
+
+                                  {/* Content */}
+                                  <div style={{ flex: 1 }}>
+                                    {/* Title */}
+                                    <a
+                                      href={getArticleUrl(source)}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      style={{
+                                        color: CITATION_COLORS[sIdx % CITATION_COLORS.length],
+                                        textDecoration: 'none',
+                                        fontWeight: 600,
+                                        fontSize: '0.95rem',
+                                        lineHeight: '1.4',
+                                        display: 'inline-block',
+                                        marginBottom: '0.25rem'
+                                      }}
+                                    >
+                                      {source.title}
+                                    </a>
+
+                                    {/* Authors */}
+                                    <div style={{ color: '#475569', fontSize: '0.85rem', marginBottom: '0.15rem' }}>
+                                      {formatAuthors(source.authors)}
                                     </div>
 
-                                    {/* Content */}
-                                    <div style={{ flex: 1 }}>
-                                      {/* Title */}
-                                      <a
-                                        href={getArticleUrl()}
-                                        target="_blank"
-                                        rel="noreferrer"
-                                        style={{
-                                          color: '#f97316', // Orange from screenshot
-                                          textDecoration: 'none',
-                                          fontWeight: 600,
-                                          fontSize: '0.95rem',
-                                          lineHeight: '1.4',
-                                          display: 'inline-block',
-                                          marginBottom: '0.25rem'
-                                        }}
-                                      >
-                                        {source.title}
-                                      </a>
+                                    {/* Journal and DOI */}
+                                    <div style={{ color: '#64748b', fontSize: '0.85rem', lineHeight: '1.4' }}>
+                                      {source.journal && (
+                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+                                          {source.journal.toLowerCase().includes('cochrane') && <span>🌐</span>}
+                                          {source.journal}.
+                                        </span>
+                                      )}
+                                      {source.year && <span> {source.year}; </span>}
+                                      {source.doi && (
+                                        <a
+                                          href={`https://doi.org/${source.doi.replace(/^https?:\/\/doi\.org\//, '')}`}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          style={{ color: '#64748b', textDecoration: 'none' }}
+                                        >
+                                          doi:{source.doi}
+                                        </a>
+                                      )}
+                                    </div>
 
-                                      {/* Authors */}
-                                      <div style={{ color: '#475569', fontSize: '0.85rem', marginBottom: '0.15rem' }}>
-                                        {formatAuthors(source.authors)}
-                                      </div>
+                                    {/* Badge row */}
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginTop: '0.5rem' }}>
+                                      {source.article_type && (
+                                        <span style={{
+                                          display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
+                                          color: '#64748b',
+                                          fontSize: '0.8rem',
+                                          fontWeight: 500
+                                        }}>
+                                          📋 {source.article_type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
+                                        </span>
+                                      )}
 
-                                      {/* Journal and DOI */}
-                                      <div style={{ color: '#64748b', fontSize: '0.85rem', lineHeight: '1.4' }}>
-                                        {source.journal && (
-                                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
-                                            {source.journal.toLowerCase().includes('cochrane') && <span>🌐</span>}
-                                            {source.journal}.
-                                          </span>
-                                        )}
-                                        {source.year && <span> {source.year}; </span>}
-                                        {source.doi && (
-                                          <a
-                                            href={`https://doi.org/${source.doi.replace(/^https?:\/\/doi\.org\//, '')}`}
-                                            target="_blank"
-                                            rel="noreferrer"
-                                            style={{ color: '#64748b', textDecoration: 'none' }}
-                                          >
-                                            doi:{source.doi}
-                                          </a>
-                                        )}
-                                      </div>
-
-                                      {/* Badge and PDF */}
-                                      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem', marginTop: '0.5rem' }}>
-                                        {source.article_type && (
-                                          <span style={{
-                                            display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
-                                            color: '#64748b',
-                                            fontSize: '0.8rem',
-                                            fontWeight: 500
-                                          }}>
-                                            <span style={{ fontSize: '1rem' }}>📋</span>
-                                            {source.article_type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
-                                          </span>
-                                        )}
-
-                                        {source.pdf_url && (
-                                          <button
-                                            onClick={() => setPdfUrl(source.pdf_url!)}
-                                            style={{
-                                              display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
-                                              backgroundColor: '#dc2626',
-                                              color: 'white',
-                                              fontSize: '0.75rem',
-                                              padding: '0.2rem 0.6rem',
-                                              borderRadius: '0.375rem',
-                                              fontWeight: 600,
-                                              border: 'none',
-                                              cursor: 'pointer',
-                                              boxShadow: '0 1px 2px rgba(0,0,0,0.1)'
-                                            }}
-                                          >
-                                            📕 PDF
-                                          </button>
-                                        )}
-                                      </div>
+                                      {source.pdf_url && (
+                                        <button
+                                          onClick={() => setPdfUrl(source.pdf_url!)}
+                                          className="pdf-badge"
+                                        >
+                                          📕 PDF Available
+                                        </button>
+                                      )}
                                     </div>
                                   </div>
-                                );
-                              })}
+                                </div>
+                              ))}
                             </div>
                           )}
                         </div>
                       )}
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
               <div ref={messagesEndRef} />
             </div>

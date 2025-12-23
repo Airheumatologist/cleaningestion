@@ -316,6 +316,15 @@ class MedicalRAGPipeline:
                         'corpus_id': pmcid,
                         'source': 'dailymed',
                         'set_id': dm.get('set_id', ''),
+                        # Include all 8 DailyMed sections for intelligent selection
+                        'highlights': dm.get('highlights', ''),
+                        'indications': dm.get('indications', ''),
+                        'dosage': dm.get('dosage', ''),
+                        'contraindications': dm.get('contraindications', ''),
+                        'warnings': dm.get('warnings', ''),
+                        'adverse_reactions': dm.get('adverse_reactions', ''),
+                        'clinical_pharmacology': dm.get('clinical_pharmacology', ''),
+                        'clinical_studies': dm.get('clinical_studies', ''),
                     })
                     existing_pmcids.add(pmcid)
             
@@ -546,8 +555,13 @@ class MedicalRAGPipeline:
     # Step 4: Direct LLM Synthesis
     # =========================================================================
     
-    def _get_papers_for_context(self, papers_df):
-        """Build context and get used papers from reranked articles."""
+    def _get_papers_for_context(self, papers_df, query: str = ""):
+        """Build context and get used papers from reranked articles.
+        
+        For DailyMed articles, intelligently selects sections:
+        - Always: highlights + clinical_studies
+        - Conditional: clinical_pharmacology (when query mentions mechanisms, PK/PD)
+        """
         from .specialty_journals import PRIORITY_JOURNALS
         HIGH_VALUE_TYPES = {'review_article', 'clinical_trial', 'systematic_review', 'meta_analysis', 'guideline'}
         
@@ -568,10 +582,7 @@ class MedicalRAGPipeline:
         all_papers = priority_journal_papers + other_papers
         used_papers = []
         context_parts = []
-        
-        full_text_count = 0
-        CHECK_TOP_N = 20
-        FULL_TEXTS_MAX = 5
+        dailymed_section_count = 0
 
         for i, (idx, row) in enumerate(all_papers[:MAX_ABSTRACTS]):
             article_type = row.get('article_type', 'other')
@@ -589,28 +600,59 @@ class MedicalRAGPipeline:
                 paper_info += f" ({row.get('year')})"
             paper_info += f" [{article_type}]"
 
-            # Selection logic: Top 5 full-texts within the top 20 results
-            full_text = row.get('full_text', '')
-            has_full_text = bool(full_text) and len(str(full_text)) > 500
-            
-            if i < CHECK_TOP_N and full_text_count < FULL_TEXTS_MAX and has_full_text:
-                text_content = full_text
-                limit = 10000
-                full_text_count += 1
-                paper_info += " [FULL TEXT]"
-            elif article_type == "drug_label" or row.get("source") == "dailymed":
-                text_content = row.get('abstract', '') or row.get('text', '')
-                limit = 6000
+            # DailyMed: Intelligent section selection
+            if article_type == "drug_label" or row.get("source") == "dailymed":
+                sections = []
+                
+                # Always include highlights (summary + boxed warning)
+                highlights = row.get('highlights', '')
+                if highlights:
+                    sections.append(f"### Highlights of Prescribing Information\n{highlights[:8000]}")
+                
+                # Always include clinical studies (efficacy data, trial results)
+                clinical_studies = row.get('clinical_studies', '')
+                if clinical_studies:
+                    sections.append(f"### Clinical Studies\n{clinical_studies[:15000]}")
+                
+                # Conditionally include clinical pharmacology
+                if self._needs_clinical_pharmacology(query):
+                    clinical_pharm = row.get('clinical_pharmacology', '')
+                    if clinical_pharm:
+                        sections.append(f"### Clinical Pharmacology\n{clinical_pharm[:10000]}")
+                
+                if sections:
+                    text_content = "\n\n".join(sections)
+                    dailymed_section_count += 1
+                else:
+                    # Fallback to abstract if no sections available
+                    text_content = (row.get('abstract', '') or row.get('text', ''))[:6000]
+                
+                text_content = self._clean_source_text(text_content)
+                paper_info += f"\n{text_content}"
             else:
+                # PMC articles: use abstract with 1200 char limit
                 text_content = row.get('abstract', '') or row.get('text', '')
-                limit = 1200
-
-            text_content = self._clean_source_text(text_content)
-            paper_info += f"\n{text_content[:limit]}"
+                text_content = self._clean_source_text(text_content)
+                paper_info += f"\n{text_content[:1200]}"
+            
             context_parts.append(paper_info)
             
-        logger.info(f"Context built: {len(context_parts)} papers, with {full_text_count} using full-text.")
+        logger.info(f"Context built: {len(context_parts)} papers ({dailymed_section_count} DailyMed with section selection).")
         return context_parts, used_papers
+
+    def _needs_clinical_pharmacology(self, query: str) -> bool:
+        """Check if query needs clinical pharmacology section (mechanism, PK/PD)."""
+        if not query:
+            return False
+        keywords = [
+            'mechanism', 'pharmacokinetic', 'pharmacodynamic', 'metabolism',
+            'half-life', 'half life', 'absorption', 'distribution', 'excretion', 
+            'clearance', 'pk', 'pd', 'bioavailability', 'drug interaction',
+            'cyp', 'enzyme', 'how does', 'how it works', 'mode of action',
+            'moa', 'pathway', 'receptor', 'binding'
+        ]
+        query_lower = query.lower()
+        return any(kw in query_lower for kw in keywords)
 
     def _clean_source_text(self, text: str) -> str:
         """
@@ -645,7 +687,7 @@ class MedicalRAGPipeline:
         if papers_df.empty:
             return ("No relevant evidence found for your query.", [], [])
 
-        context_parts, used_papers = self._get_papers_for_context(papers_df)
+        context_parts, used_papers = self._get_papers_for_context(papers_df, query)
         abstract_count = len(context_parts)
 
         logger.info(f"   Context: {abstract_count} abstracts = {len(context_parts)} total articles")
@@ -1016,7 +1058,7 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
         
         # [NEW] Reorder papers so reference ranking matches final citation order from the start
         # This prevents the UI from "jumping" and ensures references are correctly numbered
-        _, used_papers = self._get_papers_for_context(papers_df)
+        _, used_papers = self._get_papers_for_context(papers_df, query)
         
         # Prepare initial sources (no PDF URLs yet)
         initial_sources = []
@@ -1035,7 +1077,7 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
             return
 
         # Prepare context for generation
-        _, used_papers = self._get_papers_for_context(papers_df)
+        _, used_papers = self._get_papers_for_context(papers_df, query)
 
         # START PARALLEL TASKS: Generation + PDF Check
         yield {"step": "pdf_check", "status": "running", "message": "Checking PDF availability..."}

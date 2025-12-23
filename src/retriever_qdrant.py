@@ -127,6 +127,21 @@ class QdrantRetriever(AbstractRetriever):
             except Exception as e:
                 logger.warning(f"SPLADE encoder not available: {e}")
         
+        # Load drug name → set_id lookup for DailyMed
+        self.drug_setid_lookup = {}
+        try:
+            import os
+            lookup_path = os.path.join(os.path.dirname(__file__), "data", "drug_setid_lookup.json")
+            if os.path.exists(lookup_path):
+                import json
+                with open(lookup_path, "r") as f:
+                    self.drug_setid_lookup = json.load(f)
+                logger.info(f"✅ Loaded drug lookup with {len(self.drug_setid_lookup)} drugs")
+            else:
+                logger.warning(f"Drug lookup file not found: {lookup_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load drug lookup: {e}")
+        
         logger.info(f"Initialized QdrantRetriever: {COLLECTION_NAME} (Cloud Inference: {QDRANT_CLOUD_INFERENCE}, Local Fallback: {self.local_encoder is not None}, SPLADE: {self.splade_encoder is not None})")
     
     def _build_filter(self, **kwargs) -> Optional[Filter]:
@@ -588,7 +603,7 @@ class QdrantRetriever(AbstractRetriever):
             logger.error(f"Additional papers retrieval error: {e}")
             return []
     
-    def _drug_name_matches(self, search_term: str, label_name: str) -> bool:
+    def _drug_name_matches(self, search_term: str, label_name: str, additional_text: str = "") -> bool:
         """
         Check if a DailyMed drug label matches the searched drug name.
         
@@ -596,8 +611,14 @@ class QdrantRetriever(AbstractRetriever):
         - Brand names: "Humira" matches "HUMIRA INJECTION"
         - Generic names: "adalimumab" matches "Adalimumab Injection Solution"
         - Partial matches: "tofacitinib" matches "Xeljanz (tofacitinib)"
+        - Generic in highlights: "voclosporin" matches LUPKYNIS via highlights text
         
-        Returns True if the search term appears in the label name.
+        Args:
+            search_term: The drug name to search for
+            label_name: The drug label/title from DailyMed
+            additional_text: Additional text to search (e.g., highlights section)
+        
+        Returns True if the search term appears in the label name or additional text.
         """
         if not search_term or not label_name:
             return False
@@ -605,7 +626,7 @@ class QdrantRetriever(AbstractRetriever):
         search_lower = search_term.lower().strip()
         label_lower = label_name.lower().strip()
         
-        # Direct substring match
+        # Direct substring match in label name
         if search_lower in label_lower:
             return True
         
@@ -618,111 +639,140 @@ class QdrantRetriever(AbstractRetriever):
             if word.startswith(search_lower) and len(word) - len(search_lower) <= 5:
                 return True
         
+        # Check additional text (e.g., highlights section for generic name)
+        # This catches cases like searching for "voclosporin" when label is "LUPKYNIS"
+        # but highlights contains "LUPKYNIS (voclosporin) capsules"
+        if additional_text:
+            additional_lower = additional_text.lower()
+            # Look for the drug name in the first 500 chars of highlights (prescribing info header)
+            if search_lower in additional_lower[:500]:
+                return True
+        
         return False
 
     def search_dailymed_by_drug(self, drug_names: List[str], limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Search DailyMed drug labels by drug name using vector search.
+        Search DailyMed drug labels using pre-built lookup table.
         
-        Optimized for latency with parallel searches and accuracy with:
-        - MUST filters for DailyMed source
-        - Minimum similarity score threshold (0.45)
-        - Text-based drug name validation to prevent irrelevant results
+        Strategy:
+        1. Look up drug names in the drug_setid_lookup (O(1) instant)
+        2. Fetch ONE article per drug (first set_id) - avoids duplicate manufacturers
+        3. Deduplicate by set_id - if user asks for "voclosporin" AND "lupkynis",
+           only one article is returned since they share the same set_id
+        4. Fallback to keyword search for drugs not in lookup
         """
         if not drug_names:
             return []
         
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        # Minimum similarity score for DailyMed results
-        DAILYMED_SCORE_THRESHOLD = 0.45
-        
         all_results = []
-        seen_ids = set()
-        lock = threading.Lock()
+        seen_set_ids = set()  # Dedup by set_id (handles brand/generic overlap)
         
-        def search_single_drug(drug_name: str):
-            # Build filter for DailyMed source ONLY (must)
-            drug_filter = Filter(
+        for drug_name in drug_names[:5]:  # Allow up to 5 drugs
+            drug_lower = drug_name.lower().strip()
+            
+            # Step 1: Try lookup table (instant, O(1))
+            if drug_lower in self.drug_setid_lookup:
+                lookup_data = self.drug_setid_lookup[drug_lower]
+                set_ids = lookup_data.get("set_ids", [])
+                
+                if set_ids:
+                    # Only take FIRST set_id (one article per drug)
+                    first_set_id = set_ids[0]
+                    
+                    # Skip if we already have this set_id (handles brand/generic overlap)
+                    if first_set_id in seen_set_ids:
+                        logger.info(f"   💊 '{drug_name}' → already have set_id (brand/generic overlap)")
+                        continue
+                    
+                    logger.info(f"   💊 Lookup hit: '{drug_name}' → 1 set_id (out of {len(set_ids)} available)")
+                    
+                    # Fetch from Qdrant by set_id
+                    result = self._fetch_dailymed_by_set_id(first_set_id)
+                    if result:
+                        seen_set_ids.add(first_set_id)
+                        all_results.append(result)
+                    continue  # Got result from lookup, skip to next drug
+            
+            # Step 2: Fallback to keyword search (limit to 1 result per drug)
+            logger.info(f"   💊 Lookup miss for '{drug_name}', trying keyword search")
+            keyword_results = self._keyword_search_dailymed(drug_name, limit=1)
+            
+            for result in keyword_results:
+                set_id = result.get("set_id")
+                if set_id and set_id not in seen_set_ids:
+                    seen_set_ids.add(set_id)
+                    all_results.append(result)
+                    break  # Only take first result
+        
+        if all_results:
+            logger.info(f"   ✅ Found {len(all_results)} DailyMed articles (1 per drug)")
+        
+        return all_results
+    
+    def _fetch_dailymed_by_set_id(self, set_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a DailyMed drug label from Qdrant by its set_id.
+        """
+        try:
+            filter_by_id = Filter(
                 must=[
                     FieldCondition(key="source", match=MatchValue(value="dailymed")),
+                    FieldCondition(key="set_id", match=MatchValue(value=set_id)),
                 ]
             )
             
-            try:
-                # Use just the drug name for maximum semantic similarity
-                query_text = drug_name
+            results, _ = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=filter_by_id,
+                limit=1,
+                with_payload=True
+            )
+            
+            if results:
+                passage = self._transform_dailymed_payload(results[0].payload, 1.0)
+                passage["stype"] = "dailymed_lookup"
+                return passage
                 
-                # Over-fetch to account for filtering (3x limit)
-                fetch_limit = limit * 3
-                
-                if QDRANT_CLOUD_INFERENCE:
-                    results = self.client.query_points(
-                        collection_name=self.collection_name,
-                        query=Document(text=query_text, model=self.embedding_model),
-                        limit=fetch_limit,
-                        score_threshold=DAILYMED_SCORE_THRESHOLD,  # Filter low-scoring results
-                        query_filter=drug_filter,
-                        with_payload=True
-                    )
-                else:
-                    query_vector = self.local_encoder.encode(query_text).tolist()
-                    results = self.client.query_points(
-                        collection_name=self.collection_name,
-                        query=query_vector,
-                        limit=fetch_limit,
-                        score_threshold=DAILYMED_SCORE_THRESHOLD,
-                        query_filter=drug_filter,
-                        with_payload=True
-                    )
-                
-                if results and results.points:
-                    logger.info(f"   DailyMed search for '{drug_name}' returned {len(results.points)} candidates (score >= {DAILYMED_SCORE_THRESHOLD})")
-                    
-                    drug_passages = []
-                    filtered_count = 0
-                    for point in results.points:
-                        set_id = point.payload.get("set_id", "")
-                        drug_label_name = point.payload.get("drug_name", "") or point.payload.get("title", "")
-                        
-                        # Validate drug name matches the search term
-                        if not self._drug_name_matches(drug_name, drug_label_name):
-                            filtered_count += 1
-                            logger.debug(f"   Filtered DailyMed '{drug_label_name}' - doesn't match '{drug_name}'")
-                            continue
-                        
-                        # Deduplication by set_id
-                        if set_id and set_id not in seen_ids:
-                            with lock:
-                                if set_id not in seen_ids:
-                                    seen_ids.add(set_id)
-                                    passage = self._transform_dailymed_payload(point.payload, point.score)
-                                    passage["stype"] = "dailymed_search"
-                                    drug_passages.append(passage)
-                                    
-                                    # Stop if we have enough results for this drug
-                                    if len(drug_passages) >= limit:
-                                        break
-                    
-                    if filtered_count > 0:
-                        logger.info(f"   Filtered out {filtered_count} DailyMed results that didn't match '{drug_name}'")
-                    
-                    return drug_passages
-            except Exception as e:
-                logger.warning(f"DailyMed search for '{drug_name}' failed: {e}")
-            return []
-
-        # Run multi-drug searches in parallel
-        with ThreadPoolExecutor(max_workers=min(len(drug_names), 3)) as executor:
-            future_to_drug = {executor.submit(search_single_drug, d): d for d in drug_names[:3]}
-            for future in as_completed(future_to_drug):
-                results = future.result()
-                if results:
-                    all_results.extend(results)
+        except Exception as e:
+            logger.warning(f"   Qdrant fetch by set_id failed: {e}")
         
-        if all_results:
-            logger.info(f"   Found total {len(all_results)} validated DailyMed results")
-        return all_results
+        return None
+    
+    def _keyword_search_dailymed(self, drug_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Fallback: Keyword search using MatchText on drug_name OR highlights fields.
+        """
+        try:
+            keyword_filter = Filter(
+                must=[
+                    FieldCondition(key="source", match=MatchValue(value="dailymed")),
+                ],
+                should=[
+                    FieldCondition(key="drug_name", match=MatchText(text=drug_name)),
+                    FieldCondition(key="highlights", match=MatchText(text=drug_name)),
+                ]
+            )
+            
+            results, _ = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=keyword_filter,
+                limit=limit,
+                with_payload=True
+            )
+            
+            passages = []
+            for point in results:
+                passage = self._transform_dailymed_payload(point.payload, 0.95)
+                passage["stype"] = "dailymed_keyword"
+                passages.append(passage)
+            
+            if passages:
+                logger.info(f"   Keyword fallback found {len(passages)} results for '{drug_name}'")
+            return passages
+            
+        except Exception as e:
+            logger.warning(f"   Keyword search failed for '{drug_name}': {e}")
+            return []
 
     
     def search_bulk(
