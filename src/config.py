@@ -19,12 +19,15 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = "pmc_medical_rag_fulltext"
 GRAPHRAG_COLLECTION_NAME = "pmc_medical_graphrag"  # New Graph RAG enhanced collection
 QDRANT_CLOUD_INFERENCE = True  # Use Qdrant cloud inference for embeddings
+QDRANT_TIMEOUT = 180  # Client timeout in seconds
+QDRANT_RETRY_COUNT = 3  # Number of retries for transient failures
+QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
 
 # =============================================================================
 # LLM Configuration (OpenRouter)
 # =============================================================================
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"  # Nvidia Nemotron model via OpenRouter
+OPENROUTER_MODEL = "openai/gpt-oss-120b"  # OpenAI GPT-OSS-120B model via OpenRouter
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # Legacy OpenAI (for backward compatibility)
@@ -47,7 +50,7 @@ EMBEDDING_DIMENSION = 1024
 
 # SPLADE Sparse Vector Configuration
 SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
-USE_HYBRID_SEARCH = False  # Disabled - using dense vectors only (SPLADE not ingested)
+USE_HYBRID_SEARCH = True  # Enabled - 100% of documents have sparse vectors
 DENSE_WEIGHT = 0.7  # Weight for dense vector scores in hybrid search
 SPARSE_WEIGHT = 0.3  # Weight for sparse vector scores in hybrid search
 
@@ -67,11 +70,12 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 # Query Preprocessing Configuration - SCALED UP FOR 150+ ARTICLES
 # =============================================================================
 QUERY_EXPANSION_COUNT = 4  # Number of expanded query variations
-BULK_RETRIEVAL_LIMIT = 600  # Increased from 300 to 600 - Max candidates before reranking
-BULK_RETRIEVAL_PER_QUERY = 100  # Increased from 75 to 100 - Candidates per expanded query
+BULK_RETRIEVAL_LIMIT = 600  # Increased from 300 for better coverage
+BULK_RETRIEVAL_PER_QUERY = 150  # Increased from 75 - more candidates before reranking
 RERANK_TOP_K = 100  # Increased from 30 to 100 - Final articles after reranking (keep more before aggregation)
 MAX_ABSTRACTS = 150  # Maximum abstracts to use in context (no full text) - TARGET: Use ALL 150
 MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)
+
 
 # =============================================================================
 # Multi-Stage Generation Configuration - NEW FOR 150+ ARTICLES

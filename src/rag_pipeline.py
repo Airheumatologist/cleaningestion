@@ -11,6 +11,7 @@ Designed for speed and quality clinical education responses.
 """
 
 import logging
+import re
 from typing import List, Dict, Any, Generator
 from dataclasses import asdict
 from openai import OpenAI
@@ -42,8 +43,12 @@ class MedicalRAGPipeline:
         model: str = OPENROUTER_MODEL,
         n_retrieval: int = 150,
         n_rerank: int = -1,  # -1 = no limit
-        context_threshold: float = 0.0
+        context_threshold: float = 0.3  # Post-aggregation threshold on boosted_score
+        # Note: This is the FINAL threshold after Cohere reranking + entity matching + evidence boosts
+        # With evidence tier multipliers (1.0-1.8x), 0.3 ensures good recall while filtering noise
+        # Cohere-specific filtering (0.1 minimum) is done earlier in PaperFinderWithReranker.rerank()
     ):
+
         """Initialize pipeline components."""
         logger.info("🚀 Initializing Elixir Medical RAG Pipeline...")
 
@@ -104,38 +109,121 @@ class MedicalRAGPipeline:
         self,
         processed_query: LLMProcessedQuery
     ) -> List[Dict[str, Any]]:
-        """Retrieve passages from Qdrant."""
-        logger.info("🔍 Step 2: Passage Retrieval")
+        """
+        Retrieve passages from Qdrant using multi-query expansion.
+        
+        Optimized: Runs PMC variations AND DailyMed searches in parallel.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        logger.info("🔍 Step 2: Passage Retrieval (Parallel PMC + DailyMed)")
         
         all_passages = []
+        dailymed_results = []
         seen_ids = set()
         
-        # Primary retrieval with rewritten query
-        passages = self.retriever.retrieve_passages(
-            processed_query.rewritten_query,
-            **processed_query.search_filters
-        )
+        # Get queries and drug names
+        queries_to_run = processed_query.expanded_queries or [processed_query.rewritten_query]
+        if processed_query.keyword_query and processed_query.keyword_query not in queries_to_run:
+            queries_to_run.append(processed_query.keyword_query)
+            
+        drug_names = []
+        if processed_query.decomposed and processed_query.decomposed.drug_names:
+            drug_names = processed_query.decomposed.drug_names
+        else:
+            # Fallback to manual extraction if decomposition failed
+            drug_names = self._extract_drug_names(processed_query.original_query, processed_query.rewritten_query)
+
+        logger.info(f"   PMC Queries: {len(queries_to_run)} | DailyMed Drugs: {len(drug_names)}")
         
-        for p in passages:
-            pmcid = p.get("pmcid")
-            if pmcid not in seen_ids:
-                seen_ids.add(pmcid)
-                all_passages.append(p)
+        def run_single_pmc_query(query: str) -> List[Dict[str, Any]]:
+            try:
+                return self.retriever.retrieve_passages(query, **processed_query.search_filters)
+            except Exception as e:
+                logger.warning(f"PMC query failed: {query[:40]}... - {e}")
+                return []
+
+        def run_dailymed_search(drugs: List[str]) -> List[Dict[str, Any]]:
+            try:
+                if not drugs: return []
+                return self.retriever.search_dailymed_by_drug(drugs)
+            except Exception as e:
+                logger.warning(f"DailyMed search failed: {e}")
+                return []
+
+        # Run ALL retrieval tasks in parallel (PMC + DailyMed)
+        with ThreadPoolExecutor(max_workers=max(len(queries_to_run) + 1, 5)) as executor:
+            # PMC variations
+            pmc_futures = {executor.submit(run_single_pmc_query, q): q for q in queries_to_run}
+            # DailyMed search
+            dm_future = executor.submit(run_dailymed_search, drug_names)
+            
+            # Wait for DailyMed
+            try:
+                dailymed_results = dm_future.result()
+                if dailymed_results:
+                    logger.info(f"   ✅ Parallel DailyMed search found {len(dailymed_results)} results")
+            except Exception as e:
+                logger.warning(f"DailyMed task failed: {e}")
+
+            # Collect PMC results as they arrive
+            for future in as_completed(pmc_futures):
+                query = pmc_futures[future]
+                try:
+                    passages = future.result()
+                    for p in passages:
+                        pmcid = p.get("pmcid")
+                        if pmcid and pmcid not in seen_ids:
+                            seen_ids.add(pmcid)
+                            all_passages.append(p)
+                except Exception as e:
+                    logger.warning(f"PMC query thread failed for '{query[:30]}': {e}")
         
-        # Additional retrieval with keyword query
-        if processed_query.keyword_query:
-            keyword_passages = self.retriever.retrieve_additional_papers(
-                processed_query.keyword_query,
-                **processed_query.search_filters
-            )
-            for p in keyword_passages:
-                pmcid = p.get("pmcid")
-                if pmcid not in seen_ids:
-                    seen_ids.add(pmcid)
-                    all_passages.append(p)
+        logger.info(f"   Retrieved {len(all_passages)} unique PMC passages")
+        return all_passages, dailymed_results
+
+    
+    def _extract_drug_names(self, original_query: str, rewritten_query: str) -> List[str]:
+        """
+        Extract drug names from query using simple pattern matching.
         
-        logger.info(f"   Retrieved {len(all_passages)} passages")
-        return all_passages
+        Looks for capitalized words that look like drug names (brand names)
+        and known drug name patterns.
+        """
+        import re
+        
+        # Combine queries for better coverage
+        text = f"{original_query} {rewritten_query}".lower()
+        
+        drug_names = set()
+        
+        # Common brand name drugs that are often asked about
+        common_drugs = [
+            "xeljanz", "tofacitinib", "humira", "adalimumab", "enbrel", "etanercept",
+            "remicade", "infliximab", "rituxan", "rituximab", "orencia", "abatacept",
+            "actemra", "tocilizumab", "simponi", "golimumab", "cimzia", "certolizumab",
+            "rinvoq", "upadacitinib", "olumiant", "baricitinib", "kevzara", "sarilumab",
+            "methotrexate", "mtx", "plaquenil", "hydroxychloroquine", "sulfasalazine",
+            "leflunomide", "arava", "azathioprine", "imuran", "cyclosporine",
+            "prednisone", "prednisolone", "methylprednisolone", "dexamethasone",
+            "celebrex", "celecoxib", "meloxicam", "naproxen", "ibuprofen",
+            "taltz", "ixekizumab", "cosentyx", "secukinumab", "stelara", "ustekinumab",
+            "dupixent", "dupilumab", "otezla", "apremilast", "tremfya", "guselkumab",
+        ]
+        
+        for drug in common_drugs:
+            if drug in text:
+                drug_names.add(drug)
+        
+        # Extract capitalized words that might be brand names
+        capitalized_words = re.findall(r'\b[A-Z][a-z]{3,}\b', original_query)
+        for word in capitalized_words:
+            if len(word) >= 4 and word.lower() not in ["what", "when", "where", "which", "this", "that", "with", "from", "have"]:
+                drug_names.add(word.lower())
+        
+        return list(drug_names)[:5]  # Limit to 5 drugs
+
+
     
     # =========================================================================
     # Step 3: Reranking & Aggregation
@@ -144,9 +232,18 @@ class MedicalRAGPipeline:
     def rerank_and_aggregate(
         self,
         query: str,
-        passages: List[Dict[str, Any]]
+        passages: List[Dict[str, Any]],
+        dailymed_results: List[Dict[str, Any]] = None
     ):
-        """Rerank passages and aggregate to paper level."""
+        """Rerank passages and aggregate to paper level.
+        
+        Args:
+            query: User query
+            passages: Main passages (will be reranked)
+            dailymed_results: DailyMed drug labels (bypass reranking, merged directly)
+        """
+        import pandas as pd
+        
         logger.info("📊 Step 3: Reranking & Aggregation")
 
         if self.paper_finder is None:
@@ -156,7 +253,6 @@ class MedicalRAGPipeline:
             reranked = passages[:self.retriever.n_retrieval]  # Limit to n_retrieval
 
             # Create a basic DataFrame-like structure (abstracts only - no full text)
-            import pandas as pd
             papers_df = pd.DataFrame([{
                 'pmcid': p.get('pmcid', ''),
                 'title': p.get('title', ''),
@@ -171,8 +267,19 @@ class MedicalRAGPipeline:
                 'corpus_id': p.get('corpus_id', '')
             } for p in reranked])
         else:
-            # Rerank all passages
-            reranked = self.paper_finder.rerank(query, passages)
+            # Optimization: Deduplicate passages at paper level BEFORE reranking
+            # This significantly reduces reranker latency and cost
+            logger.info(f"   Deduplicating {len(passages)} passages before reranking...")
+            unique_passages = []
+            seen_paper_ids = set()
+            for p in passages:
+                pid = p.get("pmcid") or p.get("corpus_id")
+                if pid and pid not in seen_paper_ids:
+                    seen_paper_ids.add(pid)
+                    unique_passages.append(p)
+            
+            logger.info(f"   Reranking {len(unique_passages)} unique candidate papers")
+            reranked = self.paper_finder.rerank(query, unique_passages)
 
             # Aggregate to paper level and format as DataFrame
             papers_df = self.paper_finder.aggregate_into_dataframe(reranked)
@@ -185,7 +292,40 @@ class MedicalRAGPipeline:
         # Post-retrieval filtering: filter out papers that don't contain key medical entities
         papers_df = self._filter_by_entities(query, papers_df)
         
+        # MERGE DailyMed results directly (bypass reranking and thresholds)
+        if dailymed_results:
+            logger.info(f"   Merging {len(dailymed_results)} DailyMed results (bypassed reranking)")
+            existing_pmcids = set(papers_df['pmcid'].tolist()) if not papers_df.empty else set()
+            
+            # Create rows for DailyMed - give them high relevance score to appear at top
+            dailymed_rows = []
+            for dm in dailymed_results:
+                pmcid = dm.get('pmcid', '')
+                if pmcid and pmcid not in existing_pmcids:
+                    dailymed_rows.append({
+                        'pmcid': pmcid,
+                        'title': dm.get('title', ''),
+                        'authors': dm.get('authors', []),
+                        'venue': dm.get('venue', '') or dm.get('journal', 'DailyMed'),
+                        'journal': dm.get('journal', 'DailyMed'),
+                        'year': dm.get('year'),
+                        'doi': dm.get('doi', ''),
+                        'article_type': dm.get('article_type', 'drug_label'),
+                        'relevance_score': 0.95,  # High score to appear near top
+                        'abstract': dm.get('abstract', ''),
+                        'corpus_id': pmcid,
+                        'source': 'dailymed',
+                        'set_id': dm.get('set_id', ''),
+                    })
+                    existing_pmcids.add(pmcid)
+            
+            if dailymed_rows:
+                dailymed_df = pd.DataFrame(dailymed_rows)
+                papers_df = pd.concat([dailymed_df, papers_df], ignore_index=True)
+                logger.info(f"   Total papers after DailyMed merge: {len(papers_df)}")
+        
         return papers_df, reranked
+
     
     def _deduplicate_dailymed(self, papers_df) -> Any:
         """
@@ -406,33 +546,15 @@ class MedicalRAGPipeline:
     # Step 4: Direct LLM Synthesis
     # =========================================================================
     
-    def run_generation(
-        self,
-        query: str,
-        papers_df
-    ):
-        """Generate answer directly using LLM with ELIXIR system prompt."""
-        logger.info("🧠 Step 4: Direct LLM Synthesis")
-
-        if papers_df.empty:
-            return ("No relevant evidence found for your query.", [], [])
-
-        # Context configuration: Abstracts only (no full text)
+    def _get_papers_for_context(self, papers_df):
+        """Build context and get used papers from reranked articles."""
         from .specialty_journals import PRIORITY_JOURNALS
-
         HIGH_VALUE_TYPES = {'review_article', 'clinical_trial', 'systematic_review', 'meta_analysis', 'guideline'}
-        ABSTRACT_LIMIT = 1200  # Chars per abstract (increased since no full text)
-
-        # Build context from reranked papers with journal prioritization
-        context_parts = []
-        abstract_count = 0
-
-        # First pass: prioritize high-value articles from priority journals
+        
         priority_journal_papers = []
         other_papers = []
 
         for idx, row in papers_df.head(MAX_ABSTRACTS).iterrows():
-            corpus_id = row.get('corpus_id', '')
             journal = row.get('journal', '') or row.get('venue', '')
             is_priority_journal = journal in PRIORITY_JOURNALS
             article_type = row.get('article_type', 'other')
@@ -443,22 +565,23 @@ class MedicalRAGPipeline:
             else:
                 other_papers.append((idx, row))
 
-        # Combine: priority journals first, then others
         all_papers = priority_journal_papers + other_papers
+        used_papers = []
+        context_parts = []
+        
+        full_text_count = 0
+        CHECK_TOP_N = 20
+        FULL_TEXTS_MAX = 5
 
-        used_papers = []  # Track order for reference generation
-
-        for idx, row in all_papers[:MAX_ABSTRACTS]:
+        for i, (idx, row) in enumerate(all_papers[:MAX_ABSTRACTS]):
             article_type = row.get('article_type', 'other')
             source_num = len(context_parts) + 1
-
-            # Track for reference section - convert pandas Series to dict for JSON serialization
+            
             if hasattr(row, 'to_dict'):
                 used_papers.append(row.to_dict())
             else:
                 used_papers.append(dict(row))
 
-            # Build paper header with metadata
             paper_info = f"**[{source_num}]** {row.get('title', 'Untitled')}"
             if row.get('venue') or row.get('journal'):
                 paper_info += f" | *{row.get('venue') or row.get('journal')}*"
@@ -466,75 +589,138 @@ class MedicalRAGPipeline:
                 paper_info += f" ({row.get('year')})"
             paper_info += f" [{article_type}]"
 
-            # Use abstract only (no full text)
-            abstract = row.get('abstract', '') or row.get('text', '')
-            paper_info += f"\n{abstract[:ABSTRACT_LIMIT]}"
-            abstract_count += 1
+            # Selection logic: Top 5 full-texts within the top 20 results
+            full_text = row.get('full_text', '')
+            has_full_text = bool(full_text) and len(str(full_text)) > 500
+            
+            if i < CHECK_TOP_N and full_text_count < FULL_TEXTS_MAX and has_full_text:
+                text_content = full_text
+                limit = 10000
+                full_text_count += 1
+                paper_info += " [FULL TEXT]"
+            elif article_type == "drug_label" or row.get("source") == "dailymed":
+                text_content = row.get('abstract', '') or row.get('text', '')
+                limit = 6000
+            else:
+                text_content = row.get('abstract', '') or row.get('text', '')
+                limit = 1200
 
+            text_content = self._clean_source_text(text_content)
+            paper_info += f"\n{text_content[:limit]}"
             context_parts.append(paper_info)
+            
+        logger.info(f"Context built: {len(context_parts)} papers, with {full_text_count} using full-text.")
+        return context_parts, used_papers
+
+    def _clean_source_text(self, text: str) -> str:
+        """
+        Strip internal citations from source text to prevent LLM confusion.
+        Target patterns: [1], [1, 2], [1-5], [1,2,3], etc.
+        """
+        if not text:
+            return ""
+        
+        # Pattern for [1], [1, 2], [1-5], [1,2,3] etc.
+        # Targets brackets containing numbers, commas, spaces, and hyphens/dashes.
+        # Includes leading space to avoid "statement [1]." -> "statement ."
+        cleaned = re.sub(r'\s*\[[\d\s,\-\–\.]+\]', '', text)
+        
+        # Also handle potential superscript numbers if they were converted to text like ^1
+        cleaned = re.sub(r'\^[\d,]+', '', cleaned)
+        
+        # Basic cleanup of double spaces resulting from removal
+        cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+        
+        return cleaned.strip()
+
+    def run_generation(
+        self,
+        query: str,
+        papers_df,
+        stream: bool = False
+    ):
+        """Generate answer directly using LLM with ELIXIR system prompt."""
+        logger.info("🧠 Step 4: Direct LLM Synthesis")
+
+        if papers_df.empty:
+            return ("No relevant evidence found for your query.", [], [])
+
+        context_parts, used_papers = self._get_papers_for_context(papers_df)
+        abstract_count = len(context_parts)
 
         logger.info(f"   Context: {abstract_count} abstracts = {len(context_parts)} total articles")
         context = "\n\n---\n\n".join(context_parts)
 
-        user_prompt = f"""Analyze and synthesize the following medical literature to create a detailed, clinically-focused response for healthcare professionals.
+        # Use ELIXIR_SYSTEM_PROMPT for comprehensive deep research responses
+        system_prompt = ELIXIR_SYSTEM_PROMPT
+        logger.info(f"   Mode: Deep Research | Prompt: {len(system_prompt)} chars")
 
-**Clinical Query**: {query}
+        # Use comprehensive deep research prompt
+        user_prompt = f"""
+# [QUERY]
+{query}
 
-**Instructions**:
-1. **Extract specific clinical details** from the abstracts below:
-   - Classification/staging systems (e.g., Hurley staging, TNM staging) with criteria for each level
-   - Specific medications with brand/generic names, dosing protocols, administration routes, and durations
-   - Surgical approaches and procedural techniques with specific indications
-   - Trial results with specific outcomes, p-values, and clinical significance
-   - Latest guideline recommendations and regulatory updates
-
-2. **Provide comparative analyses** when multiple treatment options exist:
-   - Efficacy comparisons with specific data points
-   - Safety profiles and contraindications
-   - Clinical scenarios where one approach is preferred
-
-3. **Structure your response** with:
-   - Clear section headings for different aspects (pathogenesis, diagnosis, staging, treatment options, etc.)
-   - Markdown tables for staging systems, treatment comparisons, and medication protocols
-   - Evidence-based recommendations with specific citations to the source articles
-
-4. **Depth requirement**: This should read like a detailed clinical review or practice guideline section, with sufficient technical detail for physician decision-making.
-
-5. **Citation requirement**: Use inline citations **[1]**, **[2]**, etc. to cite specific articles that support each claim.
-
-**Source Literature** ({abstract_count} abstracts):
+# [CONTEXT]
+(Source Literature: {abstract_count} articles)
 {context}
 
-Generate a comprehensive, evidence-based clinical response that synthesizes findings across the {abstract_count} abstracts provided. Cross-reference multiple sources to identify consensus and note any conflicting evidence."""
+# [INSTRUCTIONS]
+Analyze and synthesize the medical literature above to create a detailed, clinically-focused clinical review or practice guideline section.
+1. **Extract specific clinical details**: Classification systems, staging criteria, detailed medication protocols (dosing, administration, duration), trial results (outcomes, p-values), and guideline recommendations.
+2. **Provide comparative analyses**: Efficacy comparisons with data points and safety profiles.
+3. **Structure**: Use clear hierarchical headings, markdown tables for comparisons/staging, and evidence-based recommendations.
+4. **Citation**: Use inline citations **[1]**, **[2]**, etc. strictly.
+5. **Depth**: High technical detail for physician decision-making. No word count limit, but maintain density.
+"""
 
         try:
-            response = self.openai_client.responses.create(
+            if stream:
+                # Return a generator for tokens
+                return self._stream_generation(query, user_prompt, used_papers)
+            
+            response = self.openai_client.chat.completions.create(
                 model=self.model,
-                input=[
-                    {"role": "system", "content": ELIXIR_SYSTEM_PROMPT},
+                messages=[
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
-                ],
-                text={
-                    "format": {
-                        "type": "text"
-                    },
-                    "verbosity": "medium"
-                },
-                reasoning={
-                    "effort": "medium"
-                },
-                store=False
+                ]
             )
 
-            answer = response.output_text.strip()
-
+            answer = response.choices[0].message.content.strip()
             logger.info(f"   Generated response ({len(answer)} chars)")
-            # Return answer and used papers (no full_text_articles tracking)
             return answer, used_papers
 
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             return (f"Error generating response: {str(e)}", [])
+
+    def _stream_generation(self, query: str, user_prompt: str, used_papers: list) -> Generator[Dict[str, Any], None, None]:
+        """Generator for token-by-token streaming."""
+        try:
+            # Use ELIXIR_SYSTEM_PROMPT for deep research
+            system_prompt = ELIXIR_SYSTEM_PROMPT
+            
+            response = self.openai_client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                stream=True
+            )
+            
+            full_answer = ""
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    full_answer += token
+                    yield {"step": "generation", "status": "running", "token": token}
+            
+            yield {"step": "generation", "status": "complete", "answer": full_answer, "used_papers": used_papers}
+            
+        except Exception as e:
+            logger.error(f"Streaming generation failed: {e}")
+            yield {"step": "error", "message": str(e)}
     
     # =========================================================================
     # PDF Availability Check via Europe PMC
@@ -564,43 +750,11 @@ Generate a comprehensive, evidence-based clinical response that synthesizes find
         
         def check_single_pdf(paper) -> dict:
             """Check PDF for a single paper via Europe PMC API."""
-            pmcid = paper.get("pmcid") or paper.get("corpus_id", "")
-            source_type = paper.get("source", "")
+            source = self._map_paper_to_source(paper)
             
-            # Detect DailyMed articles
-            is_dailymed = (
-                source_type == "dailymed" or 
-                paper.get("article_type") == "drug_label" or
-                str(pmcid).startswith("dailymed_")
-            )
-            
-            # Extract set_id for DailyMed articles
-            set_id = None
-            if is_dailymed:
-                set_id = paper.get("set_id", "")
-                if not set_id and str(pmcid).startswith("dailymed_"):
-                    set_id = pmcid.replace("dailymed_", "")
-            
-            source = {
-                "pmcid": pmcid,
-                "pmid": paper.get("pmid", ""),
-                "title": paper.get("title", "Untitled"),
-                "authors": paper.get("authors", []),
-                "journal": paper.get("venue") or paper.get("journal", ""),
-                "year": paper.get("year"),
-                "doi": paper.get("doi", ""),
-                "article_type": paper.get("article_type", ""),
-                "relevance_score": paper.get("relevance_judgement", 0),
-                "pdf_url": None,
-                # DailyMed-specific fields
-                "source": source_type,
-                "set_id": set_id,
-                "dailymed_url": f"https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid={set_id}" if set_id else None,
-            }
-            
-            doi = paper.get("doi", "")
-            pmcid = paper.get("pmcid") or paper.get("corpus_id", "")
-            pmid = paper.get("pmid", "")
+            doi = source.get("doi", "")
+            pmcid = source.get("pmcid", "")
+            pmid = source.get("pmid", "")
             
             try:
                 # Build query - try DOI first, then PMCID, then PMID
@@ -617,11 +771,12 @@ Generate a comprehensive, evidence-based clinical response that synthesizes find
                     query = f"EXT_ID:{pmid}"
                     
                 if not query:
-                    return source
+                    return self._map_paper_to_source(paper)
                 
                 api_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={requests.utils.quote(query)}&format=json&resultType=core&pageSize=1"
                 
                 response = requests.get(api_url, timeout=10)
+                source = self._map_paper_to_source(paper)
                 if response.status_code == 200:
                     data = response.json()
                     results = data.get("resultList", {}).get("result", [])
@@ -657,11 +812,13 @@ Generate a comprehensive, evidence-based clinical response that synthesizes find
                                     
             except requests.exceptions.Timeout:
                 logger.debug(f"PDF check timed out for {doi or pmcid or pmid}")
+                source = self._map_paper_to_source(paper)
             except Exception as e:
                 logger.debug(f"PDF check failed for {doi or pmcid or pmid}: {e}")
+                source = self._map_paper_to_source(paper)
             
             return source
-        
+
         logger.info("📄 Step 5: Checking PDF availability via Europe PMC")
         
         if not papers:
@@ -688,6 +845,57 @@ Generate a comprehensive, evidence-based clinical response that synthesizes find
         logger.info(f"   Found {pdf_count}/{len(sources)} articles with open access PDFs")
         
         return sources
+
+    def _map_paper_to_source(self, paper: Any) -> Dict[str, Any]:
+        """
+        Helper to map a paper record (Dict or Series) to a standardized source object.
+        Used both in initial streaming and final PDF verification.
+        """
+        # Convert Series/Namespace to dict if needed
+        if hasattr(paper, 'to_dict'):
+            p = paper.to_dict()
+        else:
+            p = dict(paper)
+
+        pmcid = p.get("pmcid") or p.get("corpus_id", "")
+        source_type = p.get("source", "")
+        
+        # Detect DailyMed articles
+        is_dailymed = (
+            source_type == "dailymed" or 
+            p.get("article_type") == "drug_label" or
+            str(pmcid).startswith("dailymed_")
+        )
+        
+        # Extract set_id for DailyMed articles
+        set_id = p.get("set_id", "")
+        if is_dailymed and not set_id and str(pmcid).startswith("dailymed_"):
+            set_id = pmcid.replace("dailymed_", "")
+
+        # Helper to sanitize NaN values (pandas can return float('nan') which breaks JSON)
+        def sanitize(val, default=""):
+            import math
+            if val is None:
+                return default
+            if isinstance(val, float) and math.isnan(val):
+                return default
+            return val
+
+        return {
+            "pmcid": pmcid,
+            "pmid": sanitize(p.get("pmid"), ""),
+            "title": sanitize(p.get("title"), "Untitled"),
+            "authors": p.get("authors", []),
+            "journal": sanitize(p.get("venue") or p.get("journal"), ""),
+            "year": sanitize(p.get("year")),
+            "doi": sanitize(p.get("doi"), ""),
+            "article_type": sanitize(p.get("article_type"), ""),
+            "relevance_score": sanitize(p.get("relevance_judgement", p.get("relevance_score", 0)), 0),
+            "pdf_url": sanitize(p.get("pdf_url")), # Preserve if already present
+            "source": source_type,
+            "set_id": set_id,
+            "dailymed_url": f"https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid={set_id}" if set_id else None,
+        }
     
     # =========================================================================
     # Full Pipeline
@@ -707,7 +915,7 @@ Generate a comprehensive, evidence-based clinical response that synthesizes find
         processed_query = self.preprocess_query(query)
         
         # Step 2: Retrieve
-        passages = self.retrieve_passages(processed_query)
+        passages, dailymed_results = self.retrieve_passages(processed_query)
         
         # Apply hybrid scoring (dense + keyword matching)
         if passages:
@@ -729,7 +937,7 @@ Generate a comprehensive, evidence-based clinical response that synthesizes find
             }
         
         # Step 3: Rerank & Aggregate
-        papers_df, reranked_passages = self.rerank_and_aggregate(query, passages)
+        papers_df, reranked_passages = self.rerank_and_aggregate(query, passages, dailymed_results)
         
         if papers_df.empty:
             return {
@@ -777,9 +985,10 @@ Generate a comprehensive, evidence-based clinical response that synthesizes find
         self,
         query: str
     ) -> Generator[Dict[str, Any], None, None]:
-        """Streaming version for real-time UI updates."""
+        """Streaming version for real-time UI updates with parallel PDF checks."""
+        from concurrent.futures import ThreadPoolExecutor
 
-        # Step 1
+        # Step 1: Preprocess
         yield {"step": "query_expansion", "status": "running", "message": "Analyzing query..."}
         processed_query = self.preprocess_query(query)
         yield {
@@ -788,77 +997,109 @@ Generate a comprehensive, evidence-based clinical response that synthesizes find
             "data": {"rewritten": processed_query.rewritten_query}
         }
 
-        # Step 2
+        # Step 2: Retrieval
         yield {"step": "retrieval", "status": "running", "message": "Searching literature..."}
-        passages = self.retrieve_passages(processed_query)
+        passages, dailymed_results = self.retrieve_passages(processed_query)
         yield {
             "step": "retrieval",
             "status": "complete",
-            "data": {"count": len(passages)}
+            "data": {"count": len(passages) + len(dailymed_results)}
         }
 
-        if not passages:
+        if not passages and not dailymed_results:
             yield {"step": "complete", "status": "no_results"}
             return
 
-        # Step 3
+        # Step 3: Reranking
         yield {"step": "reranking", "status": "running", "message": "Ranking papers..."}
-        papers_df, _ = self.rerank_and_aggregate(query, passages)
+        papers_df, _ = self.rerank_and_aggregate(query, passages, dailymed_results)
+        
+        # [NEW] Reorder papers so reference ranking matches final citation order from the start
+        # This prevents the UI from "jumping" and ensures references are correctly numbered
+        _, used_papers = self._get_papers_for_context(papers_df)
+        
+        # Prepare initial sources (no PDF URLs yet)
+        initial_sources = []
+        for p in used_papers:
+            initial_sources.append(self._map_paper_to_source(p))
+
         yield {
             "step": "reranking",
             "status": "complete",
-            "data": {"papers": len(papers_df)}
+            "data": {"papers": len(papers_df)},
+            "sources": initial_sources  # Send sources early and in corrected order!
         }
+        
+        if papers_df.empty:
+            yield {"step": "complete", "status": "no_results"}
+            return
 
-        # Step 4: Direct LLM Synthesis
-        yield {"step": "generating", "status": "running", "message": "Synthesizing response..."}
-        result = self.run_generation(query, papers_df)
-        
-        # Handle tuple return (answer, used_papers) or error string
-        if isinstance(result, tuple):
-            if len(result) == 2:
-                answer, used_papers = result
-            else:
-                answer = result[0]
-                used_papers = []
-        else:
-            answer = result
-            used_papers = []
-        
-        # Ensure answer is always a string
-        if answer is None:
-            answer = "Error: No response generated."
-        elif not isinstance(answer, str):
-            answer = str(answer)
-        
-        logger.info(f"Generated answer length: {len(answer)} chars")
-            
-        yield {
-            "step": "generating",
-            "status": "complete"
-        }
-        
-        # Step 5: Check PDF availability
+        # Prepare context for generation
+        _, used_papers = self._get_papers_for_context(papers_df)
+
+        # START PARALLEL TASKS: Generation + PDF Check
         yield {"step": "pdf_check", "status": "running", "message": "Checking PDF availability..."}
-        sources_with_pdf = self._check_pdf_availability(used_papers)
-        yield {
-            "step": "pdf_check",
-            "status": "complete",
-            "data": {"pdf_count": sum(1 for s in sources_with_pdf if s.get("pdf_url"))}
-        }
+        yield {"step": "generation", "status": "running", "message": "Synthesizing response..."}
         
-        # Final - include full source metadata with PDF URLs
-        final_event = {
+        pdf_results = []
+        pdf_yielded = False
+        
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Start PDF check in background
+            pdf_future = executor.submit(self._check_pdf_availability, used_papers)
+            
+            # Start streaming generation
+            answer = ""
+            generation_gen = self.run_generation(query, papers_df, stream=True)
+            for event in generation_gen:
+                if event["step"] == "generation" and event["status"] == "running":
+                    if "token" in event:
+                        yield event
+                    
+                    # [NEW] Check if PDF future is done during token synthesis
+                    # Yield PDF links AS SOON AS AVAILABLE instead of waiting for end
+                    if not pdf_yielded and pdf_future.done():
+                        try:
+                            pdf_results = pdf_future.result()
+                            pdf_count = sum(1 for s in pdf_results if s.get("pdf_url"))
+                            yield {
+                                "step": "pdf_check", 
+                                "status": "complete", 
+                                "data": {"pdf_count": pdf_count},
+                                "sources": pdf_results # UPDATE SOURCES WITH PDFs NOW
+                            }
+                            pdf_yielded = True
+                            logger.info(f"   ✅ PDF check yielded early ({pdf_count} PDFs found)")
+                        except Exception as e:
+                            logger.error(f"Error yielding PDF results early: {e}")
+
+                elif event["step"] == "generation" and event["status"] == "complete":
+                    answer = event["answer"]
+            
+            # Final safety check if not already yielded
+            if not pdf_results:
+                pdf_results = pdf_future.result()
+
+        if not pdf_yielded:
+            yield {"step": "pdf_check", "status": "complete", "data": {"pdf_count": sum(1 for s in pdf_results if s.get("pdf_url"))}, "sources": pdf_results}
+        yield {"step": "generation", "status": "complete"}
+        
+        # NO FILTERING: Show all sources that were provided as context
+        # Use initial_sources as base to ensure we never return empty list if PDFs check fails
+        final_sources = pdf_results if pdf_results else initial_sources
+        
+        logger.info(f"🔍 Streaming Complete: Returning {len(final_sources)} sources")
+
+        # Final event
+        yield {
             "step": "complete",
             "status": "success",
             "report_title": "Clinical Response",
             "answer": answer,
-            "sections": [],
-            "sources": sources_with_pdf,
-            "abstracts_used": len(used_papers)
+            "sources": final_sources,
+            "abstracts_used": len(used_papers),
+            "original_sources_count": len(pdf_results)
         }
-        logger.info(f"Final event: answer present={bool(final_event.get('answer'))}, answer_length={len(answer)}")
-        yield final_event
     
     # Backward compatibility
     def answer_scholarqa_style(self, query: str) -> Dict[str, Any]:

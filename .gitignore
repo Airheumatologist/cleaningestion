@@ -6,9 +6,28 @@ __pycache__/
 data/mesh/
 *.xml
 mesh_cache.json
+
 # macOS metadata
 ._*
 .DS_Store
 
 # Separate projects
 elixir-ai/
+
+# Logs and checkpoints
+*.log
+*checkpoint*.txt
+backend.log
+
+# Test outputs and temporary files
+*_response*.json
+test_*.py
+check_*.py
+count_*.py
+debug_*.py
+verify_*.py
+fix_*.py
+*_dump.txt
+
+# Node modules (frontend has its own .gitignore)
+node_modules/

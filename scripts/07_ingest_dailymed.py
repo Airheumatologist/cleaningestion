@@ -216,11 +216,11 @@ def create_points_batch(drugs: List[Dict[str, Any]]) -> tuple:
             "title": drug.get("title", "")[:300],
             "active_ingredients": drug.get("active_ingredients", [])[:10],
             "manufacturer": drug.get("manufacturer", ""),
-            "indications": drug.get("indications", "")[:1000],
-            "contraindications": drug.get("contraindications", "")[:500],
-            "warnings": drug.get("warnings", "")[:500],
-            "adverse_reactions": drug.get("adverse_reactions", "")[:500],
-            "dosage": drug.get("dosage", "")[:500],
+            "indications": drug.get("indications", "")[:5000],        # Increased from 1000
+            "contraindications": drug.get("contraindications", "")[:2000],  # Increased from 500
+            "warnings": drug.get("warnings", "")[:3000],            # Increased from 500
+            "adverse_reactions": drug.get("adverse_reactions", "")[:3000], # Increased from 500
+            "dosage": drug.get("dosage", "")[:5000],               # Increased from 500
             "source": "dailymed",
             "article_type": "drug_label",
         }

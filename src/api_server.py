@@ -31,10 +31,31 @@ pipeline = None
 def make_json_serializable(obj: Any) -> Any:
     """
     Recursively convert objects to JSON-serializable types.
-    Handles generators, pandas Series, and other non-serializable types.
+    Handles generators, pandas Series, numpy types, and NaN values.
     """
-    # Handle None and basic JSON types
-    if obj is None or isinstance(obj, (str, int, float, bool)):
+    import math
+    import numpy as np
+    
+    # Handle None
+    if obj is None:
+        return None
+    
+    # Handle NaN/Infinity FIRST (before other float checks)
+    # This catches both Python float and numpy float types
+    try:
+        if isinstance(obj, (float, np.floating)):
+            if math.isnan(obj) or math.isinf(obj):
+                return None
+            return float(obj)
+    except (TypeError, ValueError):
+        pass
+    
+    # Handle numpy integer types
+    if isinstance(obj, np.integer):
+        return int(obj)
+    
+    # Handle basic JSON types
+    if isinstance(obj, (str, int, bool)):
         return obj
     
     # Handle dict
@@ -48,14 +69,17 @@ def make_json_serializable(obj: Any) -> Any:
     # Handle pandas Series/DataFrame
     if hasattr(obj, 'to_dict'):
         try:
-            return obj.to_dict()
+            return make_json_serializable(obj.to_dict())
         except Exception:
             pass
+    
+    # Handle numpy arrays
+    if isinstance(obj, np.ndarray):
+        return make_json_serializable(obj.tolist())
     
     # Handle generators and other iterables (but not strings/bytes)
     if hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):
         try:
-            # Check if it's actually iterable by trying to get an iterator
             iter(obj)
             return [make_json_serializable(item) for item in obj]
         except (TypeError, ValueError):
@@ -158,7 +182,8 @@ async def chat(request: ChatRequest):
             request.query
         )
         
-        return result
+        # Sanitize result to handle NaN values from pandas/numpy
+        return make_json_serializable(result)
         
     except Exception as e:
         logger.error(f"Chat error: {e}")
@@ -179,40 +204,54 @@ async def chat_stream(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     async def event_generator():
-        """Generate SSE events from streaming pipeline."""
-        try:
-            # Stream events directly from the pipeline
-            # Use run_in_executor to run the sync generator in a thread
-            loop = asyncio.get_event_loop()
-            
-            def run_streaming():
-                events = []
+        """Generate SSE events from streaming pipeline in real-time."""
+        import threading
+        queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+
+        def producer():
+            """Runs the synchronous pipeline.answer_streaming in a background thread."""
+            try:
                 for event in pipeline.answer_streaming(request.query):
-                    events.append(event)
-                return events
-            
-            # Get all events (this runs the sync generator)
-            events = await loop.run_in_executor(None, run_streaming)
-            
-            # Yield events asynchronously
-            for event in events:
-                # Log complete events to debug
-                if event.get("step") == "complete":
-                    logger.info(f"Streaming complete event: status={event.get('status')}, has_answer={bool(event.get('answer'))}, answer_length={len(event.get('answer', '')) if isinstance(event.get('answer'), str) else 0}")
+                    # Put event into the queue
+                    asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+                # Signal completion
+                asyncio.run_coroutine_threadsafe(queue.put("[DONE]"), loop)
+            except Exception as e:
+                logger.error(f"Producer error: {e}", exc_info=True)
+                asyncio.run_coroutine_threadsafe(queue.put({"step": "error", "status": "error", "message": str(e)}), loop)
+                asyncio.run_coroutine_threadsafe(queue.put("[DONE]"), loop)
+
+        # Start producer thread
+        thread = threading.Thread(target=producer)
+        thread.start()
+
+        try:
+            while True:
+                event = await queue.get()
+                if event == "[DONE]":
+                    break
                 
                 # Ensure event is JSON-serializable
                 serializable_event = make_json_serializable(event)
                 
-                # Verify answer is still present after serialization
-                if serializable_event.get("step") == "complete" and "answer" in serializable_event:
-                    logger.info(f"After serialization: has_answer={bool(serializable_event.get('answer'))}")
+                # Log critical events
+                if serializable_event.get("step") == "complete":
+                    ans = serializable_event.get("answer", "")
+                    logger.info(f"Streaming complete event: status={serializable_event.get('status')}, answer_length={len(ans) if ans else 0}")
+                
+                # [NEW] Log when sources are sent (helps verify fix)
+                if "sources" in serializable_event:
+                    logger.info(f"📡 Sending streaming event with {len(serializable_event['sources'])} sources (step: {serializable_event.get('step')})")
                 
                 data = json.dumps(serializable_event)
                 yield f"data: {data}\n\n"
-                # Small delay for UI responsiveness
-                await asyncio.sleep(0.05)
-
+            
             yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            logger.error(f"Consumer error: {e}", exc_info=True)
+            yield f"data: {json.dumps({'step': 'error', 'message': str(e)})}\n\n"
 
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)

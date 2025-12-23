@@ -2,6 +2,37 @@
 
 Production-ready Retrieval-Augmented Generation (RAG) pipeline for medical literature, featuring 1.2M+ PubMed Central articles and 51K+ DailyMed drug labels with advanced preprocessing, reranking, and synthesis.
 
+## ✨ Recent Updates (December 2024)
+
+### 🖥️ Next.js Frontend with Real-Time Streaming
+- **Elixir AI Chat Interface** - Modern React-based frontend with glassmorphism design
+- **Real-time SSE Streaming** - See pipeline progress (Query Analysis → Retrieval → Reranking → PDF Check → Synthesis)
+- **Embedded PDF Viewer** - Split-screen PDF viewing with clickable references
+- **AMA-Style Citations** - Formatted with DOI links, journal names, and authors
+
+### 🔬 Unified Deep Research Mode
+- Removed "fast search" option for consistent, comprehensive responses
+- All queries now use the full ELIXIR System Prompt with multi-step generation
+- Improved context building with top 5 full-text articles + 100 abstracts
+
+### 📊 Optimized Reranking & Retrieval
+- **Lower Pre-Filter Threshold** (0.10) for better recall
+- **Post-Cohere Relevance Filter** (0.30) to eliminate low-quality results
+- **Parallel PMC + DailyMed Retrieval** for reduced latency
+- **DailyMed Bypass** - Drug labels always included when drug names mentioned
+
+### 💊 DailyMed Ingestion Improvements
+- Memory-efficient `lxml` iterative parsing for large XML files
+- Per-file timeouts to skip problematic files
+- Optimized Qdrant upsert with reduced batch sizes
+- Complete 51K+ drug label corpus
+
+### 📝 Citation & Context Enhancements
+- Full-text context for top 5 high-value articles (12K chars each)
+- All reranked sources displayed (no filtering of cited articles)
+- NaN-safe JSON serialization for API stability
+- Fixed in-text citation numbering
+
 ## 🏗️ Architecture Overview
 
 ```
@@ -19,6 +50,11 @@ Production-ready Retrieval-Augmented Generation (RAG) pipeline for medical liter
 │    Expansion (MeSH)    Search (1024-d)   • Evidence Boost    • ELIXIR Prompt   │
 │  • Query Decompose   • Metadata Filter  • Entity Matching   • Full-text Cite  │
 │  • Filter Extract    • Hybrid Scoring   • Paper Aggregate   • PDF Check       │
+│                                                                                  │
+│  Frontend Layer:                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐│
+│  │ Next.js Frontend (Elixir AI) - Real-time SSE streaming, PDF viewer         ││
+│  └─────────────────────────────────────────────────────────────────────────────┘│
 │                                                                                  │
 │  Data Layer:                                                                     │
 │  ┌─────────────────────────────────────────────────────────────────────────────┐│
@@ -222,6 +258,15 @@ RAG-pipeline/
 ├── docs/
 │   └── PRD-Pipeline.md             # Detailed PRD (2000+ lines)
 │
+├── frontend/                        # Next.js Frontend (Elixir AI)
+│   ├── src/
+│   │   └── app/
+│   │       ├── page.tsx            # Main chat UI with streaming
+│   │       ├── globals.css         # Global styles (glassmorphism)
+│   │       └── layout.tsx          # App layout
+│   ├── package.json
+│   └── next.config.ts
+│
 ├── scripts/                         # Data ingestion scripts
 │   ├── 01_download_pmc.py          # PMC S3 download
 │   ├── 02_extract_pmc.py           # PMC XML extraction
@@ -230,7 +275,9 @@ RAG-pipeline/
 │   ├── 05_setup_qdrant.py          # Qdrant collection setup
 │   ├── 06_ingest_pmc.py            # PMC ingestion
 │   ├── 07_ingest_dailymed.py       # DailyMed ingestion
-│   └── 08_monthly_update.py        # Monthly updates
+│   ├── 08_monthly_update.py        # Monthly updates
+│   └── ingestion/
+│       └── 11_ingest_dailymed_cloud.py  # Optimized DailyMed ingestion
 │
 └── src/                             # RAG pipeline source
     ├── config.py                   # Configuration & env vars
@@ -241,7 +288,7 @@ RAG-pipeline/
     ├── rag_pipeline.py             # Main pipeline orchestrator
     ├── prompts.py                  # ELIXIR system prompt
     ├── specialty_journals.py       # High-impact journal list
-    ├── api_server.py               # FastAPI server
+    ├── api_server.py               # FastAPI server with SSE streaming
     └── splade_encoder.py           # SPLADE sparse encoder (optional)
 ```
 
@@ -301,9 +348,24 @@ python -m src.api_server
 # Server runs at http://localhost:8000
 
 # API Endpoints:
-# POST /chat - Standard query
-# POST /chat/stream - Streaming query with progress updates
+# POST /api/chat/stream - Streaming query with SSE progress updates
+# GET /api/health - Health check
 ```
+
+### 5. Run Frontend (Elixir AI)
+
+```bash
+cd frontend
+npm install
+npm run dev
+# Frontend runs at http://localhost:3000
+```
+
+The frontend connects to the backend at `http://localhost:8000` and provides:
+- Real-time streaming of pipeline progress
+- Expandable references with clickable DOI links
+- Split-screen PDF viewer for source articles
+- Modern glassmorphism UI design
 
 ---
 

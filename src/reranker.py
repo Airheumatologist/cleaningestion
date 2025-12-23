@@ -79,33 +79,48 @@ def get_ref_author_str(authors) -> str:
 # Abstract Reranker Interface (matches ScholarQA)
 # =============================================================================
 
-# Evidence hierarchy boost multipliers
-EVIDENCE_HIERARCHY = {
-    # Highest evidence level
-    "systematic_review": 1.25,
-    "meta_analysis": 1.25,
-    "guideline": 1.30,
-    # Strong evidence - official drug labeling
-    "drug_label": 1.25,  # FDA-approved drug labels are authoritative
-    "clinical_trial": 1.20,
-    "randomized_controlled_trial": 1.20,
-    # Good evidence
-    "review_article": 1.10,
-    "cohort_study": 1.05,
-    # Standard evidence
-    "research_article": 1.00,
-    "original_research": 1.00,
-    "research": 1.00,
-    "other": 1.00,
-    # Lower generalizability
-    "case_report": 0.90,
-    "case_series": 0.92,
-    "letter": 0.85,
-    "editorial": 0.85,
-    "comment": 0.80,
+# =============================================================================
+# SIMPLIFIED 3-TIER EVIDENCE SYSTEM
+# =============================================================================
+
+# Tier multipliers - much stronger differentiation
+TIER_1_BOOST = 1.80  # Guidelines, systematic reviews, meta-analyses
+TIER_2_BOOST = 1.25  # RCTs, clinical trials, review articles
+TIER_3_BOOST = 1.00  # Standard research
+TIER_4_PENALTY = 0.50  # Case reports, letters, editorials
+
+# Article types for each tier
+TIER_1_TYPES = {
+    "guideline", "practice_guideline", "practice guideline",
+    "systematic_review", "systematic review", 
+    "meta_analysis", "meta-analysis",
+    "consensus", "consensus_statement"
+}
+TIER_2_TYPES = {
+    "clinical_trial", "clinical trial",
+    "randomized_controlled_trial", "rct",
+    "review_article", "review article", "review",
+    "drug_label", "drug label"
+}
+TIER_4_TYPES = {
+    "case_report", "case report",
+    "case_series", "case series",
+    "letter", "editorial", "comment", "commentary",
+    "news", "correspondence"
 }
 
-# High-impact medical journals and authoritative sources
+# Title keywords that indicate guidelines (for misclassified articles)
+GUIDELINE_TITLE_KEYWORDS = [
+    "guideline", "guidelines", 
+    "consensus", 
+    "recommendation", "recommendations",
+    "position statement",
+    "clinical practice",
+    "acr/vasculitis",  # ACR guidelines
+    "aha/acc",  # American Heart Association
+]
+
+# High-impact medical journals
 HIGH_IMPACT_JOURNALS = {
     "new england journal of medicine", "nejm",
     "the lancet", "lancet",
@@ -116,18 +131,44 @@ HIGH_IMPACT_JOURNALS = {
     "circulation",
     "blood",
     "jama internal medicine",
-    "the lancet oncology",
-    "lancet oncology",
+    "the lancet oncology", "lancet oncology",
     "journal of clinical oncology",
     "european heart journal",
     "gastroenterology",
     "hepatology",
     "diabetes care",
     "chest",
-    # Official drug information sources
-    "dailymed",  # FDA drug labels
-    "fda drug label",
+    "arthritis & rheumatology",
+    "arthritis care & research",
+    "annals of the rheumatic diseases",
+    "dailymed",
 }
+
+
+def get_evidence_multiplier(article_type: str, title: str) -> float:
+    """
+    Get evidence tier multiplier based on article type and title.
+    
+    Uses 3-tier system with title-based guideline detection.
+    """
+    article_type_lower = article_type.lower().replace("-", "_").replace(" ", "_") if article_type else ""
+    title_lower = title.lower() if title else ""
+    
+    # Title-based detection first (catches misclassified guidelines)
+    if any(kw in title_lower for kw in GUIDELINE_TITLE_KEYWORDS):
+        return TIER_1_BOOST
+    
+    # Type-based tier assignment
+    if article_type_lower in TIER_1_TYPES or any(t in article_type_lower for t in ["guideline", "systematic", "meta"]):
+        return TIER_1_BOOST
+    
+    if article_type_lower in TIER_2_TYPES or any(t in article_type_lower for t in ["trial", "review"]):
+        return TIER_2_BOOST
+    
+    if article_type_lower in TIER_4_TYPES or any(t in article_type_lower for t in ["case", "letter", "editorial"]):
+        return TIER_4_PENALTY
+    
+    return TIER_3_BOOST  # Default for standard research
 
 
 def apply_evidence_boosts(
@@ -135,46 +176,50 @@ def apply_evidence_boosts(
     current_year: int = 2025
 ) -> list:
     """
-    Apply evidence hierarchy boosts to reranked documents.
+    Apply SIMPLIFIED evidence hierarchy boosts to reranked documents.
     
-    Boosts based on:
-    1. Article type (evidence hierarchy)
-    2. Recency (newer papers slightly preferred)
-    3. Journal prestige (high-impact journals)
+    Uses 3-tier system:
+    - Tier 1 (1.80x): Guidelines, systematic reviews, meta-analyses
+    - Tier 2 (1.25x): RCTs, clinical trials, review articles
+    - Tier 3 (1.00x): Standard research
+    - Tier 4 (0.50x): Case reports, letters, editorials
     
-    Adds 'boosted_score' field to each document.
+    Plus recency and high-impact journal boosts.
     """
     for doc in documents:
-        base_score = doc.get("rerank_score", doc.get("score", 0.5))
-        multiplier = 1.0
+        # Use combined_score (includes entity matching) as base
+        base_score = doc.get("combined_score", doc.get("rerank_score", doc.get("score", 0.5)))
         
-        # 1. Article type boost
-        article_type = doc.get("article_type", "other").lower().replace("-", "_")
-        type_boost = EVIDENCE_HIERARCHY.get(article_type, 1.0)
-        multiplier *= type_boost
+        # 1. Evidence tier multiplier
+        tier_mult = get_evidence_multiplier(
+            doc.get("article_type", ""),
+            doc.get("title", "")
+        )
         
-        # 2. Recency boost
+        # 2. Recency boost (recent articles +5%)
+        recency_mult = 1.0
         year = doc.get("year")
         if year:
             try:
-                year = int(year)
-                if year >= current_year - 1:  # 2024-2025
-                    multiplier *= 1.05
-                elif year >= current_year - 3:  # 2022-2023
-                    multiplier *= 1.02
+                year_int = int(year)
+                if year_int >= current_year - 2:  # 2023-2025
+                    recency_mult = 1.05
             except (ValueError, TypeError):
                 pass
         
-        # 3. High-impact journal boost
-        journal = doc.get("journal", doc.get("venue", "")).lower()
+        # 3. High-impact journal boost (+15%)
+        journal_mult = 1.0
+        journal = (doc.get("journal") or doc.get("venue") or "").lower()
         if any(j in journal for j in HIGH_IMPACT_JOURNALS):
-            multiplier *= 1.08
+            journal_mult = 1.15
         
-        # Calculate boosted score
-        doc["boosted_score"] = base_score * multiplier
-        doc["boost_multiplier"] = multiplier
+        # Calculate final boosted score
+        doc["boosted_score"] = base_score * tier_mult * recency_mult * journal_mult
+        doc["evidence_tier"] = tier_mult
+        doc["boost_multiplier"] = tier_mult * recency_mult * journal_mult
     
     return documents
+
 
 
 class AbstractReranker:
@@ -311,19 +356,56 @@ class PaperFinderWithReranker:
     def rerank(
         self,
         query: str,
-        retrieved_ctxs: List[Dict[str, Any]]
+        retrieved_ctxs: List[Dict[str, Any]],
+        pre_filter_threshold: float = 0.15,  # Lowered: hybrid RRF scores are normalized to 0.3-1.0
+        cohere_relevance_threshold: float = 0.1  # Cohere minimum relevance (filters truly irrelevant)
     ) -> List[Dict[str, Any]]:
         """
         Rerank passages using Cohere + evidence hierarchy boosts.
         
-        1. Cohere reranking for semantic relevance
-        2. Apply evidence hierarchy boosts (article type, recency, journal)
-        3. Sort by boosted_score
+        Threshold Strategy (based on Cohere best practices):
+        1. pre_filter_threshold (0.15): Filters by retrieval score BEFORE Cohere
+           - Reduces API costs by removing obviously low-quality candidates
+           - Set lower than post-rerank threshold to preserve recall
+        
+        2. cohere_relevance_threshold (0.1): Filters by Cohere rerank score AFTER reranking
+           - Cohere scores are 0-1 normalized; <0.1 indicates very low relevance
+           - This removes documents Cohere considers irrelevant regardless of retrieval score
+        
+        3. context_threshold (from __init__): Filters AFTER aggregation by boosted_score
+           - Applied in aggregate_snippets_to_papers() using final combined scores
+           - Controls the quality floor for papers included in context
+        
+        Pipeline:
+        1. Pre-filter by retrieval score (reduces Cohere API cost)
+        2. Cohere reranking for semantic relevance  
+        3. Post-filter by Cohere relevance score (removes irrelevant docs)
+        4. Calculate entity matching scores
+        5. Apply evidence hierarchy boosts (article type, recency, journal)
+        6. Sort by boosted_score
         """
         if not retrieved_ctxs:
             return []
         
-        logger.info(f"Reranking {len(retrieved_ctxs)} passages...")
+        original_count = len(retrieved_ctxs)
+        logger.info(f"Reranking {original_count} passages...")
+        
+        # Stage 1: Pre-filter by retrieval score (before Cohere API call)
+        # This reduces API cost while preserving candidates for Cohere's judgment
+        if pre_filter_threshold > 0:
+            filtered_ctxs = [
+                ctx for ctx in retrieved_ctxs 
+                if ctx.get("score", 0.5) >= pre_filter_threshold
+            ]
+            if len(filtered_ctxs) < len(retrieved_ctxs):
+                logger.info(f"   Pre-filter (retrieval score ≥{pre_filter_threshold}): {original_count} → {len(filtered_ctxs)} passages")
+                retrieved_ctxs = filtered_ctxs
+        
+        # If no passages pass filter, return empty
+        if not retrieved_ctxs:
+            logger.warning("All passages filtered out by pre-filter, returning empty")
+            return []
+
         
         # Format documents as YAML for optimal Cohere reranking (best practice)
         passages = []
@@ -348,22 +430,42 @@ class PaperFinderWithReranker:
                 # Fallback to plain text
                 passages.append((title + " " + content).strip()[:2000])
         
-        # Get rerank scores from Cohere
+        # Stage 2: Get rerank scores from Cohere (0-1 normalized, query-dependent)
         rerank_scores = self.reranker_engine.get_scores(query, passages)
         
-        # Calculate entity matching scores
+        # Attach rerank scores to contexts for filtering
+        for i, score in enumerate(rerank_scores):
+            retrieved_ctxs[i]["rerank_score"] = score
+        
+        # Stage 3: Post-filter by Cohere relevance score
+        # Cohere best practice: scores <0.1 indicate very low relevance
+        pre_cohere_count = len(retrieved_ctxs)
+        if cohere_relevance_threshold > 0:
+            retrieved_ctxs = [
+                ctx for ctx in retrieved_ctxs
+                if ctx.get("rerank_score", 0) >= cohere_relevance_threshold
+            ]
+            if len(retrieved_ctxs) < pre_cohere_count:
+                logger.info(f"   Post-filter (Cohere score ≥{cohere_relevance_threshold}): {pre_cohere_count} → {len(retrieved_ctxs)} passages")
+        
+        if not retrieved_ctxs:
+            logger.warning("All passages filtered out by Cohere relevance threshold, returning empty")
+            return []
+        
+        # Stage 4: Calculate entity matching scores
         entity_scores = self._calculate_entity_scores(query, retrieved_ctxs)
         
         # Combine Cohere rerank scores with entity matching scores
         # Weight: 70% rerank score, 30% entity score
         combined_scores = []
-        for i, (rerank_score, entity_score) in enumerate(zip(rerank_scores, entity_scores)):
+        for i, entity_score in enumerate(entity_scores):
+            rerank_score = retrieved_ctxs[i].get("rerank_score", 0)
             combined_score = 0.7 * rerank_score + 0.3 * entity_score
             combined_scores.append(combined_score)
-            retrieved_ctxs[i]["rerank_score"] = rerank_score
             retrieved_ctxs[i]["entity_score"] = entity_score
             retrieved_ctxs[i]["combined_score"] = combined_score
         
+        logger.info(f"Cohere top scores: {sorted(rerank_scores, reverse=True)[:5]}")
         logger.info(f"Entity scores: {[round(s, 3) for s in entity_scores[:5]]}")
         logger.info(f"Combined scores: {[round(s, 3) for s in combined_scores[:5]]}")
         
@@ -440,55 +542,75 @@ class PaperFinderWithReranker:
     
     def _extract_query_entities(self, query: str) -> List[str]:
         """
-        Extract medical entities from query.
+        Extract medical entities from query for entity-based scoring.
         
-        Args:
-            query: Search query
-            
-        Returns:
-            List of medical entity terms
+        Improved extraction using:
+        1. Key medical terms (capitalized words, hyphenated terms)
+        2. MeSH acronym expansion
+        3. Disease/condition pattern matching
         """
+        import re
         entities = []
         
         if not self.entity_expander:
-            return entities
+            # Fallback: extract key terms without MeSH
+            key_terms = re.findall(r'\b[A-Z][a-z]+(?:[-][a-z]+)*\b', query)
+            key_terms += re.findall(r'\b[A-Z]{2,}\d*\b', query)  # Acronyms
+            logger.info(f"Entity extraction (no MeSH): {key_terms}")
+            return list(set(key_terms))
         
-        # Extract acronyms and their expansions
-        import re
-        words = query.split()
-        for word in words:
-            # Remove punctuation
-            clean_word = re.sub(r'[^\w]', '', word)
-            
-            # Check if it's a known acronym
-            if self.entity_expander._is_likely_acronym(clean_word):
-                expansions = self.entity_expander.expand_acronym(clean_word)
-                if expansions:
-                    # Add both acronym and full term
-                    entities.append(clean_word.upper())
-                    entities.append(expansions[0])
+        # 1. Extract hyphenated medical terms (e.g., "IgG4-related")
+        hyphenated = re.findall(r'\b\w+(?:-\w+)+\b', query)
+        entities.extend(hyphenated)
         
-        # Also look for common medical condition patterns
-        medical_patterns = [
-            r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Syndrome\b',
-            r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Disease\b',
-            r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Disorder\b',
+        # 2. Extract acronyms (2+ uppercase letters, optionally with numbers)
+        acronyms = re.findall(r'\b[A-Z]{2,}\d*\b', query)
+        for acr in acronyms:
+            entities.append(acr)
+            # Try to expand acronym using MeSH
+            expansions = self.entity_expander.expand_acronym(acr)
+            if expansions:
+                entities.append(expansions[0])
+        
+        # 3. Extract capitalized multi-word terms (e.g., "Antiphospholipid Syndrome")
+        capitalized_phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[a-z]+)*(?:\s+[A-Z][a-z]+)*\b', query)
+        entities.extend([p for p in capitalized_phrases if len(p) > 3])
+        
+        # 4. Extract disease-related patterns more flexibly
+        disease_patterns = [
+            r'\b\w+[-]?related\s+disease\b',    # "IgG4-related disease"
+            r'\b\w+\s+disease\b',               # "X disease"
+            r'\b\w+\s+syndrome\b',              # "X syndrome"
+            r'\b\w+\s+disorder\b',              # "X disorder"
+            r'\b\w+itis\b',                     # "arthritis", etc.
+            r'\b\w+osis\b',                     # "fibrosis", etc.
+            r'\b\w+emia\b',                     # "anemia", etc.
+            r'\b\w+pathy\b',                    # "neuropathy", etc.
         ]
         
-        for pattern in medical_patterns:
-            matches = re.findall(pattern, query)
+        for pattern in disease_patterns:
+            matches = re.findall(pattern, query, re.IGNORECASE)
             entities.extend(matches)
         
-        # Remove duplicates while preserving order
+        # 5. Also extract significant lowercase medical terms (length > 5)
+        words = query.split()
+        for word in words:
+            clean = re.sub(r'[^\w-]', '', word)
+            if len(clean) > 5 and clean.lower() not in ['management', 'treatment', 'therapy', 'diagnosis', 'clinical', 'features', 'symptoms', 'guidelines', 'recommendations']:
+                entities.append(clean)
+        
+        # Deduplicate (case-insensitive) while preserving order
         seen = set()
         unique_entities = []
         for entity in entities:
             entity_lower = entity.lower()
-            if entity_lower not in seen:
+            if entity_lower not in seen and len(entity) > 2:
                 seen.add(entity_lower)
                 unique_entities.append(entity)
         
+        logger.info(f"Extracted entities from query: {unique_entities}")
         return unique_entities
+
     
     def aggregate_snippets_to_papers(
         self,
@@ -496,27 +618,81 @@ class PaperFinderWithReranker:
         paper_metadata: Dict[str, Any] = None
     ) -> List[Dict[str, Any]]:
         """
-        Aggregate passages to paper level (ScholarQA methodology).
+        Aggregate passages to paper level with multi-level deduplication.
+        
+        Deduplication priority:
+        1. DOI (most reliable - same content has same DOI across journals)
+        2. Normalized title (catches sister journal publications)
+        3. PMCID (fallback)
         
         Uses max rerank_score for each paper.
         """
         logger.info(f"Aggregating {len(snippets_list)} passages at paper level")
         
         paper_snippets = {}
+        seen_dois = {}  # doi -> corpus_id mapping
+        seen_titles = {}  # normalized_title -> corpus_id mapping
+        
+        def normalize_title(title: str) -> str:
+            """Normalize title for comparison (lowercase, remove punctuation)."""
+            import re
+            if not title:
+                return ""
+            # Lowercase, remove punctuation, collapse whitespace
+            normalized = re.sub(r'[^\w\s]', '', title.lower())
+            normalized = re.sub(r'\s+', ' ', normalized).strip()
+            return normalized
         
         for snippet in snippets_list:
-            # Use pmcid as corpus_id for our Qdrant data
-            corpus_id = snippet.get("pmcid") or snippet.get("corpus_id", "")
+            # Get identifiers
+            pmcid = snippet.get("pmcid") or snippet.get("corpus_id", "")
+            doi = snippet.get("doi", "")
+            title = snippet.get("title", "")
+            normalized_title = normalize_title(title)
             
-            if not corpus_id:
+            if not pmcid and not doi and not normalized_title:
                 continue
             
+            # Determine unique key using multi-level deduplication
+            # Priority: DOI > Title > PMCID
+            corpus_id = pmcid
+            is_duplicate = False
+            duplicate_of = None
+            
+            # 1. Check if we've seen this DOI before
+            if doi and doi in seen_dois:
+                is_duplicate = True
+                duplicate_of = seen_dois[doi]
+                logger.debug(f"DOI duplicate: {doi} -> {duplicate_of}")
+            
+            # 2. Check if we've seen this title before (for sister journal publications)
+            elif normalized_title and len(normalized_title) > 30 and normalized_title in seen_titles:
+                is_duplicate = True
+                duplicate_of = seen_titles[normalized_title]
+                logger.debug(f"Title duplicate: '{title[:50]}...' -> {duplicate_of}")
+            
+            if is_duplicate and duplicate_of:
+                # Merge with existing paper - use higher score
+                if duplicate_of in paper_snippets:
+                    current_score = paper_snippets[duplicate_of]["relevance_judgement"]
+                    new_score = snippet.get("boosted_score", snippet.get("rerank_score", snippet.get("score", 0)))
+                    paper_snippets[duplicate_of]["relevance_judgement"] = max(current_score, new_score)
+                    # Add snippet to existing paper
+                    paper_snippets[duplicate_of]["sentences"].append({
+                        "text": snippet.get("text", ""),
+                        "section_title": snippet.get("section_title", "abstract"),
+                        "char_start_offset": snippet.get("char_offset", 0),
+                    })
+                continue
+            
+            # Not a duplicate - create new entry
             if corpus_id not in paper_snippets:
                 paper_snippets[corpus_id] = {
                     "corpus_id": corpus_id,
                     "pmcid": corpus_id,
                     "pmid": snippet.get("pmid"),
-                    "title": snippet.get("title", ""),
+                    "doi": doi,
+                    "title": title,
                     "abstract": snippet.get("abstract", ""),
                     "venue": snippet.get("journal") or snippet.get("venue", ""),
                     "year": snippet.get("year"),
@@ -526,6 +702,11 @@ class PaperFinderWithReranker:
                     "relevance_judgement": -1,
                     "citation_count": snippet.get("citation_count", 0),
                 }
+                # Track this DOI and title for deduplication
+                if doi:
+                    seen_dois[doi] = corpus_id
+                if normalized_title and len(normalized_title) > 30:
+                    seen_titles[normalized_title] = corpus_id
             
             # Add sentence/snippet
             paper_snippets[corpus_id]["sentences"].append({
@@ -536,15 +717,23 @@ class PaperFinderWithReranker:
             
             # Update relevance using max boosted_score (evidence hierarchy aware)
             current_score = paper_snippets[corpus_id]["relevance_judgement"]
-            # Prefer boosted_score (with evidence hierarchy) over raw rerank_score
             new_score = snippet.get("boosted_score", snippet.get("rerank_score", snippet.get("score", 0)))
             paper_snippets[corpus_id]["relevance_judgement"] = max(current_score, new_score)
             
             # Update abstract if from abstract section
             if snippet.get("section_title") == "abstract" and not paper_snippets[corpus_id]["abstract"]:
                 paper_snippets[corpus_id]["abstract"] = snippet.get("text", "")
+
+        
+        # Log deduplication stats
+        total_snippets = len(snippets_list)
+        unique_papers = len(paper_snippets)
+        duplicates_removed = total_snippets - sum(len(p["sentences"]) for p in paper_snippets.values())
+        if duplicates_removed > 0:
+            logger.info(f"   Deduplication: {total_snippets} passages → {unique_papers} unique papers ({duplicates_removed} duplicates removed)")
         
         # Sort by relevance
+
         sorted_papers = sorted(
             paper_snippets.values(),
             key=lambda x: x["relevance_judgement"],

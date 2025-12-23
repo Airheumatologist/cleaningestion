@@ -1,6 +1,6 @@
 # RAG Pipeline Dependencies
 qdrant-client>=1.7.0
-fastembed>=0.2.0
+
 groq>=0.4.0
 openai>=1.0.0
 cohere>=5.0.0

@@ -87,16 +87,25 @@ class SPLADEEncoder:
         relu_log = torch.log(1 + torch.relu(logits))
         
         # Aggregate (max pooling over tokens)
-        sparse_vecs = relu_log.max(dim=1)[0].squeeze()
+        # Shape: [batch_size, vocab_size]
+        sparse_vecs = relu_log.max(dim=1)[0]
+        
+        # Handle single text case - ensure we have 2D tensor
+        if len(sparse_vecs.shape) == 1:
+            sparse_vecs = sparse_vecs.unsqueeze(0)
         
         # Convert to sparse format (dict of token_id -> score)
         sparse_vectors = []
         for vec in sparse_vecs:
             # Filter out zero values and convert to dict
             sparse_dict = {}
-            for token_id, score in enumerate(vec):
+            # Use nonzero() to efficiently get non-zero indices
+            non_zero_indices = torch.nonzero(vec, as_tuple=True)[0]
+            for token_id in non_zero_indices:
+                idx = int(token_id.item())
+                score = float(vec[idx].item())
                 if score > 0:
-                    sparse_dict[int(token_id)] = float(score.item())
+                    sparse_dict[idx] = score
             sparse_vectors.append(sparse_dict)
         
         return sparse_vectors
