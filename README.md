@@ -97,6 +97,7 @@ Production-ready Retrieval-Augmented Generation (RAG) pipeline for medical liter
   - `APS` → `Antiphospholipid Syndrome`
   - `COPD` → `Chronic Obstructive Pulmonary Disease`
   - `HFpEF` → `Heart Failure with Preserved Ejection Fraction`
+  - MeSH cache included: `data/mesh/mesh_cache.json` (350K+ entries)
   
 - **LLM Query Decomposition** extracts:
   - Year range (`"latest"` → 2022-2025)
@@ -257,6 +258,10 @@ RAG-pipeline/
 │
 ├── docs/
 │   └── PRD-Pipeline.md             # Detailed PRD (2000+ lines)
+│
+├── data/                            # Data files
+│   └── mesh/
+│       └── mesh_cache.json         # MeSH medical abbreviation cache (350K+ entries)
 │
 ├── frontend/                        # Next.js Frontend (Elixir AI)
 │   ├── src/

@@ -3,9 +3,7 @@ venv/
 __pycache__/
 *.pyc
 .DS_Store
-data/mesh/
 *.xml
-mesh_cache.json
 
 # macOS metadata
 ._*
