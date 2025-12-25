@@ -183,6 +183,15 @@ class MedicalRAGPipeline:
         return all_passages, dailymed_results
 
     
+    # Words that should NOT be extracted as drug names
+    NON_DRUG_WORDS = {
+        "guideline", "guidelines", "treatment", "treatments", "management",
+        "screening", "diagnosis", "therapy", "therapies", "recommendation",
+        "recommendations", "update", "review", "reviews", "criteria",
+        "college", "rheumatology", "american", "european", "eular", "acr",
+        "lupus", "nephritis", "arthritis", "disease", "syndrome", "disorder"
+    }
+    
     def _extract_drug_names(self, original_query: str, rewritten_query: str) -> List[str]:
         """
         Extract drug names from query using simple pattern matching.
@@ -216,10 +225,14 @@ class MedicalRAGPipeline:
                 drug_names.add(drug)
         
         # Extract capitalized words that might be brand names
+        # Filter out NON_DRUG_WORDS to prevent false positives
         capitalized_words = re.findall(r'\b[A-Z][a-z]{3,}\b', original_query)
         for word in capitalized_words:
-            if len(word) >= 4 and word.lower() not in ["what", "when", "where", "which", "this", "that", "with", "from", "have"]:
-                drug_names.add(word.lower())
+            word_lower = word.lower()
+            if (len(word) >= 4 and 
+                word_lower not in self.NON_DRUG_WORDS and
+                word_lower not in ["what", "when", "where", "which", "this", "that", "with", "from", "have"]):
+                drug_names.add(word_lower)
         
         return list(drug_names)[:5]  # Limit to 5 drugs
 
@@ -233,7 +246,8 @@ class MedicalRAGPipeline:
         self,
         query: str,
         passages: List[Dict[str, Any]],
-        dailymed_results: List[Dict[str, Any]] = None
+        dailymed_results: List[Dict[str, Any]] = None,
+        medical_conditions: List[str] = None
     ):
         """Rerank passages and aggregate to paper level.
         
@@ -241,6 +255,7 @@ class MedicalRAGPipeline:
             query: User query
             passages: Main passages (will be reranked)
             dailymed_results: DailyMed drug labels (bypass reranking, merged directly)
+            medical_conditions: LLM-extracted conditions for strict filtering
         """
         import pandas as pd
         
@@ -290,7 +305,8 @@ class MedicalRAGPipeline:
         papers_df = self._deduplicate_dailymed(papers_df)
         
         # Post-retrieval filtering: filter out papers that don't contain key medical entities
-        papers_df = self._filter_by_entities(query, papers_df)
+        # Pass LLM-extracted conditions for strict matching
+        papers_df = self._filter_by_entities(query, papers_df, medical_conditions)
         
         # MERGE DailyMed results directly (bypass reranking and thresholds)
         if dailymed_results:
@@ -431,35 +447,45 @@ class MedicalRAGPipeline:
         
         return papers_df
     
-    def _filter_by_entities(self, query: str, papers_df) -> Any:
+    def _filter_by_entities(self, query: str, papers_df, medical_conditions: List[str] = None) -> Any:
         """
         Filter papers based on medical entity matching.
         
-        Removes papers that don't contain key medical entities from the query.
-        This helps prevent irrelevant results (e.g., IgG4-RD when query is about APS).
+        When LLM-extracted medical_conditions are provided, uses STRICT matching:
+        papers MUST contain at least one condition to be included.
+        
+        Falls back to regex-based entity extraction if no conditions provided.
         
         Args:
             query: Original query
             papers_df: DataFrame of papers
+            medical_conditions: LLM-extracted conditions for strict matching
             
         Returns:
             Filtered DataFrame
         """
-        if papers_df.empty or self.entity_expander is None:
+        if papers_df.empty:
             return papers_df
         
         import pandas as pd
         
         logger.info("🔍 Post-retrieval filtering: Checking entity matches...")
         
-        # Extract medical entities from query
-        query_entities = self._extract_query_entities(query)
+        # Use LLM-extracted conditions if available (STRICT matching)
+        # Otherwise fall back to regex extraction
+        if medical_conditions:
+            query_entities = medical_conditions
+            logger.info(f"   Using LLM-extracted conditions (strict): {query_entities}")
+        elif self.entity_expander:
+            query_entities = self._extract_query_entities(query)
+            logger.info(f"   Using regex-extracted entities: {query_entities}")
+        else:
+            logger.info("   No entity extraction available, skipping filter")
+            return papers_df
         
         if not query_entities:
             logger.info("   No medical entities found in query, skipping filter")
             return papers_df
-        
-        logger.info(f"   Query entities: {query_entities}")
         
         # Check each paper for entity matches
         filtered_indices = []
@@ -979,7 +1005,11 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
             }
         
         # Step 3: Rerank & Aggregate
-        papers_df, reranked_passages = self.rerank_and_aggregate(query, passages, dailymed_results)
+        # Pass LLM-extracted medical conditions for strict filtering
+        medical_conditions = []
+        if processed_query.decomposed and processed_query.decomposed.medical_conditions:
+            medical_conditions = processed_query.decomposed.medical_conditions
+        papers_df, reranked_passages = self.rerank_and_aggregate(query, passages, dailymed_results, medical_conditions)
         
         if papers_df.empty:
             return {
@@ -1054,7 +1084,11 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
 
         # Step 3: Reranking
         yield {"step": "reranking", "status": "running", "message": "Ranking papers..."}
-        papers_df, _ = self.rerank_and_aggregate(query, passages, dailymed_results)
+        # Pass LLM-extracted medical conditions for strict filtering
+        medical_conditions = []
+        if processed_query.decomposed and processed_query.decomposed.medical_conditions:
+            medical_conditions = processed_query.decomposed.medical_conditions
+        papers_df, _ = self.rerank_and_aggregate(query, passages, dailymed_results, medical_conditions)
         
         # [NEW] Reorder papers so reference ranking matches final citation order from the start
         # This prevents the UI from "jumping" and ensures references are correctly numbered

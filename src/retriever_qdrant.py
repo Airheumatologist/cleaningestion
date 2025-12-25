@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText, Range, SparseVector
+from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText, Range, SparseVector, SearchParams, QuantizationSearchParams
 from qdrant_client.http.models import Document
 
 from .config import (
@@ -264,7 +264,13 @@ class QdrantRetriever(AbstractRetriever):
                         limit=self.n_retrieval,
                         score_threshold=self.score_threshold,
                         query_filter=search_filter,
-                        with_payload=True
+                        with_payload=True,
+                        search_params=SearchParams(
+                            quantization=QuantizationSearchParams(
+                                rescore=True,
+                                oversampling=2.0
+                            )
+                        )
                     )
                     logger.info(f"✅ Cloud inference successful (attempt {attempt + 1}), retrieved {len(results.points)} passages")
                     break  # Success, exit retry loop
@@ -296,7 +302,13 @@ class QdrantRetriever(AbstractRetriever):
                     limit=self.n_retrieval,
                     score_threshold=self.score_threshold,
                     query_filter=search_filter,
-                    with_payload=True
+                    with_payload=True,
+                    search_params=SearchParams(
+                        quantization=QuantizationSearchParams(
+                            rescore=True,
+                            oversampling=2.0
+                        )
+                    )
                 )
                 logger.info(f"✅ Local embeddings successful, retrieved {len(results.points)} passages")
             except Exception as e:
@@ -383,7 +395,13 @@ class QdrantRetriever(AbstractRetriever):
                     ),
                     limit=self.n_retrieval * 2,  # Get more for fusion
                     query_filter=search_filter,
-                    with_payload=True
+                    with_payload=True,
+                    search_params=SearchParams(
+                        quantization=QuantizationSearchParams(
+                            rescore=True,
+                            oversampling=2.0
+                        )
+                    )
                 )
             else:
                 if self.local_encoder:
@@ -393,7 +411,13 @@ class QdrantRetriever(AbstractRetriever):
                         query=query_embedding.tolist(),
                         limit=self.n_retrieval * 2,
                         query_filter=search_filter,
-                        with_payload=True
+                        with_payload=True,
+                        search_params=SearchParams(
+                            quantization=QuantizationSearchParams(
+                                rescore=True,
+                                oversampling=2.0
+                            )
+                        )
                     )
         except Exception as e:
             logger.warning(f"Dense search failed: {e}")
@@ -443,16 +467,16 @@ class QdrantRetriever(AbstractRetriever):
                 dense_scores.get(pmcid, 0) + sparse_scores.get(pmcid, 0)
             )
         
-        # Normalize combined scores to 0-1 range
-        # RRF scores are very small (0.001-0.03), but the reranker pre-filter expects 0.25+
+        # Normalize combined scores to full 0-1 range for clearer separation
+        # RRF scores are very small (0.001-0.03), so we normalize to full range
         if combined_scores:
             max_score = max(combined_scores.values())
             min_score = min(combined_scores.values())
             score_range = max_score - min_score if max_score > min_score else 1.0
             for pmcid in combined_scores:
-                # Normalize to 0.3-1.0 range to ensure passages pass pre-filter
+                # Normalize to full 0.0-1.0 range
                 normalized = (combined_scores[pmcid] - min_score) / score_range
-                combined_scores[pmcid] = 0.3 + (normalized * 0.7)  # Scale to 0.3-1.0
+                combined_scores[pmcid] = normalized
         
         # Get all points from both results
         all_points = {}

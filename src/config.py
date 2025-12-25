@@ -27,7 +27,7 @@ QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
 # LLM Configuration (OpenRouter)
 # =============================================================================
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = "openai/gpt-oss-120b"  # OpenAI GPT-OSS-120B model via OpenRouter
+OPENROUTER_MODEL = "openai/gpt-oss-20b"  # OpenAI GPT-OSS-20B model via OpenRouter
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # Legacy OpenAI (for backward compatibility)

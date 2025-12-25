@@ -249,6 +249,14 @@ class MedicalEntityExpander:
         # Remove extra whitespace, convert to title case
         return ' '.join(term.strip().split())
     
+    # Organization acronyms that should NOT be treated as disease entities
+    # These are medical societies/organizations, not conditions
+    ORGANIZATION_ACRONYMS = {
+        "ACR", "EULAR", "AHA", "ACC", "ESC", "WHO", "CDC", "FDA", "NIH",
+        "AAN", "AMA", "AAFP", "AAP", "ASCO", "ESMO", "BSR", "OARSI",
+        "GRAPPA", "SPARTAN", "ASAS", "PANLAR", "APLAR", "ILAR"
+    }
+    
     def _is_likely_acronym(self, term: str) -> bool:
         """
         Check if a term is likely an acronym.
@@ -257,11 +265,16 @@ class MedicalEntityExpander:
         - Short (2-10 characters)
         - Mostly uppercase or mixed case
         - Not a common word
+        - NOT an organization acronym (ACR, EULAR, etc.)
         """
         term = term.strip()
         
         # Too long to be an acronym
         if len(term) > 10 or len(term) < 2:
+            return False
+        
+        # Exclude organization acronyms - these are NOT disease entities
+        if term.upper() in self.ORGANIZATION_ACRONYMS:
             return False
         
         # Check if mostly uppercase or has mixed case pattern
