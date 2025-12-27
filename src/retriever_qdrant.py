@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText, Range, SparseVector, SearchParams, QuantizationSearchParams
+from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText, Range, SparseVector, SearchParams, QuantizationSearchParams, QueryRequest
 from qdrant_client.http.models import Document
 
 from .config import (
@@ -217,6 +217,7 @@ class QdrantRetriever(AbstractRetriever):
         use_hybrid: bool = True,
         dense_weight: float = 0.7,
         sparse_weight: float = 0.3,
+        precomputed_sparse_vector: Optional[SparseVector] = None,
         **filter_kwargs
     ) -> List[Dict[str, Any]]:
         """
@@ -227,6 +228,7 @@ class QdrantRetriever(AbstractRetriever):
             use_hybrid: Whether to use hybrid search (dense + SPLADE sparse)
             dense_weight: Weight for dense vector scores (default: 0.7)
             sparse_weight: Weight for sparse vector scores (default: 0.3)
+            precomputed_sparse_vector: Optional pre-computed SPLADE sparse vector (for batch optimization)
             **filter_kwargs: Filters (year, venue, article_type, country)
 
         Returns:
@@ -241,7 +243,8 @@ class QdrantRetriever(AbstractRetriever):
                 query=query,
                 search_filter=search_filter,
                 dense_weight=dense_weight,
-                sparse_weight=sparse_weight
+                sparse_weight=sparse_weight,
+                precomputed_sparse_vector=precomputed_sparse_vector
             )
 
         # Fall back to dense-only search
@@ -356,7 +359,8 @@ class QdrantRetriever(AbstractRetriever):
         query: str,
         search_filter: Optional[Filter],
         dense_weight: float = 0.7,
-        sparse_weight: float = 0.3
+        sparse_weight: float = 0.3,
+        precomputed_sparse_vector: Optional[SparseVector] = None
     ) -> List[Dict[str, Any]]:
         """
         Perform hybrid search using both dense and sparse vectors.
@@ -367,21 +371,26 @@ class QdrantRetriever(AbstractRetriever):
             search_filter: Qdrant filter
             dense_weight: Weight for dense vector scores
             sparse_weight: Weight for sparse vector scores
+            precomputed_sparse_vector: Optional pre-computed SPLADE sparse vector (for batch optimization)
             
         Returns:
             List of passages with combined scores
         """
-        # Generate SPLADE sparse vector for query
-        sparse_vecs = self.splade_encoder.encode([query])
-        if not sparse_vecs or not sparse_vecs[0]:
-            logger.warning("SPLADE encoding failed, falling back to dense-only")
-            return self.retrieve_passages(query, use_hybrid=False, **{})
-        
-        sparse_dict = sparse_vecs[0]
-        sparse_vector = SparseVector(
-            indices=list(sparse_dict.keys()),
-            values=list(sparse_dict.values())
-        )
+        # Use pre-computed sparse vector if provided, otherwise generate
+        if precomputed_sparse_vector is not None:
+            sparse_vector = precomputed_sparse_vector
+        else:
+            # Generate SPLADE sparse vector for query (fallback for single queries)
+            sparse_vecs = self.splade_encoder.encode([query])
+            if not sparse_vecs or not sparse_vecs[0]:
+                logger.warning("SPLADE encoding failed, falling back to dense-only")
+                return self.retrieve_passages(query, use_hybrid=False, **{})
+            
+            sparse_dict = sparse_vecs[0]
+            sparse_vector = SparseVector(
+                indices=list(sparse_dict.keys()),
+                values=list(sparse_dict.values())
+            )
         
         # Perform dense search
         dense_results = None
@@ -540,6 +549,173 @@ class QdrantRetriever(AbstractRetriever):
         logger.info(f"✅ Hybrid search successful, retrieved {len(passages)} passages")
         return passages
     
+    def batch_hybrid_search(
+        self,
+        queries: List[str],
+        sparse_vectors: List[SparseVector],
+        dense_weight: float = 0.7,
+        sparse_weight: float = 0.3,
+        **filter_kwargs
+    ) -> List[Dict[str, Any]]:
+        """
+        Perform batched hybrid search for multiple queries in a SINGLE HTTP call.
+        
+        This consolidates 6+ HTTP calls into 1 batch request, significantly reducing
+        network latency. Uses Qdrant's query_batch_points API with Cloud Inference.
+        
+        Args:
+            queries: List of query strings (will use Cloud Inference for dense embedding)
+            sparse_vectors: List of pre-computed SPLADE sparse vectors (one per query)
+            dense_weight: Weight for dense vector scores (default: 0.7)
+            sparse_weight: Weight for sparse vector scores (default: 0.3)
+            **filter_kwargs: Filters (year, venue, article_type)
+            
+        Returns:
+            Combined list of unique passages from all queries with RRF fusion scores
+        """
+        if not queries or not sparse_vectors:
+            return []
+        
+        if len(queries) != len(sparse_vectors):
+            logger.warning(f"Query count ({len(queries)}) != sparse vector count ({len(sparse_vectors)})")
+            return []
+        
+        logger.info(f"⚡ Batch hybrid search: {len(queries)} queries × 2 (dense+sparse) = {len(queries) * 2} searches in 1 HTTP call")
+        
+        # Build filter
+        search_filter = self._build_filter(**filter_kwargs)
+        
+        # Build batch requests: interleave dense and sparse for each query
+        batch_requests = []
+        
+        # Search params for binary quantization rescore (production-ready)
+        search_params = SearchParams(
+            quantization=QuantizationSearchParams(
+                rescore=True,
+                oversampling=2.0
+            )
+        )
+        
+        for i, (query_text, sparse_vec) in enumerate(zip(queries, sparse_vectors)):
+            # Dense query using Cloud Inference (text → embedding)
+            dense_request = QueryRequest(
+                query=Document(text=query_text, model=self.embedding_model),
+                filter=search_filter,
+                limit=self.n_retrieval * 2,  # Get more for fusion
+                with_payload=True,
+                params=search_params  # Enable quantization rescore
+            )
+            batch_requests.append(dense_request)
+            
+            # Sparse query using pre-computed SPLADE vector
+            sparse_request = QueryRequest(
+                query=sparse_vec,
+                using="sparse",
+                filter=search_filter,
+                limit=self.n_retrieval * 2,
+                with_payload=True
+            )
+            batch_requests.append(sparse_request)
+        
+        # Execute single batch HTTP call
+        try:
+            batch_results = self.client.query_batch_points(
+                collection_name=self.collection_name,
+                requests=batch_requests
+            )
+            logger.info(f"⚡ Batch query returned {len(batch_results)} result sets")
+        except Exception as e:
+            logger.error(f"Batch hybrid search failed: {e}")
+            # Fallback to sequential queries
+            logger.info("⚠️ Falling back to sequential hybrid search")
+            all_passages = []
+            for query, sparse_vec in zip(queries, sparse_vectors):
+                passages = self._hybrid_search(
+                    query=query,
+                    search_filter=search_filter,
+                    dense_weight=dense_weight,
+                    sparse_weight=sparse_weight,
+                    precomputed_sparse_vector=sparse_vec
+                )
+                all_passages.extend(passages)
+            return all_passages
+        
+        # Process results: pair up dense/sparse for each query and apply RRF
+        all_passages = []
+        all_points = {}  # pmcid -> point (for payload access)
+        combined_scores = {}  # pmcid -> RRF score
+        
+        for i in range(len(queries)):
+            dense_idx = i * 2
+            sparse_idx = i * 2 + 1
+            
+            dense_results = batch_results[dense_idx].points if dense_idx < len(batch_results) else []
+            sparse_results = batch_results[sparse_idx].points if sparse_idx < len(batch_results) else []
+            
+            # Build RRF scores for this query pair
+            for rank, point in enumerate(dense_results, 1):
+                pmcid = point.payload.get("pmcid") or str(point.id)
+                rrf_score = (1.0 / (60.0 + rank)) * dense_weight
+                combined_scores[pmcid] = combined_scores.get(pmcid, 0) + rrf_score
+                if pmcid not in all_points:
+                    all_points[pmcid] = point
+            
+            for rank, point in enumerate(sparse_results, 1):
+                pmcid = point.payload.get("pmcid") or str(point.id)
+                rrf_score = (1.0 / (60.0 + rank)) * sparse_weight
+                combined_scores[pmcid] = combined_scores.get(pmcid, 0) + rrf_score
+                if pmcid not in all_points:
+                    all_points[pmcid] = point
+        
+        # Normalize combined scores to 0-1 range
+        if combined_scores:
+            max_score = max(combined_scores.values())
+            min_score = min(combined_scores.values())
+            score_range = max_score - min_score if max_score > min_score else 1.0
+            for pmcid in combined_scores:
+                combined_scores[pmcid] = (combined_scores[pmcid] - min_score) / score_range
+        
+        # Sort by score and limit total results
+        sorted_pmcids = sorted(
+            combined_scores.keys(),
+            key=lambda p: combined_scores[p],
+            reverse=True
+        )[:self.n_retrieval]
+        
+        # Format passages
+        for pmcid in sorted_pmcids:
+            point = all_points[pmcid]
+            source = point.payload.get("source", "")
+            article_type = point.payload.get("article_type", "")
+            is_dailymed = source == "dailymed" or article_type == "drug_label"
+            
+            if is_dailymed:
+                passage = self._transform_dailymed_payload(point.payload, combined_scores[pmcid])
+                passage["stype"] = "batch_hybrid_search"
+            else:
+                passage = {
+                    "corpus_id": point.payload.get("pmcid", ""),
+                    "pmcid": point.payload.get("pmcid", ""),
+                    "pmid": point.payload.get("pmid"),
+                    "title": point.payload.get("title", ""),
+                    "text": point.payload.get("abstract", ""),
+                    "abstract": point.payload.get("abstract", ""),
+                    "full_text": point.payload.get("full_text", ""),
+                    "has_full_text": point.payload.get("has_full_text", False),
+                    "section_title": "abstract",
+                    "journal": point.payload.get("journal", ""),
+                    "venue": point.payload.get("journal", ""),
+                    "year": point.payload.get("year"),
+                    "authors": self._parse_authors(point.payload.get("authors")),
+                    "article_type": point.payload.get("article_type", ""),
+                    "score": combined_scores[pmcid],
+                    "stype": "batch_hybrid_search"
+                }
+            all_passages.append(passage)
+        
+        logger.info(f"✅ Batch hybrid search complete: {len(all_passages)} unique passages")
+        return all_passages
+
     def retrieve_additional_papers(
         self,
         query: str,

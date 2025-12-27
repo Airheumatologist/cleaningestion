@@ -80,21 +80,23 @@ def get_ref_author_str(authors) -> str:
 # =============================================================================
 
 # =============================================================================
-# SIMPLIFIED 3-TIER EVIDENCE SYSTEM
+# EVIDENCE HIERARCHY SYSTEM
 # =============================================================================
 
-# Tier multipliers - much stronger differentiation
-TIER_1_BOOST = 1.80  # Guidelines, systematic reviews, meta-analyses
-TIER_2_BOOST = 1.25  # RCTs, clinical trials, review articles
+# Tier multipliers - strong differentiation to ensure guidelines rank above case reports
+# A case report with 0.92 Cohere score → 0.92 × 0.20 = 0.18
+# A guideline with 0.70 Cohere score → 0.70 × 3.00 = 2.10 (11x higher)
+TIER_1_BOOST = 3.00  # Guidelines, systematic reviews, meta-analyses
+TIER_2_BOOST = 1.50  # RCTs, clinical trials, review articles
 TIER_3_BOOST = 1.00  # Standard research
-TIER_4_PENALTY = 0.50  # Case reports, letters, editorials
+TIER_4_PENALTY = 0.20  # Case reports, letters, editorials - strictly suppressed
 
 # Article types for each tier
 TIER_1_TYPES = {
     "guideline", "practice_guideline", "practice guideline",
     "systematic_review", "systematic review", 
-    "meta_analysis", "meta-analysis",
-    "consensus", "consensus_statement"
+    "meta_analysis", "meta-analysis", "meta analysis",
+    "consensus", "consensus_statement", "consensus statement"
 }
 TIER_2_TYPES = {
     "clinical_trial", "clinical trial",
@@ -109,56 +111,93 @@ TIER_4_TYPES = {
     "news", "correspondence"
 }
 
-# Title keywords that indicate guidelines (for misclassified articles)
+# Title keywords that indicate guidelines (catches misclassified articles)
 GUIDELINE_TITLE_KEYWORDS = [
+    # Standard terms
     "guideline", "guidelines", 
-    "consensus", 
+    "consensus", "consensus statement",
     "recommendation", "recommendations",
     "position statement",
     "clinical practice",
-    "acr/vasculitis",  # ACR guidelines
-    "aha/acc",  # American Heart Association
+    # Evidence-based patterns
+    "evidence-based", "evidence based",
+    "management guidelines", "treatment guidelines",
+    "international consensus",
+    # Major medical organizations
+    "eular", "acr", "kdigo", "easl", "aga", "aasld",
+    "aha", "acc", "escmid", "idsa", "nice", "who",
+    "esmo", "asco", "bsr", "oarsi",
+    # Specific patterns
+    "acr/vasculitis", "aha/acc",
 ]
 
 # High-impact medical journals
 HIGH_IMPACT_JOURNALS = {
+    # Top general medical
     "new england journal of medicine", "nejm",
     "the lancet", "lancet",
     "jama", "journal of the american medical association",
     "bmj", "british medical journal",
     "nature medicine",
     "annals of internal medicine",
-    "circulation",
-    "blood",
     "jama internal medicine",
-    "the lancet oncology", "lancet oncology",
+    # Cardiology
+    "circulation", "european heart journal",
+    # Hematology/Oncology
+    "blood", "the lancet oncology", "lancet oncology",
     "journal of clinical oncology",
-    "european heart journal",
-    "gastroenterology",
-    "hepatology",
-    "diabetes care",
-    "chest",
-    "arthritis & rheumatology",
-    "arthritis care & research",
+    # Gastroenterology/Hepatology
+    "gastroenterology", "hepatology", "gut",
+    "journal of hepatology",
+    "united european gastroenterology journal",  # IgG4-RD guidelines
+    "clinical gastroenterology and hepatology",
+    # Rheumatology
+    "arthritis & rheumatology", "arthritis care & research",
     "annals of the rheumatic diseases",
+    "the lancet rheumatology", "lancet rheumatology",
+    "nature reviews rheumatology",
+    "rheumatology",
+    "autoimmunity reviews",
+    # Other specialties
+    "diabetes care", "chest",
+    # Drug labels
     "dailymed",
 }
 
 
-def get_evidence_multiplier(article_type: str, title: str) -> float:
+def get_evidence_multiplier(article_type: str, title: str, publication_types: list = None) -> float:
     """
-    Get evidence tier multiplier based on article type and title.
+    Get evidence tier multiplier based on article type, title, and publication types.
     
-    Uses 3-tier system with title-based guideline detection.
+    Priority:
+    1. Title keywords (catches misclassified guidelines)
+    2. Publication types list (from PubMed metadata - most reliable)
+    3. Article type field
     """
-    article_type_lower = article_type.lower().replace("-", "_").replace(" ", "_") if article_type else ""
-    title_lower = title.lower() if title else ""
+    article_type_lower = (article_type or "").lower().replace("-", "_").replace(" ", "_")
+    title_lower = (title or "").lower()
+    pub_types_lower = [(pt or "").lower() for pt in (publication_types or [])]
     
-    # Title-based detection first (catches misclassified guidelines)
+    # 1. Title-based detection first (catches misclassified guidelines)
     if any(kw in title_lower for kw in GUIDELINE_TITLE_KEYWORDS):
         return TIER_1_BOOST
     
-    # Type-based tier assignment
+    # 2. Publication types list (from PubMed - more reliable than article_type)
+    TIER1_PUBTYPE_PATTERNS = ["systematic review", "meta-analysis", "guideline", "practice guideline", "consensus"]
+    TIER2_PUBTYPE_PATTERNS = ["randomized controlled trial", "clinical trial", "review"]
+    TIER4_PUBTYPE_PATTERNS = ["case report", "letter", "editorial", "comment", "news"]
+    
+    for pt in pub_types_lower:
+        if any(p in pt for p in TIER1_PUBTYPE_PATTERNS):
+            return TIER_1_BOOST
+    for pt in pub_types_lower:
+        if any(p in pt for p in TIER4_PUBTYPE_PATTERNS):
+            return TIER_4_PENALTY
+    for pt in pub_types_lower:
+        if any(p in pt for p in TIER2_PUBTYPE_PATTERNS):
+            return TIER_2_BOOST
+    
+    # 3. Article type-based tier assignment
     if article_type_lower in TIER_1_TYPES or any(t in article_type_lower for t in ["guideline", "systematic", "meta"]):
         return TIER_1_BOOST
     
@@ -176,36 +215,41 @@ def apply_evidence_boosts(
     current_year: int = 2025
 ) -> list:
     """
-    Apply SIMPLIFIED evidence hierarchy boosts to reranked documents.
+    Apply evidence hierarchy boosts to reranked documents.
     
-    Uses 3-tier system:
-    - Tier 1 (1.80x): Guidelines, systematic reviews, meta-analyses
-    - Tier 2 (1.25x): RCTs, clinical trials, review articles
+    Tier System (strong differentiation):
+    - Tier 1 (3.00x): Guidelines, systematic reviews, meta-analyses
+    - Tier 2 (1.50x): RCTs, clinical trials, review articles
     - Tier 3 (1.00x): Standard research
-    - Tier 4 (0.50x): Case reports, letters, editorials
+    - Tier 4 (0.20x): Case reports, letters, editorials
     
-    Plus recency and high-impact journal boosts.
+    Smart Recency: Only applies to non-case-reports to preserve seminal older papers.
+    Journal Boost: High-impact journals get +15%.
     """
     for doc in documents:
         # Use combined_score (includes entity matching) as base
         base_score = doc.get("combined_score", doc.get("rerank_score", doc.get("score", 0.5)))
         
-        # 1. Evidence tier multiplier
+        # 1. Evidence tier multiplier (now with publication_types support)
         tier_mult = get_evidence_multiplier(
             doc.get("article_type", ""),
-            doc.get("title", "")
+            doc.get("title", ""),
+            doc.get("publication_type", [])  # From payload
         )
         
-        # 2. Recency boost (recent articles +5%)
+        # 2. Smart recency boost: ONLY apply to non-case-reports
+        # This prevents fresh case reports from outranking seminal older guidelines
         recency_mult = 1.0
-        year = doc.get("year")
-        if year:
-            try:
-                year_int = int(year)
-                if year_int >= current_year - 2:  # 2023-2025
-                    recency_mult = 1.05
-            except (ValueError, TypeError):
-                pass
+        is_case_report = (tier_mult == TIER_4_PENALTY)
+        if not is_case_report:
+            year = doc.get("year")
+            if year:
+                try:
+                    year_int = int(year)
+                    if year_int >= current_year - 2:  # 2023-2025
+                        recency_mult = 1.10  # +10% for recent high-quality articles
+                except (ValueError, TypeError):
+                    pass
         
         # 3. High-impact journal boost (+15%)
         journal_mult = 1.0
@@ -217,6 +261,7 @@ def apply_evidence_boosts(
         doc["boosted_score"] = base_score * tier_mult * recency_mult * journal_mult
         doc["evidence_tier"] = tier_mult
         doc["boost_multiplier"] = tier_mult * recency_mult * journal_mult
+        doc["is_case_report"] = is_case_report  # Track for debugging
     
     return documents
 

@@ -24,11 +24,15 @@ QDRANT_RETRY_COUNT = 3  # Number of retries for transient failures
 QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
 
 # =============================================================================
-# LLM Configuration (OpenRouter)
+# LLM Configuration (DeepInfra)
 # =============================================================================
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = "openai/gpt-oss-20b"  # OpenAI GPT-OSS-20B model via OpenRouter
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEEPINFRA_API_KEY = "Huum9P1B1P9UHu92sMY2AWF99GaVthTw"
+DEEPINFRA_MODEL = "nvidia/Nemotron-3-Nano-30B-A3B"  # NVIDIA Nemotron 3 Nano model via DeepInfra
+DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
+
+# LLM Generation Parameters
+LLM_TEMPERATURE = 0.7  # Controls randomness (0=deterministic, 1=creative)
+LLM_TOP_P = 0.9  # Nucleus sampling threshold
 
 # Legacy OpenAI (for backward compatibility)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -69,11 +73,11 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 # =============================================================================
 # Query Preprocessing Configuration - SCALED UP FOR 150+ ARTICLES
 # =============================================================================
-QUERY_EXPANSION_COUNT = 4  # Number of expanded query variations
+QUERY_EXPANSION_COUNT = 2  # Number of expanded query variations (3 total with base query)
 BULK_RETRIEVAL_LIMIT = 600  # Increased from 300 for better coverage
 BULK_RETRIEVAL_PER_QUERY = 150  # Increased from 75 - more candidates before reranking
 RERANK_TOP_K = 100  # Increased from 30 to 100 - Final articles after reranking (keep more before aggregation)
-MAX_ABSTRACTS = 150  # Maximum abstracts to use in context (no full text) - TARGET: Use ALL 150
+MAX_ABSTRACTS = 100  # Maximum abstracts to use in context - reduced from 150 to save tokens
 MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)
 
 
@@ -96,8 +100,8 @@ def validate_config():
         errors.append("QDRANT_URL not set in .env")
     if not QDRANT_API_KEY:
         errors.append("QDRANT_API_KEY not set in .env")
-    if not OPENROUTER_API_KEY:
-        errors.append("OPENROUTER_API_KEY not set in .env")
+    if not DEEPINFRA_API_KEY:
+        errors.append("DEEPINFRA_API_KEY not set")
     if not COHERE_API_KEY:
         errors.append("COHERE_API_KEY not set in .env")
 
@@ -117,9 +121,9 @@ if __name__ == "__main__":
         validate_config()
         print(f"✅ QDRANT_URL: {QDRANT_URL[:50]}...")
         print(f"✅ QDRANT_API_KEY: {QDRANT_API_KEY[:20]}...")
-        print(f"✅ OPENROUTER_API_KEY: {OPENROUTER_API_KEY[:20]}...")
-        print(f"✅ OpenRouter Model: {OPENROUTER_MODEL}")
-        print(f"✅ OpenRouter Base URL: {OPENROUTER_BASE_URL}")
+        print(f"✅ DEEPINFRA_API_KEY: {DEEPINFRA_API_KEY[:20]}...")
+        print(f"✅ DeepInfra Model: {DEEPINFRA_MODEL}")
+        print(f"✅ DeepInfra Base URL: {DEEPINFRA_BASE_URL}")
         print(f"✅ Embedding Model: {EMBEDDING_MODEL}")
         print(f"✅ Collection Name: {COLLECTION_NAME}")
         print("\n✅ All configuration validated!")

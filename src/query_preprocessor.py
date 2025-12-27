@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Optional, NamedTuple, Union
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from .config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL, QUERY_EXPANSION_COUNT
+from .config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, DEEPINFRA_MODEL, LLM_TEMPERATURE, LLM_TOP_P, QUERY_EXPANSION_COUNT
 from .medical_entity_expander import MedicalEntityExpander
 
 logger = logging.getLogger(__name__)
@@ -202,14 +202,14 @@ class QueryPreprocessor:
     - Fallback to basic expansion on errors
     """
     
-    def __init__(self, model: str = OPENROUTER_MODEL, use_entity_expansion: bool = True):
-        """Initialize with OpenRouter client."""
-        if not OPENROUTER_API_KEY:
-            raise ValueError("OPENROUTER_API_KEY not set in environment")
+    def __init__(self, model: str = DEEPINFRA_MODEL, use_entity_expansion: bool = True):
+        """Initialize with DeepInfra client."""
+        if not DEEPINFRA_API_KEY:
+            raise ValueError("DEEPINFRA_API_KEY not set")
 
         self.openai_client = OpenAI(
-            api_key=OPENROUTER_API_KEY,
-            base_url=OPENROUTER_BASE_URL,
+            api_key=DEEPINFRA_API_KEY,
+            base_url=DEEPINFRA_BASE_URL,
             timeout=300.0
         )
         self.model = model
@@ -343,18 +343,17 @@ class QueryPreprocessor:
         expanded_query = self._expand_medical_entities(query)
         
         try:
-            response = self.openai_client.responses.create(
+            response = self.openai_client.chat.completions.create(
                 model=self.model,
-                input=[
+                messages=[
                     {"role": "system", "content": QUERY_DECOMPOSER_PROMPT},
                     {"role": "user", "content": expanded_query}
                 ],
-                text={"format": {"type": "text"}},
-                reasoning={"effort": "low"},
-                store=False
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P
             )
 
-            decomposed = self._parse_llm_response(response.output_text.strip())
+            decomposed = self._parse_llm_response(response.choices[0].message.content.strip())
             logger.info(f"Decomposed query: {decomposed}")
             
             # Extract filters and queries
@@ -405,19 +404,18 @@ RULES:
 4. Output ONLY the queries, one per line, no numbering or bullets"""
 
         try:
-            response = self.openai_client.responses.create(
+            response = self.openai_client.chat.completions.create(
                 model=self.model,
-                input=[
+                messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f'Generate {self.expansion_count} alternative medical search queries for:\n\n"{query}"\n\nOutput only the queries, one per line:'}
                 ],
-                text={"format": {"type": "text"}},
-                reasoning={"effort": "low"},
-                store=False
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P
             )
 
             expanded = []
-            for line in response.output_text.strip().split('\n'):
+            for line in response.choices[0].message.content.strip().split('\n'):
                 cleaned = line.strip().lstrip('0123456789.-•*) ').strip()
                 if cleaned and len(cleaned) > 10:
                     expanded.append(cleaned)

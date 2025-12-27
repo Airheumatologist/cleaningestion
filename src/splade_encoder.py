@@ -17,15 +17,16 @@ SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
 
 
 class SPLADEEncoder:
-    """SPLADE encoder for generating sparse vectors."""
+    """SPLADE encoder for generating sparse vectors with caching."""
     
-    def __init__(self, model_name: str = SPLADE_MODEL, device: Optional[str] = None):
+    def __init__(self, model_name: str = SPLADE_MODEL, device: Optional[str] = None, cache_size: int = 256):
         """
         Initialize SPLADE encoder.
         
         Args:
             model_name: HuggingFace model name
             device: Device to use ('cuda', 'cpu', or None for auto)
+            cache_size: Max number of query vectors to cache (default: 256)
         """
         self.model_name = model_name
         
@@ -33,6 +34,13 @@ class SPLADEEncoder:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
+        
+        # LRU cache for query sparse vectors (key: query text, value: sparse dict)
+        from collections import OrderedDict
+        self._cache: OrderedDict = OrderedDict()
+        self._cache_size = cache_size
+        self._cache_hits = 0
+        self._cache_misses = 0
         
         logger.info(f"Loading SPLADE model: {model_name} on {device}")
         
@@ -42,10 +50,98 @@ class SPLADEEncoder:
             self.model.to(device)
             self.model.eval()
             
-            logger.info("✅ SPLADE model loaded successfully")
+            logger.info(f"✅ SPLADE model loaded successfully (cache_size={cache_size})")
         except Exception as e:
             logger.error(f"❌ Error loading SPLADE model: {e}")
             raise
+    
+    def encode_cached(self, text: str, max_length: int = 512) -> Dict[int, float]:
+        """
+        Encode a single text with caching.
+        
+        Args:
+            text: Text string to encode
+            max_length: Maximum sequence length
+            
+        Returns:
+            Sparse vector dict (token_id -> score)
+        """
+        cache_key = text[:512]  # Truncate for cache key consistency
+        
+        # Check cache
+        if cache_key in self._cache:
+            self._cache_hits += 1
+            # Move to end (LRU)
+            self._cache.move_to_end(cache_key)
+            return self._cache[cache_key]
+        
+        # Cache miss - compute
+        self._cache_misses += 1
+        vectors = self.encode([text], max_length=max_length)
+        sparse_dict = vectors[0] if vectors else {}
+        
+        # Add to cache
+        self._cache[cache_key] = sparse_dict
+        
+        # Evict oldest if over capacity
+        while len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
+        
+        return sparse_dict
+    
+    def encode_batch_cached(self, texts: List[str], max_length: int = 512) -> List[Dict[int, float]]:
+        """
+        Encode multiple texts with caching - returns cached results and computes only missing ones.
+        
+        Args:
+            texts: List of text strings
+            max_length: Maximum sequence length
+            
+        Returns:
+            List of sparse vectors in same order as input
+        """
+        results = [None] * len(texts)
+        texts_to_encode = []
+        indices_to_encode = []
+        
+        # Check cache for each text
+        for i, text in enumerate(texts):
+            cache_key = text[:512]
+            if cache_key in self._cache:
+                self._cache_hits += 1
+                self._cache.move_to_end(cache_key)
+                results[i] = self._cache[cache_key]
+            else:
+                texts_to_encode.append(text)
+                indices_to_encode.append(i)
+        
+        # Encode all uncached texts in a single batch
+        if texts_to_encode:
+            self._cache_misses += len(texts_to_encode)
+            encoded_vectors = self.encode(texts_to_encode, max_length=max_length)
+            
+            # Store results and update cache
+            for idx, vector, text in zip(indices_to_encode, encoded_vectors, texts_to_encode):
+                results[idx] = vector
+                cache_key = text[:512]
+                self._cache[cache_key] = vector
+                
+                # Evict oldest if over capacity
+                while len(self._cache) > self._cache_size:
+                    self._cache.popitem(last=False)
+        
+        return results
+    
+    def get_cache_stats(self) -> Dict[str, int]:
+        """Return cache statistics."""
+        total = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / total * 100) if total > 0 else 0
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "size": len(self._cache),
+            "hit_rate_pct": round(hit_rate, 1)
+        }
     
     def encode(
         self,

@@ -16,7 +16,7 @@ from typing import List, Dict, Any, Generator
 from dataclasses import asdict
 from openai import OpenAI
 
-from .config import OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL, BULK_RETRIEVAL_LIMIT, MAX_ABSTRACTS, MAX_DAILYMED_PER_DRUG
+from .config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, DEEPINFRA_MODEL, LLM_TEMPERATURE, LLM_TOP_P, BULK_RETRIEVAL_LIMIT, MAX_ABSTRACTS, MAX_DAILYMED_PER_DRUG
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
 from .reranker import PaperFinderWithReranker
@@ -40,7 +40,7 @@ class MedicalRAGPipeline:
     
     def __init__(
         self,
-        model: str = OPENROUTER_MODEL,
+        model: str = DEEPINFRA_MODEL,
         n_retrieval: int = 150,
         n_rerank: int = -1,  # -1 = no limit
         context_threshold: float = 0.3  # Post-aggregation threshold on boosted_score
@@ -52,13 +52,13 @@ class MedicalRAGPipeline:
         """Initialize pipeline components."""
         logger.info("🚀 Initializing Elixir Medical RAG Pipeline...")
 
-        if not OPENROUTER_API_KEY:
-            raise ValueError("OPENROUTER_API_KEY not set")
+        if not DEEPINFRA_API_KEY:
+            raise ValueError("DEEPINFRA_API_KEY not set")
 
         self.model = model
         self.openai_client = OpenAI(
-            api_key=OPENROUTER_API_KEY,
-            base_url=OPENROUTER_BASE_URL,
+            api_key=DEEPINFRA_API_KEY,
+            base_url=DEEPINFRA_BASE_URL,
             timeout=300.0
         )  # 5 minutes timeout
         
@@ -112,15 +112,17 @@ class MedicalRAGPipeline:
         """
         Retrieve passages from Qdrant using multi-query expansion.
         
-        Optimized: Runs PMC variations AND DailyMed searches in parallel.
+        Optimized with BATCH query API:
+        - Batch encodes ALL query variations with SPLADE in ONE call
+        - Sends ALL queries (dense + sparse) to Qdrant in ONE HTTP request
+        - DailyMed search runs in parallel thread
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
+        from qdrant_client.models import SparseVector
         
-        logger.info("🔍 Step 2: Passage Retrieval (Parallel PMC + DailyMed)")
+        logger.info("🔍 Step 2: Passage Retrieval (Batch Hybrid Search)")
         
-        all_passages = []
         dailymed_results = []
-        seen_ids = set()
         
         # Get queries and drug names
         queries_to_run = processed_query.expanded_queries or [processed_query.rewritten_query]
@@ -136,13 +138,36 @@ class MedicalRAGPipeline:
 
         logger.info(f"   PMC Queries: {len(queries_to_run)} | DailyMed Drugs: {len(drug_names)}")
         
-        def run_single_pmc_query(query: str) -> List[Dict[str, Any]]:
+        # ========================================================================
+        # OPTIMIZATION 1: Batch encode ALL query variations with SPLADE in ONE call
+        # ========================================================================
+        sparse_vectors = []
+        if hasattr(self.retriever, 'splade_encoder') and self.retriever.splade_encoder:
             try:
-                return self.retriever.retrieve_passages(query, **processed_query.search_filters)
+                logger.info(f"   ⚡ Batch encoding {len(queries_to_run)} queries with SPLADE...")
+                sparse_dicts = self.retriever.splade_encoder.encode_batch_cached(queries_to_run)
+                
+                # Convert to SparseVector format
+                for sparse_dict in sparse_dicts:
+                    if sparse_dict:
+                        sparse_vectors.append(SparseVector(
+                            indices=list(sparse_dict.keys()),
+                            values=list(sparse_dict.values())
+                        ))
+                    else:
+                        sparse_vectors.append(SparseVector(indices=[], values=[]))
+                logger.info(f"   ⚡ Batch encoding complete ({len(sparse_vectors)} vectors)")
             except Exception as e:
-                logger.warning(f"PMC query failed: {query[:40]}... - {e}")
-                return []
-
+                logger.warning(f"   Batch SPLADE encoding failed: {e}")
+                # Create empty sparse vectors as fallback
+                sparse_vectors = [SparseVector(indices=[], values=[]) for _ in queries_to_run]
+        else:
+            # No SPLADE available, create empty sparse vectors
+            sparse_vectors = [SparseVector(indices=[], values=[]) for _ in queries_to_run]
+        
+        # ========================================================================
+        # OPTIMIZATION 2: Run DailyMed search in parallel with batch PMC query
+        # ========================================================================
         def run_dailymed_search(drugs: List[str]) -> List[Dict[str, Any]]:
             try:
                 if not drugs: return []
@@ -150,34 +175,27 @@ class MedicalRAGPipeline:
             except Exception as e:
                 logger.warning(f"DailyMed search failed: {e}")
                 return []
-
-        # Run ALL retrieval tasks in parallel (PMC + DailyMed)
-        with ThreadPoolExecutor(max_workers=max(len(queries_to_run) + 1, 5)) as executor:
-            # PMC variations
-            pmc_futures = {executor.submit(run_single_pmc_query, q): q for q in queries_to_run}
-            # DailyMed search
+        
+        # Start DailyMed search in background thread
+        with ThreadPoolExecutor(max_workers=2) as executor:
             dm_future = executor.submit(run_dailymed_search, drug_names)
             
-            # Wait for DailyMed
+            # ========================================================================
+            # OPTIMIZATION 3: Single batch HTTP call for ALL PMC queries (6 → 1)
+            # ========================================================================
+            all_passages = self.retriever.batch_hybrid_search(
+                queries=queries_to_run,
+                sparse_vectors=sparse_vectors,
+                **processed_query.search_filters
+            )
+            
+            # Collect DailyMed results
             try:
                 dailymed_results = dm_future.result()
                 if dailymed_results:
-                    logger.info(f"   ✅ Parallel DailyMed search found {len(dailymed_results)} results")
+                    logger.info(f"   ✅ DailyMed search found {len(dailymed_results)} results")
             except Exception as e:
                 logger.warning(f"DailyMed task failed: {e}")
-
-            # Collect PMC results as they arrive
-            for future in as_completed(pmc_futures):
-                query = pmc_futures[future]
-                try:
-                    passages = future.result()
-                    for p in passages:
-                        pmcid = p.get("pmcid")
-                        if pmcid and pmcid not in seen_ids:
-                            seen_ids.add(pmcid)
-                            all_passages.append(p)
-                except Exception as e:
-                    logger.warning(f"PMC query thread failed for '{query[:30]}': {e}")
         
         logger.info(f"   Retrieved {len(all_passages)} unique PMC passages")
         return all_passages, dailymed_results
@@ -451,15 +469,17 @@ class MedicalRAGPipeline:
         """
         Filter papers based on medical entity matching.
         
-        When LLM-extracted medical_conditions are provided, uses STRICT matching:
-        papers MUST contain at least one condition to be included.
+        When LLM-extracted medical_conditions are provided, uses flexible matching:
+        - Splits compound conditions into individual terms
+        - Normalizes case variations (e.g., IgG4 vs IGG4)
+        - Matches if paper contains ANY key term from the condition
         
         Falls back to regex-based entity extraction if no conditions provided.
         
         Args:
             query: Original query
             papers_df: DataFrame of papers
-            medical_conditions: LLM-extracted conditions for strict matching
+            medical_conditions: LLM-extracted conditions for matching
             
         Returns:
             Filtered DataFrame
@@ -468,24 +488,51 @@ class MedicalRAGPipeline:
             return papers_df
         
         import pandas as pd
+        import re
         
         logger.info("🔍 Post-retrieval filtering: Checking entity matches...")
         
-        # Use LLM-extracted conditions if available (STRICT matching)
+        # Use LLM-extracted conditions if available
         # Otherwise fall back to regex extraction
         if medical_conditions:
-            query_entities = medical_conditions
-            logger.info(f"   Using LLM-extracted conditions (strict): {query_entities}")
+            raw_entities = medical_conditions
+            logger.info(f"   Using LLM-extracted conditions (strict): {raw_entities}")
         elif self.entity_expander:
-            query_entities = self._extract_query_entities(query)
-            logger.info(f"   Using regex-extracted entities: {query_entities}")
+            raw_entities = self._extract_query_entities(query)
+            logger.info(f"   Using regex-extracted entities: {raw_entities}")
         else:
             logger.info("   No entity extraction available, skipping filter")
             return papers_df
         
-        if not query_entities:
+        if not raw_entities:
             logger.info("   No medical entities found in query, skipping filter")
             return papers_df
+        
+        # ========================================================================
+        # Extract KEY TERMS from conditions for flexible matching
+        # e.g., "Immunoglobulin G IGG4 disease" -> ["igg4", "immunoglobulin"]
+        # ========================================================================
+        key_terms = set()
+        for entity in raw_entities:
+            # Add the full entity (normalized)
+            entity_lower = entity.lower()
+            
+            # Split by common separators and extract meaningful terms
+            words = re.split(r'[\s\-_,]+', entity_lower)
+            for word in words:
+                # Skip common filler words
+                if word in {'of', 'the', 'and', 'or', 'in', 'a', 'an', 'disease', 'syndrome', 'disorder', 'related'}:
+                    continue
+                # Keep meaningful medical terms (3+ chars)
+                if len(word) >= 3:
+                    key_terms.add(word)
+            
+            # Also add the full entity for exact phrase matching
+            key_terms.add(entity_lower)
+        
+        # Add common variations (e.g., igg4 matches IgG4, IGG4)
+        # These will match case-insensitively in the paper text
+        logger.info(f"   Key terms for matching: {sorted(key_terms)[:10]}...")
         
         # Check each paper for entity matches
         filtered_indices = []
@@ -495,17 +542,13 @@ class MedicalRAGPipeline:
             title = str(row.get('title', '')).lower()
             abstract = str(row.get('abstract', '')).lower()
             
-            # Combine title and abstract for searching (abstracts only - no full text)
-            paper_text = f"{title} {abstract}".lower()
+            # Combine title and abstract for searching
+            paper_text = f"{title} {abstract}"
             
-            # Check if paper contains at least one key entity
+            # Check if paper contains at least one key term
             has_entity = False
-            for entity in query_entities:
-                entity_lower = entity.lower()
-                # Check for exact match or word boundary match
-                if (entity_lower in paper_text or 
-                    f" {entity_lower} " in paper_text or
-                    entity_lower in title):
+            for term in key_terms:
+                if term in paper_text:
                     has_entity = True
                     break
             
@@ -751,7 +794,9 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
-                ]
+                ],
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P
             )
 
             answer = response.choices[0].message.content.strip()
@@ -774,7 +819,9 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                stream=True
+                stream=True,
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P
             )
             
             full_answer = ""
