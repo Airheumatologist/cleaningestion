@@ -34,6 +34,10 @@ DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
 LLM_TEMPERATURE = 0.7  # Controls randomness (0=deterministic, 1=creative)
 LLM_TOP_P = 0.9  # Nucleus sampling threshold
 
+# Fallback LLM (for no-results scenarios - larger model with more knowledge)
+FALLBACK_LLM_MODEL = "deepseek-ai/DeepSeek-V3.2"
+FALLBACK_LLM_ENABLED = True
+
 # Legacy OpenAI (for backward compatibility)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = "gpt-5-nano"  # GPT-5 Nano model

@@ -36,6 +36,9 @@ class DecomposedQuery(BaseModel):
     rewritten_query_for_keyword_search: str = Field(description="The keyword-optimized query")
     drug_names: List[str] = Field(default=[], description="List of drug names (brand and generic) mentioned in query")
     medical_conditions: List[str] = Field(default=[], description="Key medical conditions/diseases mentioned in query")
+    # Typo correction fields
+    corrected_query: str = Field(default="", description="Typo-corrected version of the query (empty if no typos found)")
+    corrected_medical_conditions: List[str] = Field(default=[], description="Typo-corrected medical conditions for entity matching")
 
 
 class LLMProcessedQuery(NamedTuple):
@@ -90,7 +93,19 @@ Components to extract:
      * Rituximab: RITUXAN (IV) vs RITUXAN HYCELA (SC)
      * Trastuzumab: HERCEPTIN (IV) vs HERCEPTIN HYLECTA (SC)
      * Tocilizumab: ACTEMRA (both IV and SC, same brand)
-8. Medical conditions: List key diseases or clinical conditions mentioned.
+8. Medical conditions: List key diseases or clinical conditions mentioned (preserve original spelling from query).
+9. TYPO DETECTION AND CORRECTION (CRITICAL):
+   - Carefully check for typos/misspellings in medical terms, drug names, and disease names
+   - Common typo patterns: transposed letters, missing letters, extra letters, phonetic misspellings
+   - Examples of typos to correct:
+     * "NUEROBROCELLOSIS" → "neurobrucellosis" (transposed letters)
+     * "rhuematoid" → "rheumatoid" (common misspelling)
+     * "methotrexat" → "methotrexate" (missing letter)
+   - PRESERVE legitimate medical terms exactly - do NOT "correct" valid terms
+   - When confident a term is misspelled, provide the corrected version
+   - When unsure, leave corrected fields empty (err on side of caution)
+10. Corrected query: If typos were detected, provide the fully corrected query. Leave empty if no typos.
+11. Corrected medical conditions: List the corrected spellings of conditions (for entity matching).
 
 Current year is 2025.
 </task>
@@ -109,7 +124,9 @@ What are the latest treatments for heart failure with preserved ejection fractio
     "rewritten_query": "Treatments for heart failure with preserved ejection fraction HFpEF",
     "rewritten_query_for_keyword_search": "HFpEF treatment therapy heart failure preserved ejection fraction",
     "drug_names": [],
-    "medical_conditions": ["heart failure", "HFpEF"]
+    "medical_conditions": ["heart failure", "HFpEF"],
+    "corrected_query": "",
+    "corrected_medical_conditions": []
 }
 </example output>
 
@@ -126,7 +143,9 @@ golimumab infusion dosing for rheumatoid arthritis
     "rewritten_query": "golimumab IV infusion dosing rheumatoid arthritis",
     "rewritten_query_for_keyword_search": "golimumab SIMPONI ARIA infusion IV dosing rheumatoid arthritis RA",
     "drug_names": ["golimumab", "SIMPONI ARIA"],
-    "medical_conditions": ["rheumatoid arthritis"]
+    "medical_conditions": ["rheumatoid arthritis"],
+    "corrected_query": "",
+    "corrected_medical_conditions": []
 }
 </example output>
 
@@ -143,7 +162,9 @@ golimumab dosing for RA
     "rewritten_query": "golimumab dosing rheumatoid arthritis",
     "rewritten_query_for_keyword_search": "golimumab SIMPONI dosing rheumatoid arthritis RA",
     "drug_names": ["golimumab", "SIMPONI", "SIMPONI ARIA"],
-    "medical_conditions": ["rheumatoid arthritis"]
+    "medical_conditions": ["rheumatoid arthritis"],
+    "corrected_query": "",
+    "corrected_medical_conditions": []
 }
 </example output>
 
@@ -160,7 +181,9 @@ Systematic reviews on SGLT2 inhibitors for diabetes and heart failure from 2020 
     "rewritten_query": "Systematic reviews SGLT2 inhibitors sodium-glucose cotransporter-2 diabetes heart failure",
     "rewritten_query_for_keyword_search": "SGLT2 inhibitor systematic review meta-analysis diabetes heart failure",
     "drug_names": ["SGLT2 inhibitors"],
-    "medical_conditions": ["diabetes", "heart failure"]
+    "medical_conditions": ["diabetes", "heart failure"],
+    "corrected_query": "",
+    "corrected_medical_conditions": []
 }
 </example output>
 
@@ -177,7 +200,28 @@ rituximab subcutaneous vs IV administration
     "rewritten_query": "rituximab subcutaneous versus intravenous IV administration comparison",
     "rewritten_query_for_keyword_search": "rituximab RITUXAN RITUXAN HYCELA SC IV subcutaneous intravenous",
     "drug_names": ["rituximab", "RITUXAN", "RITUXAN HYCELA"],
-    "medical_conditions": []
+    "medical_conditions": [],
+    "corrected_query": "",
+    "corrected_medical_conditions": []
+}
+</example output>
+
+<example input>
+Management of NUEROBROCELLOSIS
+</example input>
+<example output>
+{
+    "earliest_search_year": "",
+    "latest_search_year": "",
+    "venues": "",
+    "authors": [],
+    "field_of_study": "Medicine",
+    "rewritten_query": "Management of NUEROBROCELLOSIS",
+    "rewritten_query_for_keyword_search": "NUEROBROCELLOSIS management treatment therapy",
+    "drug_names": [],
+    "medical_conditions": ["NUEROBROCELLOSIS"],
+    "corrected_query": "Management of neurobrucellosis",
+    "corrected_medical_conditions": ["neurobrucellosis"]
 }
 </example output>
 </examples>
@@ -358,7 +402,13 @@ class QueryPreprocessor:
             
             # Extract filters and queries
             search_filters = self._extract_search_filters(decomposed)
-            rewritten = decomposed.rewritten_query or expanded_query
+            
+            # Use corrected query if available (CRITICAL for retrieval), otherwise use rewritten
+            rewritten = decomposed.corrected_query if decomposed.corrected_query else (decomposed.rewritten_query or expanded_query)
+            
+            # For keywords, if we have a corrected query, we should ideally use it, but the LLM
+            # generated keywords based on the input. Let's trust the rewritten query update 
+            # will drive better semantic search, and keep keywords as is unless empty.
             keyword = decomposed.rewritten_query_for_keyword_search or expanded_query
             
             # Ensure expanded terms are included if entity expansion was used

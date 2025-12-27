@@ -16,7 +16,7 @@ from typing import List, Dict, Any, Generator
 from dataclasses import asdict
 from openai import OpenAI
 
-from .config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, DEEPINFRA_MODEL, LLM_TEMPERATURE, LLM_TOP_P, BULK_RETRIEVAL_LIMIT, MAX_ABSTRACTS, MAX_DAILYMED_PER_DRUG
+from .config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, DEEPINFRA_MODEL, LLM_TEMPERATURE, LLM_TOP_P, BULK_RETRIEVAL_LIMIT, MAX_ABSTRACTS, MAX_DAILYMED_PER_DRUG, FALLBACK_LLM_MODEL, FALLBACK_LLM_ENABLED
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
 from .reranker import PaperFinderWithReranker
@@ -265,7 +265,8 @@ class MedicalRAGPipeline:
         query: str,
         passages: List[Dict[str, Any]],
         dailymed_results: List[Dict[str, Any]] = None,
-        medical_conditions: List[str] = None
+        medical_conditions: List[str] = None,
+        corrected_conditions: List[str] = None
     ):
         """Rerank passages and aggregate to paper level.
         
@@ -274,6 +275,7 @@ class MedicalRAGPipeline:
             passages: Main passages (will be reranked)
             dailymed_results: DailyMed drug labels (bypass reranking, merged directly)
             medical_conditions: LLM-extracted conditions for strict filtering
+            corrected_conditions: Typo-corrected conditions for matching
         """
         import pandas as pd
         
@@ -323,8 +325,8 @@ class MedicalRAGPipeline:
         papers_df = self._deduplicate_dailymed(papers_df)
         
         # Post-retrieval filtering: filter out papers that don't contain key medical entities
-        # Pass LLM-extracted conditions for strict matching
-        papers_df = self._filter_by_entities(query, papers_df, medical_conditions)
+        # Pass both LLM-extracted conditions AND typo-corrected conditions for matching
+        papers_df = self._filter_by_entities(query, papers_df, medical_conditions, corrected_conditions)
         
         # MERGE DailyMed results directly (bypass reranking and thresholds)
         if dailymed_results:
@@ -465,7 +467,7 @@ class MedicalRAGPipeline:
         
         return papers_df
     
-    def _filter_by_entities(self, query: str, papers_df, medical_conditions: List[str] = None) -> Any:
+    def _filter_by_entities(self, query: str, papers_df, medical_conditions: List[str] = None, corrected_conditions: List[str] = None) -> Any:
         """
         Filter papers based on medical entity matching.
         
@@ -473,13 +475,15 @@ class MedicalRAGPipeline:
         - Splits compound conditions into individual terms
         - Normalizes case variations (e.g., IgG4 vs IGG4)
         - Matches if paper contains ANY key term from the condition
+        - Uses BOTH original and typo-corrected conditions for matching
         
         Falls back to regex-based entity extraction if no conditions provided.
         
         Args:
             query: Original query
             papers_df: DataFrame of papers
-            medical_conditions: LLM-extracted conditions for matching
+            medical_conditions: LLM-extracted conditions for matching (original spelling)
+            corrected_conditions: Typo-corrected conditions for matching
             
         Returns:
             Filtered DataFrame
@@ -492,15 +496,21 @@ class MedicalRAGPipeline:
         
         logger.info("🔍 Post-retrieval filtering: Checking entity matches...")
         
-        # Use LLM-extracted conditions if available
-        # Otherwise fall back to regex extraction
+        # Combine original and corrected conditions (corrected takes priority for matching)
+        raw_entities = []
         if medical_conditions:
-            raw_entities = medical_conditions
-            logger.info(f"   Using LLM-extracted conditions (strict): {raw_entities}")
-        elif self.entity_expander:
+            raw_entities.extend(medical_conditions)
+            logger.info(f"   Using LLM-extracted conditions: {medical_conditions}")
+        if corrected_conditions:
+            raw_entities.extend(corrected_conditions)
+            logger.info(f"   Also using typo-corrected conditions: {corrected_conditions}")
+        
+        # Fall back to regex extraction if no LLM conditions
+        if not raw_entities and self.entity_expander:
             raw_entities = self._extract_query_entities(query)
             logger.info(f"   Using regex-extracted entities: {raw_entities}")
-        else:
+        
+        if not raw_entities:
             logger.info("   No entity extraction available, skipping filter")
             return papers_df
         
@@ -838,6 +848,105 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
             yield {"step": "error", "message": str(e)}
     
     # =========================================================================
+    # Fallback Generation (when no sources found)
+    # =========================================================================
+    
+    def _run_fallback_generation(self, query: str, stream: bool = False):
+        """
+        Generate response from LLM internal knowledge when no sources are found.
+        
+        Uses DeepSeek V3.2 (larger model) for better knowledge coverage.
+        Response includes a disclaimer about no citations.
+        
+        Args:
+            query: Original user query
+            stream: Whether to stream the response
+            
+        Returns:
+            If stream=False: tuple of (answer, [])
+            If stream=True: Generator yielding response events
+        """
+        if not FALLBACK_LLM_ENABLED:
+            return ("No relevant evidence found for your query.", [])
+        
+        logger.info("📭 No sources found, using fallback LLM generation with DeepSeek V3.2")
+        
+        # Create fallback client (uses same DeepInfra provider, different model)
+        fallback_client = OpenAI(
+            api_key=DEEPINFRA_API_KEY,
+            base_url=DEEPINFRA_BASE_URL,
+            timeout=300.0
+        )
+        
+        fallback_system_prompt = """You are a medical AI assistant providing information based on your training knowledge.
+
+IMPORTANT: You are responding WITHOUT access to specific literature sources. Your response is based on general medical knowledge.
+
+Guidelines:
+- Provide accurate, evidence-based medical information
+- Use appropriate technical terminology for healthcare professionals  
+- Structure your response clearly with headings where appropriate
+- Be direct and clinically focused
+- Do NOT use citation numbers like [1], [2] etc. since there are no sources
+
+At the END of your response, add this disclaimer:
+---
+*Note: This response is based on the model's training knowledge as no relevant literature sources were found for this specific query. Please verify with current clinical guidelines and authoritative sources.*"""
+
+        user_prompt = f"""Medical Query: {query}
+
+Please provide a comprehensive clinical response based on your medical knowledge."""
+
+        try:
+            if stream:
+                return self._stream_fallback_generation(fallback_client, fallback_system_prompt, user_prompt)
+            
+            response = fallback_client.chat.completions.create(
+                model=FALLBACK_LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": fallback_system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P
+            )
+            
+            answer = response.choices[0].message.content.strip()
+            logger.info(f"   Fallback response generated ({len(answer)} chars)")
+            return answer, []
+            
+        except Exception as e:
+            logger.error(f"Fallback generation failed: {e}")
+            return (f"Unable to generate response: {str(e)}", [])
+    
+    def _stream_fallback_generation(self, client, system_prompt: str, user_prompt: str) -> Generator[Dict[str, Any], None, None]:
+        """Stream fallback generation tokens."""
+        try:
+            response = client.chat.completions.create(
+                model=FALLBACK_LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                stream=True,
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P
+            )
+            
+            full_answer = ""
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    token = chunk.choices[0].delta.content
+                    full_answer += token
+                    yield {"step": "generation", "status": "running", "token": token}
+            
+            yield {"step": "generation", "status": "complete", "answer": full_answer, "used_papers": []}
+            
+        except Exception as e:
+            logger.error(f"Fallback streaming failed: {e}")
+            yield {"step": "error", "message": str(e)}
+    
+    # =========================================================================
     # PDF Availability Check via Europe PMC
     # =========================================================================
     
@@ -1042,30 +1151,40 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
             )
         
         if not passages:
+            # No passages retrieved - use fallback LLM generation
+            logger.info("📭 No passages retrieved, using fallback generation")
+            answer, _ = self._run_fallback_generation(query, stream=False)
             return {
                 "query": query,
-                "report_title": "No Results Found",
-                "answer": "No relevant papers found for your query.",
+                "report_title": "Clinical Response (No Sources)",
+                "answer": answer,
                 "sections": [],
                 "sources": [],
-                "status": "no_results"
+                "status": "fallback"
             }
         
         # Step 3: Rerank & Aggregate
-        # Pass LLM-extracted medical conditions for strict filtering
+        # Pass LLM-extracted medical conditions AND typo-corrected conditions for strict filtering
         medical_conditions = []
-        if processed_query.decomposed and processed_query.decomposed.medical_conditions:
-            medical_conditions = processed_query.decomposed.medical_conditions
-        papers_df, reranked_passages = self.rerank_and_aggregate(query, passages, dailymed_results, medical_conditions)
+        corrected_conditions = []
+        if processed_query.decomposed:
+            if processed_query.decomposed.medical_conditions:
+                medical_conditions = processed_query.decomposed.medical_conditions
+            if processed_query.decomposed.corrected_medical_conditions:
+                corrected_conditions = processed_query.decomposed.corrected_medical_conditions
+        papers_df, reranked_passages = self.rerank_and_aggregate(query, passages, dailymed_results, medical_conditions, corrected_conditions)
         
         if papers_df.empty:
+            # No papers after filtering - use fallback LLM generation
+            logger.info("📭 No papers after filtering, using fallback generation")
+            answer, _ = self._run_fallback_generation(query, stream=False)
             return {
                 "query": query,
-                "report_title": "No Results After Reranking",
-                "answer": "Papers did not meet relevance threshold.",
+                "report_title": "Clinical Response (No Sources)",
+                "answer": answer,
                 "sections": [],
                 "sources": [],
-                "status": "no_results"
+                "status": "fallback"
             }
         
         # Step 4: Direct LLM Synthesis
@@ -1126,16 +1245,37 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
         }
 
         if not passages and not dailymed_results:
-            yield {"step": "complete", "status": "no_results"}
+            # No passages retrieved - use fallback LLM generation with streaming
+            logger.info("📭 No passages retrieved, using fallback streaming generation")
+            yield {"step": "generation", "status": "running", "message": "Generating response from medical knowledge..."}
+            fallback_gen = self._run_fallback_generation(query, stream=True)
+            final_answer = ""
+            for event in fallback_gen:
+                if event["step"] == "generation" and event["status"] == "running":
+                    yield event
+                elif event["step"] == "generation" and event["status"] == "complete":
+                    final_answer = event.get("answer", "")
+            yield {
+                "step": "complete",
+                "status": "fallback",
+                "report_title": "Clinical Response (No Sources)",
+                "answer": final_answer,
+                "sources": [],
+                "abstracts_used": 0
+            }
             return
 
         # Step 3: Reranking
         yield {"step": "reranking", "status": "running", "message": "Ranking papers..."}
-        # Pass LLM-extracted medical conditions for strict filtering
+        # Pass LLM-extracted medical conditions AND typo-corrected conditions for strict filtering
         medical_conditions = []
-        if processed_query.decomposed and processed_query.decomposed.medical_conditions:
-            medical_conditions = processed_query.decomposed.medical_conditions
-        papers_df, _ = self.rerank_and_aggregate(query, passages, dailymed_results, medical_conditions)
+        corrected_conditions = []
+        if processed_query.decomposed:
+            if processed_query.decomposed.medical_conditions:
+                medical_conditions = processed_query.decomposed.medical_conditions
+            if processed_query.decomposed.corrected_medical_conditions:
+                corrected_conditions = processed_query.decomposed.corrected_medical_conditions
+        papers_df, _ = self.rerank_and_aggregate(query, passages, dailymed_results, medical_conditions, corrected_conditions)
         
         # [NEW] Reorder papers so reference ranking matches final citation order from the start
         # This prevents the UI from "jumping" and ensures references are correctly numbered
@@ -1154,7 +1294,24 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
         }
         
         if papers_df.empty:
-            yield {"step": "complete", "status": "no_results"}
+            # No papers after filtering - use fallback LLM generation with streaming
+            logger.info("📭 No papers after filtering, using fallback streaming generation")
+            yield {"step": "generation", "status": "running", "message": "Generating response from medical knowledge..."}
+            fallback_gen = self._run_fallback_generation(query, stream=True)
+            final_answer = ""
+            for event in fallback_gen:
+                if event["step"] == "generation" and event["status"] == "running":
+                    yield event
+                elif event["step"] == "generation" and event["status"] == "complete":
+                    final_answer = event.get("answer", "")
+            yield {
+                "step": "complete",
+                "status": "fallback",
+                "report_title": "Clinical Response (No Sources)",
+                "answer": final_answer,
+                "sources": initial_sources if initial_sources else [],
+                "abstracts_used": 0
+            }
             return
 
         # Prepare context for generation
