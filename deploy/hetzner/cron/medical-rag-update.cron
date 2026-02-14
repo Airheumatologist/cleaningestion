@@ -1,0 +1,5 @@
+# Monthly PubMed + DailyMed incremental update
+# Install with: sudo cp deploy/hetzner/cron/medical-rag-update.cron /etc/cron.d/medical-rag-update
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 2 1 * * root cd /opt/RAG-pipeline && /bin/bash -lc 'source venv/bin/activate && set -a && source .env && set +a && python scripts/08_monthly_update.py' >> /var/log/rag-update.log 2>&1

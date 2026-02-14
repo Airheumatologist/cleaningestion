@@ -20,8 +20,11 @@ from qdrant_client.http.models import Document
 from .config import (
     QDRANT_URL, QDRANT_API_KEY, COLLECTION_NAME, SCORE_THRESHOLD, 
     EMBEDDING_MODEL, QDRANT_CLOUD_INFERENCE, QDRANT_TIMEOUT, 
-    QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY
+    QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY, USE_HYBRID_SEARCH,
+    SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
+    SPARSE_REMOVE_STOPWORDS,
 )
+from .bm25_sparse import BM25SparseEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +36,13 @@ except ImportError:
     LOCAL_EMBEDDINGS_AVAILABLE = False
     logger.warning("sentence-transformers not available, local embeddings disabled")
 
-# SPLADE encoder for sparse vectors
+# SPLADE encoder for sparse vectors (optional legacy mode)
 try:
     from .splade_encoder import get_splade_encoder
     SPLADE_AVAILABLE = True
 except ImportError:
     SPLADE_AVAILABLE = False
-    logger.warning("SPLADE encoder not available, hybrid search disabled")
+    logger.warning("SPLADE encoder not available; bm25 sparse mode will be used if enabled")
 
 
 # =============================================================================
@@ -114,18 +117,29 @@ class QdrantRetriever(AbstractRetriever):
                 logger.warning(f"Failed to load local embedding model: {e}")
 
 
-        # Initialize SPLADE encoder if available and hybrid search is enabled
+        # Initialize sparse query encoder for hybrid search.
         self.splade_encoder = None
-        if SPLADE_AVAILABLE:
-            try:
-                from .config import USE_HYBRID_SEARCH
-                if USE_HYBRID_SEARCH:
+        self.bm25_sparse_encoder = None
+        self.sparse_mode = (SPARSE_RETRIEVAL_MODE or "bm25").lower().strip()
+        if USE_HYBRID_SEARCH:
+            if self.sparse_mode == "splade" and SPLADE_AVAILABLE:
+                try:
                     self.splade_encoder = get_splade_encoder()
                     logger.info("✅ SPLADE encoder initialized for hybrid search")
-                else:
-                    logger.info("ℹ️ Hybrid search disabled in config, SPLADE encoder not loaded")
-            except Exception as e:
-                logger.warning(f"SPLADE encoder not available: {e}")
+                except Exception as e:
+                    logger.warning(f"SPLADE initialization failed, falling back to bm25 sparse: {e}")
+                    self.sparse_mode = "bm25"
+
+            if self.sparse_mode != "splade":
+                self.bm25_sparse_encoder = BM25SparseEncoder(
+                    max_terms_doc=max(SPARSE_MAX_TERMS_QUERY, 64),
+                    max_terms_query=SPARSE_MAX_TERMS_QUERY,
+                    min_token_len=SPARSE_MIN_TOKEN_LEN,
+                    remove_stopwords=SPARSE_REMOVE_STOPWORDS,
+                )
+                logger.info("✅ BM25 sparse encoder initialized for hybrid search")
+        else:
+            logger.info("ℹ️ Hybrid search disabled in config")
         
         # Load drug name → set_id lookup for DailyMed
         self.drug_setid_lookup = {}
@@ -142,7 +156,66 @@ class QdrantRetriever(AbstractRetriever):
         except Exception as e:
             logger.warning(f"Failed to load drug lookup: {e}")
         
-        logger.info(f"Initialized QdrantRetriever: {COLLECTION_NAME} (Cloud Inference: {QDRANT_CLOUD_INFERENCE}, Local Fallback: {self.local_encoder is not None}, SPLADE: {self.splade_encoder is not None})")
+        logger.info(
+            "Initialized QdrantRetriever: %s (Cloud Inference: %s, Local Fallback: %s, Sparse Mode: %s)",
+            COLLECTION_NAME,
+            QDRANT_CLOUD_INFERENCE,
+            self.local_encoder is not None,
+            self.sparse_mode if USE_HYBRID_SEARCH else "disabled",
+        )
+
+    def _rank_key_from_point(self, point) -> str:
+        """
+        Key used for fusion/ranking.
+        Prefer chunk-level identity so chunked corpora are not collapsed to one paper hit.
+        """
+        payload = point.payload or {}
+        return str(
+            payload.get("chunk_id")
+            or payload.get("point_id")
+            or point.id
+            or payload.get("pmcid")
+            or payload.get("doc_id")
+        )
+
+    def _doc_id_from_payload(self, payload: Dict[str, Any]) -> str:
+        """Stable document ID for paper-level aggregation."""
+        return str(payload.get("pmcid") or payload.get("doc_id") or payload.get("pmid") or "")
+
+    def _build_sparse_query_vector(self, query: str) -> Optional[SparseVector]:
+        """Build sparse query vector from configured sparse mode."""
+        if self.splade_encoder is not None:
+            try:
+                sparse_dicts = self.splade_encoder.encode([query])
+                if sparse_dicts and sparse_dicts[0]:
+                    sparse_dict = sparse_dicts[0]
+                    return SparseVector(
+                        indices=list(sparse_dict.keys()),
+                        values=list(sparse_dict.values()),
+                    )
+            except Exception as exc:
+                logger.warning("SPLADE sparse encoding failed: %s", exc)
+
+        if self.bm25_sparse_encoder is not None:
+            return self.bm25_sparse_encoder.encode_query(query)
+        return None
+
+    def build_sparse_query_vectors(self, queries: List[str]) -> List[SparseVector]:
+        """Batch-build sparse vectors for queries."""
+        if self.splade_encoder is not None:
+            try:
+                sparse_dicts = self.splade_encoder.encode_batch_cached(queries)
+                return [
+                    SparseVector(indices=list(s.keys()), values=list(s.values())) if s else SparseVector(indices=[], values=[])
+                    for s in sparse_dicts
+                ]
+            except Exception as exc:
+                logger.warning("Batch SPLADE sparse encoding failed: %s", exc)
+
+        if self.bm25_sparse_encoder is not None:
+            return self.bm25_sparse_encoder.encode_queries(queries)
+
+        return [SparseVector(indices=[], values=[]) for _ in queries]
     
     def _build_filter(self, **kwargs) -> Optional[Filter]:
         """
@@ -237,8 +310,8 @@ class QdrantRetriever(AbstractRetriever):
         # Build filter
         search_filter = self._build_filter(**filter_kwargs)
 
-        # Try hybrid search if SPLADE is available
-        if use_hybrid and self.splade_encoder:
+        # Try hybrid search if sparse query encoder is available
+        if use_hybrid and (self.splade_encoder is not None or self.bm25_sparse_encoder is not None):
             return self._hybrid_search(
                 query=query,
                 search_filter=search_filter,
@@ -329,17 +402,22 @@ class QdrantRetriever(AbstractRetriever):
                 # DailyMed schema mapping
                 passage = self._transform_dailymed_payload(point.payload, point.score)
             else:
-                # Standard PMC schema - abstracts only (no full text)
+                doc_id = self._doc_id_from_payload(point.payload)
+                # Standard PMC schema - abstracts or chunks
                 passage = {
-                    "corpus_id": point.payload.get("pmcid", ""),
-                    "pmcid": point.payload.get("pmcid", ""),
+                    "corpus_id": doc_id,
+                    "pmcid": point.payload.get("pmcid", doc_id),
                     "pmid": point.payload.get("pmid"),
                     "title": point.payload.get("title", ""),
-                    "text": point.payload.get("abstract", ""),
+                    # Use page_content (chunk) if available, else abstract
+                    "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
                     "full_text": point.payload.get("full_text", ""),
                     "has_full_text": point.payload.get("has_full_text", False),
-                    "section_title": "abstract",
+                    "section_title": point.payload.get("section_title", "abstract"),
+                    "section_type": point.payload.get("section_type", "body"),
+                    "chunk_id": point.payload.get("chunk_id"),
+                    "chunk_index": point.payload.get("chunk_index"),
                     "journal": point.payload.get("journal", ""),
                     "venue": point.payload.get("journal", ""),
                     "year": point.payload.get("year"),
@@ -376,21 +454,14 @@ class QdrantRetriever(AbstractRetriever):
         Returns:
             List of passages with combined scores
         """
-        # Use pre-computed sparse vector if provided, otherwise generate
-        if precomputed_sparse_vector is not None:
-            sparse_vector = precomputed_sparse_vector
-        else:
-            # Generate SPLADE sparse vector for query (fallback for single queries)
-            sparse_vecs = self.splade_encoder.encode([query])
-            if not sparse_vecs or not sparse_vecs[0]:
-                logger.warning("SPLADE encoding failed, falling back to dense-only")
-                return self.retrieve_passages(query, use_hybrid=False, **{})
-            
-            sparse_dict = sparse_vecs[0]
-            sparse_vector = SparseVector(
-                indices=list(sparse_dict.keys()),
-                values=list(sparse_dict.values())
-            )
+        # Use pre-computed sparse vector if provided, otherwise generate.
+        sparse_vector = precomputed_sparse_vector or self._build_sparse_query_vector(query)
+        if sparse_vector is None:
+            logger.warning("Sparse encoding unavailable, falling back to dense-only")
+            return self.retrieve_passages(query, use_hybrid=False, **{})
+        if not sparse_vector.indices:
+            logger.info("Sparse vector empty, falling back to dense-only")
+            return self.retrieve_passages(query, use_hybrid=False, **{})
         
         # Perform dense search
         dense_results = None
@@ -450,30 +521,30 @@ class QdrantRetriever(AbstractRetriever):
             logger.warning("Both searches failed, returning empty results")
             return []
         
-        # Build score maps
+        # Build score maps keyed by chunk/point identity
         dense_scores = {}
         sparse_scores = {}
         
         if dense_results:
             for rank, point in enumerate(dense_results.points, 1):
-                pmcid = point.payload.get("pmcid") or point.id
+                key = self._rank_key_from_point(point)
                 # RRF: 1 / (k + rank), where k=60 is typical
                 rrf_score = 1.0 / (60.0 + rank)
-                dense_scores[pmcid] = rrf_score * dense_weight
+                dense_scores[key] = rrf_score * dense_weight
         
         if sparse_results:
             for rank, point in enumerate(sparse_results.points, 1):
-                pmcid = point.payload.get("pmcid") or point.id
+                key = self._rank_key_from_point(point)
                 rrf_score = 1.0 / (60.0 + rank)
-                sparse_scores[pmcid] = rrf_score * sparse_weight
+                sparse_scores[key] = rrf_score * sparse_weight
         
         # Combine scores
         combined_scores = {}
-        all_pmcids = set(dense_scores.keys()) | set(sparse_scores.keys())
-        
-        for pmcid in all_pmcids:
-            combined_scores[pmcid] = (
-                dense_scores.get(pmcid, 0) + sparse_scores.get(pmcid, 0)
+        all_keys = set(dense_scores.keys()) | set(sparse_scores.keys())
+
+        for key in all_keys:
+            combined_scores[key] = (
+                dense_scores.get(key, 0) + sparse_scores.get(key, 0)
             )
         
         # Normalize combined scores to full 0-1 range for clearer separation
@@ -482,34 +553,34 @@ class QdrantRetriever(AbstractRetriever):
             max_score = max(combined_scores.values())
             min_score = min(combined_scores.values())
             score_range = max_score - min_score if max_score > min_score else 1.0
-            for pmcid in combined_scores:
+            for key in combined_scores:
                 # Normalize to full 0.0-1.0 range
-                normalized = (combined_scores[pmcid] - min_score) / score_range
-                combined_scores[pmcid] = normalized
-        
+                normalized = (combined_scores[key] - min_score) / score_range
+                combined_scores[key] = normalized
+
         # Get all points from both results
         all_points = {}
         if dense_results:
             for point in dense_results.points:
-                pmcid = point.payload.get("pmcid") or point.id
-                all_points[pmcid] = point
+                key = self._rank_key_from_point(point)
+                all_points[key] = point
         if sparse_results:
             for point in sparse_results.points:
-                pmcid = point.payload.get("pmcid") or point.id
-                if pmcid not in all_points:
-                    all_points[pmcid] = point
-        
+                key = self._rank_key_from_point(point)
+                if key not in all_points:
+                    all_points[key] = point
+
         # Sort by combined score
-        sorted_pmcids = sorted(
-            all_pmcids,
+        sorted_keys = sorted(
+            all_keys,
             key=lambda p: combined_scores[p],
             reverse=True
         )[:self.n_retrieval]
         
         # Format results
         passages = []
-        for pmcid in sorted_pmcids:
-            point = all_points[pmcid]
+        for key in sorted_keys:
+            point = all_points[key]
             
             # Detect DailyMed articles
             source = point.payload.get("source", "")
@@ -517,30 +588,33 @@ class QdrantRetriever(AbstractRetriever):
             is_dailymed = source == "dailymed" or article_type == "drug_label"
             
             if is_dailymed:
-                passage = self._transform_dailymed_payload(point.payload, combined_scores[pmcid])
-                passage["dense_score"] = dense_scores.get(pmcid, 0)
-                passage["sparse_score"] = sparse_scores.get(pmcid, 0)
+                passage = self._transform_dailymed_payload(point.payload, combined_scores[key])
+                passage["dense_score"] = dense_scores.get(key, 0)
+                passage["sparse_score"] = sparse_scores.get(key, 0)
                 passage["stype"] = "hybrid_search"
             else:
-                # Standard PMC schema - abstracts only (no full text)
+                doc_id = self._doc_id_from_payload(point.payload)
                 passage = {
-                    "corpus_id": point.payload.get("pmcid", ""),
-                    "pmcid": point.payload.get("pmcid", ""),
+                    "corpus_id": doc_id,
+                    "pmcid": point.payload.get("pmcid", doc_id),
                     "pmid": point.payload.get("pmid"),
                     "title": point.payload.get("title", ""),
-                    "text": point.payload.get("abstract", ""),
+                    "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
                     "full_text": point.payload.get("full_text", ""),
                     "has_full_text": point.payload.get("has_full_text", False),
-                    "section_title": "abstract",
+                    "section_title": point.payload.get("section_title", "abstract"),
+                    "section_type": point.payload.get("section_type", "body"),
+                    "chunk_id": point.payload.get("chunk_id"),
+                    "chunk_index": point.payload.get("chunk_index"),
                     "journal": point.payload.get("journal", ""),
                     "venue": point.payload.get("journal", ""),
                     "year": point.payload.get("year"),
                     "authors": self._parse_authors(point.payload.get("authors")),
                     "article_type": point.payload.get("article_type", ""),
-                    "score": combined_scores[pmcid],
-                    "dense_score": dense_scores.get(pmcid, 0),
-                    "sparse_score": sparse_scores.get(pmcid, 0),
+                    "score": combined_scores[key],
+                    "dense_score": dense_scores.get(key, 0),
+                    "sparse_score": sparse_scores.get(key, 0),
                     "stype": "hybrid_search"
                 }
             
@@ -552,7 +626,7 @@ class QdrantRetriever(AbstractRetriever):
     def batch_hybrid_search(
         self,
         queries: List[str],
-        sparse_vectors: List[SparseVector],
+        sparse_vectors: Optional[List[SparseVector]] = None,
         dense_weight: float = 0.7,
         sparse_weight: float = 0.3,
         **filter_kwargs
@@ -573,14 +647,20 @@ class QdrantRetriever(AbstractRetriever):
         Returns:
             Combined list of unique passages from all queries with RRF fusion scores
         """
-        if not queries or not sparse_vectors:
+        if not queries:
             return []
-        
-        if len(queries) != len(sparse_vectors):
-            logger.warning(f"Query count ({len(queries)}) != sparse vector count ({len(sparse_vectors)})")
-            return []
-        
-        logger.info(f"⚡ Batch hybrid search: {len(queries)} queries × 2 (dense+sparse) = {len(queries) * 2} searches in 1 HTTP call")
+
+        if sparse_vectors is None or len(sparse_vectors) != len(queries):
+            sparse_vectors = self.build_sparse_query_vectors(queries)
+
+        use_sparse = any(vec.indices for vec in sparse_vectors)
+        per_query_requests = 2 if use_sparse else 1
+        logger.info(
+            "⚡ Batch search: %s queries × %s request(s) = %s in one HTTP call",
+            len(queries),
+            per_query_requests,
+            len(queries) * per_query_requests,
+        )
         
         # Build filter
         search_filter = self._build_filter(**filter_kwargs)
@@ -596,10 +676,18 @@ class QdrantRetriever(AbstractRetriever):
             )
         )
         
-        for i, (query_text, sparse_vec) in enumerate(zip(queries, sparse_vectors)):
-            # Dense query using Cloud Inference (text → embedding)
+        for i, query_text in enumerate(queries):
+            # Dense query using cloud inference text model or local embedding fallback.
+            if QDRANT_CLOUD_INFERENCE:
+                dense_query = Document(text=query_text, model=self.embedding_model)
+            else:
+                if self.local_encoder is None:
+                    logger.warning("Skipping query without dense encoder available: %s", query_text[:80])
+                    continue
+                dense_query = self.local_encoder.encode(query_text, normalize_embeddings=True).tolist()
+
             dense_request = QueryRequest(
-                query=Document(text=query_text, model=self.embedding_model),
+                query=dense_query,
                 filter=search_filter,
                 limit=self.n_retrieval * 2,  # Get more for fusion
                 with_payload=True,
@@ -607,15 +695,19 @@ class QdrantRetriever(AbstractRetriever):
             )
             batch_requests.append(dense_request)
             
-            # Sparse query using pre-computed SPLADE vector
-            sparse_request = QueryRequest(
-                query=sparse_vec,
-                using="sparse",
-                filter=search_filter,
-                limit=self.n_retrieval * 2,
-                with_payload=True
-            )
-            batch_requests.append(sparse_request)
+            if use_sparse:
+                # Sparse query using pre-computed sparse vector (SPLADE or BM25).
+                sparse_request = QueryRequest(
+                    query=sparse_vectors[i],
+                    using="sparse",
+                    filter=search_filter,
+                    limit=self.n_retrieval * 2,
+                    with_payload=True
+                )
+                batch_requests.append(sparse_request)
+
+        if not batch_requests:
+            return []
         
         # Execute single batch HTTP call
         try:
@@ -629,86 +721,95 @@ class QdrantRetriever(AbstractRetriever):
             # Fallback to sequential queries
             logger.info("⚠️ Falling back to sequential hybrid search")
             all_passages = []
-            for query, sparse_vec in zip(queries, sparse_vectors):
-                passages = self._hybrid_search(
-                    query=query,
-                    search_filter=search_filter,
-                    dense_weight=dense_weight,
-                    sparse_weight=sparse_weight,
-                    precomputed_sparse_vector=sparse_vec
-                )
+            for idx, query in enumerate(queries):
+                if use_sparse:
+                    passages = self._hybrid_search(
+                        query=query,
+                        search_filter=search_filter,
+                        dense_weight=dense_weight,
+                        sparse_weight=sparse_weight,
+                        precomputed_sparse_vector=sparse_vectors[idx],
+                    )
+                else:
+                    passages = self.retrieve_passages(query, use_hybrid=False, **filter_kwargs)
                 all_passages.extend(passages)
             return all_passages
         
         # Process results: pair up dense/sparse for each query and apply RRF
         all_passages = []
-        all_points = {}  # pmcid -> point (for payload access)
-        combined_scores = {}  # pmcid -> RRF score
+        all_points = {}  # rank_key -> point (for payload access)
+        combined_scores = {}  # rank_key -> RRF score
         
         for i in range(len(queries)):
-            dense_idx = i * 2
-            sparse_idx = i * 2 + 1
+            dense_idx = i * per_query_requests
+            sparse_idx = dense_idx + 1
             
             dense_results = batch_results[dense_idx].points if dense_idx < len(batch_results) else []
-            sparse_results = batch_results[sparse_idx].points if sparse_idx < len(batch_results) else []
+            sparse_results = []
+            if use_sparse and sparse_idx < len(batch_results):
+                sparse_results = batch_results[sparse_idx].points
             
             # Build RRF scores for this query pair
             for rank, point in enumerate(dense_results, 1):
-                pmcid = point.payload.get("pmcid") or str(point.id)
+                key = self._rank_key_from_point(point)
                 rrf_score = (1.0 / (60.0 + rank)) * dense_weight
-                combined_scores[pmcid] = combined_scores.get(pmcid, 0) + rrf_score
-                if pmcid not in all_points:
-                    all_points[pmcid] = point
-            
+                combined_scores[key] = combined_scores.get(key, 0) + rrf_score
+                if key not in all_points:
+                    all_points[key] = point
+
             for rank, point in enumerate(sparse_results, 1):
-                pmcid = point.payload.get("pmcid") or str(point.id)
+                key = self._rank_key_from_point(point)
                 rrf_score = (1.0 / (60.0 + rank)) * sparse_weight
-                combined_scores[pmcid] = combined_scores.get(pmcid, 0) + rrf_score
-                if pmcid not in all_points:
-                    all_points[pmcid] = point
+                combined_scores[key] = combined_scores.get(key, 0) + rrf_score
+                if key not in all_points:
+                    all_points[key] = point
         
         # Normalize combined scores to 0-1 range
         if combined_scores:
             max_score = max(combined_scores.values())
             min_score = min(combined_scores.values())
             score_range = max_score - min_score if max_score > min_score else 1.0
-            for pmcid in combined_scores:
-                combined_scores[pmcid] = (combined_scores[pmcid] - min_score) / score_range
-        
+            for key in combined_scores:
+                combined_scores[key] = (combined_scores[key] - min_score) / score_range
+
         # Sort by score and limit total results
-        sorted_pmcids = sorted(
+        sorted_keys = sorted(
             combined_scores.keys(),
             key=lambda p: combined_scores[p],
             reverse=True
         )[:self.n_retrieval]
-        
+
         # Format passages
-        for pmcid in sorted_pmcids:
-            point = all_points[pmcid]
+        for key in sorted_keys:
+            point = all_points[key]
             source = point.payload.get("source", "")
             article_type = point.payload.get("article_type", "")
             is_dailymed = source == "dailymed" or article_type == "drug_label"
-            
+
             if is_dailymed:
-                passage = self._transform_dailymed_payload(point.payload, combined_scores[pmcid])
+                passage = self._transform_dailymed_payload(point.payload, combined_scores[key])
                 passage["stype"] = "batch_hybrid_search"
             else:
+                doc_id = self._doc_id_from_payload(point.payload)
                 passage = {
-                    "corpus_id": point.payload.get("pmcid", ""),
-                    "pmcid": point.payload.get("pmcid", ""),
+                    "corpus_id": doc_id,
+                    "pmcid": point.payload.get("pmcid", doc_id),
                     "pmid": point.payload.get("pmid"),
                     "title": point.payload.get("title", ""),
-                    "text": point.payload.get("abstract", ""),
+                    "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
                     "full_text": point.payload.get("full_text", ""),
                     "has_full_text": point.payload.get("has_full_text", False),
-                    "section_title": "abstract",
+                    "section_title": point.payload.get("section_title", "abstract"),
+                    "section_type": point.payload.get("section_type", "body"),
+                    "chunk_id": point.payload.get("chunk_id"),
+                    "chunk_index": point.payload.get("chunk_index"),
                     "journal": point.payload.get("journal", ""),
                     "venue": point.payload.get("journal", ""),
                     "year": point.payload.get("year"),
                     "authors": self._parse_authors(point.payload.get("authors")),
                     "article_type": point.payload.get("article_type", ""),
-                    "score": combined_scores[pmcid],
+                    "score": combined_scores[key],
                     "stype": "batch_hybrid_search"
                 }
             all_passages.append(passage)
@@ -776,17 +877,20 @@ class QdrantRetriever(AbstractRetriever):
                     paper = self._transform_dailymed_payload(point.payload, point.score)
                     paper["stype"] = "keyword_search"
                 else:
-                    # Standard PMC schema - abstracts only (no full text)
+                    doc_id = self._doc_id_from_payload(point.payload)
                     paper = {
-                        "corpus_id": point.payload.get("pmcid", ""),
-                        "pmcid": point.payload.get("pmcid", ""),
+                        "corpus_id": doc_id,
+                        "pmcid": point.payload.get("pmcid", doc_id),
                         "pmid": point.payload.get("pmid"),
                         "title": point.payload.get("title", ""),
-                        "text": point.payload.get("abstract", ""),
+                        "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                         "abstract": point.payload.get("abstract", ""),
                         "full_text": point.payload.get("full_text", ""),
                         "has_full_text": point.payload.get("has_full_text", False),
-                        "section_title": "abstract",
+                        "section_title": point.payload.get("section_title", "abstract"),
+                        "section_type": point.payload.get("section_type", "body"),
+                        "chunk_id": point.payload.get("chunk_id"),
+                        "chunk_index": point.payload.get("chunk_index"),
                         "journal": point.payload.get("journal", ""),
                         "venue": point.payload.get("journal", ""),
                         "year": point.payload.get("year"),

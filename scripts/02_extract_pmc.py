@@ -20,6 +20,7 @@ import sys
 import json
 import logging
 import argparse
+import gzip
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -221,11 +222,16 @@ def extract_affiliations(root: ET.Element) -> tuple:
 def parse_xml_file(xml_path: Path) -> Optional[Dict[str, Any]]:
     """Parse a single PMC XML file and extract all data."""
     try:
-        tree = ET.parse(xml_path)
-        root = tree.getroot()
+        if xml_path.name.endswith(".xml.gz"):
+            with gzip.open(xml_path, "rb") as f:
+                root = ET.fromstring(f.read())
+            pmcid = xml_path.stem.replace(".xml", "")
+        else:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            pmcid = xml_path.stem
         
         # Get PMCID from filename
-        pmcid = xml_path.stem
         
         # Extract year and filter
         year = None
@@ -255,11 +261,13 @@ def parse_xml_file(xml_path: Path) -> Optional[Dict[str, Any]]:
                     abstract_parts.append(text)
         abstract = ' '.join(abstract_parts)
         
-        # Extract full text from body (ONLY available in OA articles)
+        # Extract full text and structured sections
         full_text = ""
+        structured_sections = []
+        
         body = root.find('.//body')
         if body is not None:
-            sections = []
+            # Process sections
             for sec in body.findall('.//sec'):
                 sec_title = extract_text(sec.find('title'))
                 sec_parts = []
@@ -267,20 +275,52 @@ def parse_xml_file(xml_path: Path) -> Optional[Dict[str, Any]]:
                     text = extract_text(p)
                     if text and len(text) > 20:
                         sec_parts.append(text)
+                
                 if sec_parts:
                     sec_text = '\n'.join(sec_parts)
+                    
+                    # Infer section type
+                    sec_type = "body"
+                    lower_title = sec_title.lower()
+                    if any(x in lower_title for x in ['intro', 'background']):
+                        sec_type = "introduction"
+                    elif any(x in lower_title for x in ['method', 'design']):
+                        sec_type = "methods"
+                    elif any(x in lower_title for x in ['result', 'finding']):
+                        sec_type = "results"
+                    elif any(x in lower_title for x in ['discuss', 'conclu']):
+                        sec_type = "discussion"
+                    
+                    structured_sections.append({
+                        "title": sec_title,
+                        "text": sec_text,
+                        "type": sec_type
+                    })
+
                     if sec_title:
-                        sections.append(f"\n## {sec_title}\n{sec_text}")
+                        full_text += f"\n## {sec_title}\n{sec_text}"
                     else:
-                        sections.append(sec_text)
-            
-            # Also get direct paragraphs
+                        full_text += f"\n{sec_text}"
+
+            # Also get direct paragraphs (unsectioned)
+            direct_paras = []
             for p in body.findall('p'):
+                # Check if this p is inside a sec (already handled)
+                # ElementTree findall('p') finds direct children? No, './/p' finds all descendants.
+                # body.findall('p') finds direct children.
                 text = extract_text(p)
                 if text and len(text) > 20:
-                    sections.append(text)
+                    direct_paras.append(text)
             
-            full_text = '\n'.join(sections)
+            if direct_paras:
+                para_text = "\n".join(direct_paras)
+                structured_sections.append({
+                    "title": "",
+                    "text": para_text,
+                    "type": "body"
+                })
+                full_text += f"\n{para_text}"
+
             if len(full_text) > MAX_FULL_TEXT_CHARS:
                 full_text = full_text[:MAX_FULL_TEXT_CHARS]
         
@@ -387,6 +427,7 @@ def parse_xml_file(xml_path: Path) -> Optional[Dict[str, Any]]:
             "title": title,
             "abstract": abstract[:MAX_ABSTRACT_CHARS] if abstract else "",
             "full_text": full_text,
+            "sections": structured_sections,
             "tables": tables,
             
             # Publication info
@@ -442,6 +483,11 @@ def main():
     parser = argparse.ArgumentParser(description="Extract PMC articles from XML to JSONL")
     parser.add_argument("--xml-dir", type=Path, required=True, help="Directory with XML files")
     parser.add_argument("--output", type=Path, required=True, help="Output JSONL file")
+    parser.add_argument(
+        "--delete-source",
+        action="store_true",
+        help="Delete each source file after successful extraction (streaming mode)",
+    )
     
     args = parser.parse_args()
     
@@ -456,10 +502,12 @@ def main():
     # Find XML files
     logger.info(f"Scanning {args.xml_dir} for XML files...")
     xml_files = list(args.xml_dir.glob("*.xml"))
+    xml_files.extend(args.xml_dir.glob("*.xml.gz"))
     
     # Also check subdirectories
     if not xml_files:
         xml_files = list(args.xml_dir.rglob("*.xml"))
+        xml_files.extend(args.xml_dir.rglob("*.xml.gz"))
     
     total = len(xml_files)
     logger.info(f"Found {total:,} XML files")
@@ -481,6 +529,11 @@ def main():
                 if article:
                     f.write(json.dumps(article) + '\n')
                     extracted += 1
+                    if args.delete_source:
+                        try:
+                            xml_file.unlink(missing_ok=True)
+                        except Exception as e:
+                            logger.debug(f"Failed to delete {xml_file}: {e}")
                 else:
                     errors += 1
             except Exception as e:
@@ -497,4 +550,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

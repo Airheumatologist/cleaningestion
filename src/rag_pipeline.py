@@ -16,7 +16,23 @@ from typing import List, Dict, Any, Generator
 from dataclasses import asdict
 from openai import OpenAI
 
-from .config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, DEEPINFRA_MODEL, LLM_TEMPERATURE, LLM_TOP_P, BULK_RETRIEVAL_LIMIT, MAX_ABSTRACTS, MAX_DAILYMED_PER_DRUG, FALLBACK_LLM_MODEL, FALLBACK_LLM_ENABLED
+from .config import (
+    DEEPINFRA_API_KEY,
+    DEEPINFRA_BASE_URL,
+    DEEPINFRA_MODEL,
+    LLM_TEMPERATURE,
+    LLM_TOP_P,
+    BULK_RETRIEVAL_LIMIT,
+    MAX_ABSTRACTS,
+    MAX_DAILYMED_PER_DRUG,
+    FALLBACK_LLM_MODEL,
+    FALLBACK_LLM_ENABLED,
+    RETRIEVAL_CHUNK_LIMIT,
+    MAX_CHUNKS_PER_ARTICLE_PRE_RERANK,
+    RERANK_INPUT_CHUNK_LIMIT,
+    RERANK_TOP_CHUNKS,
+    FINAL_TOP_ARTICLES,
+)
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
 from .reranker import PaperFinderWithReranker
@@ -41,8 +57,8 @@ class MedicalRAGPipeline:
     def __init__(
         self,
         model: str = DEEPINFRA_MODEL,
-        n_retrieval: int = 150,
-        n_rerank: int = -1,  # -1 = no limit
+        n_retrieval: int = RETRIEVAL_CHUNK_LIMIT,
+        n_rerank: int = RERANK_TOP_CHUNKS,
         context_threshold: float = 0.3  # Post-aggregation threshold on boosted_score
         # Note: This is the FINAL threshold after Cohere reranking + entity matching + evidence boosts
         # With evidence tier multipliers (1.0-1.8x), 0.3 ensures good recall while filtering noise
@@ -56,6 +72,9 @@ class MedicalRAGPipeline:
             raise ValueError("DEEPINFRA_API_KEY not set")
 
         self.model = model
+        self.max_chunks_per_article_pre_rerank = MAX_CHUNKS_PER_ARTICLE_PRE_RERANK
+        self.rerank_input_chunk_limit = RERANK_INPUT_CHUNK_LIMIT
+        self.final_top_articles = FINAL_TOP_ARTICLES
         self.openai_client = OpenAI(
             api_key=DEEPINFRA_API_KEY,
             base_url=DEEPINFRA_BASE_URL,
@@ -139,30 +158,14 @@ class MedicalRAGPipeline:
         logger.info(f"   PMC Queries: {len(queries_to_run)} | DailyMed Drugs: {len(drug_names)}")
         
         # ========================================================================
-        # OPTIMIZATION 1: Batch encode ALL query variations with SPLADE in ONE call
+        # OPTIMIZATION 1: Batch encode ALL query variations with configured sparse mode
         # ========================================================================
         sparse_vectors = []
-        if hasattr(self.retriever, 'splade_encoder') and self.retriever.splade_encoder:
-            try:
-                logger.info(f"   ⚡ Batch encoding {len(queries_to_run)} queries with SPLADE...")
-                sparse_dicts = self.retriever.splade_encoder.encode_batch_cached(queries_to_run)
-                
-                # Convert to SparseVector format
-                for sparse_dict in sparse_dicts:
-                    if sparse_dict:
-                        sparse_vectors.append(SparseVector(
-                            indices=list(sparse_dict.keys()),
-                            values=list(sparse_dict.values())
-                        ))
-                    else:
-                        sparse_vectors.append(SparseVector(indices=[], values=[]))
-                logger.info(f"   ⚡ Batch encoding complete ({len(sparse_vectors)} vectors)")
-            except Exception as e:
-                logger.warning(f"   Batch SPLADE encoding failed: {e}")
-                # Create empty sparse vectors as fallback
-                sparse_vectors = [SparseVector(indices=[], values=[]) for _ in queries_to_run]
-        else:
-            # No SPLADE available, create empty sparse vectors
+        try:
+            sparse_vectors = self.retriever.build_sparse_query_vectors(queries_to_run)
+            logger.info(f"   ⚡ Built {len(sparse_vectors)} sparse query vectors")
+        except Exception as e:
+            logger.warning(f"   Sparse query vector build failed: {e}")
             sparse_vectors = [SparseVector(indices=[], values=[]) for _ in queries_to_run]
         
         # ========================================================================
@@ -259,6 +262,45 @@ class MedicalRAGPipeline:
     # =========================================================================
     # Step 3: Reranking & Aggregation
     # =========================================================================
+
+    def _select_chunks_for_rerank(self, passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Preserve chunk-level recall while controlling rerank cost:
+        - sort by retrieval score
+        - keep at most N chunks per article
+        - cap total rerank input chunks
+        """
+        if not passages:
+            return []
+
+        sorted_passages = sorted(passages, key=lambda p: p.get("score", 0), reverse=True)
+        per_article_counts: Dict[str, int] = {}
+        selected: List[Dict[str, Any]] = []
+
+        for p in sorted_passages:
+            article_id = (
+                p.get("pmcid")
+                or p.get("corpus_id")
+                or p.get("doc_id")
+                or p.get("pmid")
+                or "unknown"
+            )
+            if per_article_counts.get(article_id, 0) >= self.max_chunks_per_article_pre_rerank:
+                continue
+
+            per_article_counts[article_id] = per_article_counts.get(article_id, 0) + 1
+            selected.append(p)
+
+            if len(selected) >= self.rerank_input_chunk_limit:
+                break
+
+        logger.info(
+            "   Chunk preselection: %s passages → %s rerank candidates (%s chunks/article max)",
+            len(passages),
+            len(selected),
+            self.max_chunks_per_article_pre_rerank,
+        )
+        return selected
     
     def rerank_and_aggregate(
         self,
@@ -284,8 +326,7 @@ class MedicalRAGPipeline:
         if self.paper_finder is None:
             # Skip reranking and create basic aggregation
             logger.info("   Skipping reranking (Cohere not available)")
-            # Convert passages to the expected format for aggregation
-            reranked = passages[:self.retriever.n_retrieval]  # Limit to n_retrieval
+            reranked = self._select_chunks_for_rerank(passages)
 
             # Create a basic DataFrame-like structure (abstracts only - no full text)
             papers_df = pd.DataFrame([{
@@ -302,19 +343,9 @@ class MedicalRAGPipeline:
                 'corpus_id': p.get('corpus_id', '')
             } for p in reranked])
         else:
-            # Optimization: Deduplicate passages at paper level BEFORE reranking
-            # This significantly reduces reranker latency and cost
-            logger.info(f"   Deduplicating {len(passages)} passages before reranking...")
-            unique_passages = []
-            seen_paper_ids = set()
-            for p in passages:
-                pid = p.get("pmcid") or p.get("corpus_id")
-                if pid and pid not in seen_paper_ids:
-                    seen_paper_ids.add(pid)
-                    unique_passages.append(p)
-            
-            logger.info(f"   Reranking {len(unique_passages)} unique candidate papers")
-            reranked = self.paper_finder.rerank(query, unique_passages)
+            rerank_candidates = self._select_chunks_for_rerank(passages)
+            logger.info(f"   Reranking {len(rerank_candidates)} chunk candidates")
+            reranked = self.paper_finder.rerank(query, rerank_candidates)
 
             # Aggregate to paper level and format as DataFrame
             papers_df = self.paper_finder.aggregate_into_dataframe(reranked)
@@ -368,7 +399,26 @@ class MedicalRAGPipeline:
                 dailymed_df = pd.DataFrame(dailymed_rows)
                 papers_df = pd.concat([dailymed_df, papers_df], ignore_index=True)
                 logger.info(f"   Total papers after DailyMed merge: {len(papers_df)}")
-        
+
+        # Keep only top-N final articles after all merges and filtering
+        if not papers_df.empty:
+            if "relevance_judgement" in papers_df.columns and "relevance_score" in papers_df.columns:
+                papers_df["_sort_score"] = papers_df["relevance_judgement"].fillna(papers_df["relevance_score"]).fillna(0.0)
+            elif "relevance_judgement" in papers_df.columns:
+                papers_df["_sort_score"] = papers_df["relevance_judgement"].fillna(0.0)
+            elif "relevance_score" in papers_df.columns:
+                papers_df["_sort_score"] = papers_df["relevance_score"].fillna(0.0)
+            else:
+                papers_df["_sort_score"] = 0.0
+
+            papers_df = (
+                papers_df.sort_values(by="_sort_score", ascending=False)
+                .head(self.final_top_articles)
+                .drop(columns=["_sort_score"], errors="ignore")
+                .reset_index(drop=True)
+            )
+            logger.info(f"   Final article cap applied: {len(papers_df)} (top {self.final_top_articles})")
+
         return papers_df, reranked
 
     

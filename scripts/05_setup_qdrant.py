@@ -1,241 +1,138 @@
 #!/usr/bin/env python3
-"""
-Setup Qdrant Collection for Medical RAG Pipeline.
+"""Create the self-hosted Qdrant collection for the medical RAG pipeline."""
 
-Creates a Qdrant collection with:
-- Dense vectors: mixedbread-ai/mxbai-embed-large-v1 (1024-d)
-- Sparse vectors: SPLADE support (optional)
-- Binary quantization: Enabled for memory efficiency
-- Cloud Inference: Enabled for automatic embedding
-- Sharding: 4 shards for parallel ingestion
-- Payload indexes: year, source, article_type, journal, country, evidence_grade
+from __future__ import annotations
 
-Usage:
-    python 05_setup_qdrant.py [--collection-name pmc_medical_rag_fulltext]
-
-Requirements:
-    - QDRANT_URL and QDRANT_API_KEY environment variables
-    - Cloud Inference enabled in Qdrant Cloud dashboard
-"""
-
-import os
-import sys
-import logging
 import argparse
-from dotenv import load_dotenv
+import logging
+import sys
 
-try:
-    from qdrant_client import QdrantClient
-    from qdrant_client import models
-except ImportError:
-    print("Installing qdrant-client...")
-    os.system("pip3 install qdrant-client python-dotenv --quiet")
-    from qdrant_client import QdrantClient
-    from qdrant_client import models
+import requests
+from qdrant_client import QdrantClient, models
 
-# Load environment variables
-load_dotenv()
+from config_ingestion import IngestionConfig
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Configuration
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-DEFAULT_COLLECTION_NAME = os.getenv("COLLECTION_NAME", "pmc_medical_rag_fulltext")
 
-# Vector configuration
-VECTOR_SIZE = 1024  # mxbai-embed-large-v1
-SHARD_NUMBER = 4    # For parallel ingestion
-
-
-def setup_collection(
-    collection_name: str = DEFAULT_COLLECTION_NAME,
-    vector_size: int = VECTOR_SIZE,
-    replace_existing: bool = True,
-    shard_number: int = SHARD_NUMBER,
-    enable_sparse: bool = True
-):
-    """
-    Create and configure Qdrant collection.
-    
-    Args:
-        collection_name: Name of the collection
-        vector_size: Dimension of dense vectors
-        replace_existing: Delete existing collection if present
-        shard_number: Number of shards for parallel processing
-        enable_sparse: Enable sparse vector support
-    """
-    
-    logger.info("=" * 70)
-    logger.info("🔧 Qdrant Collection Setup")
-    logger.info("=" * 70)
-    
-    # Validate configuration
-    if not QDRANT_URL:
-        logger.error("❌ QDRANT_URL environment variable not set!")
-        sys.exit(1)
-    
-    if not QDRANT_API_KEY:
-        logger.error("❌ QDRANT_API_KEY environment variable not set!")
-        sys.exit(1)
-    
-    # Connect to Qdrant
-    client = QdrantClient(
-        url=QDRANT_URL,
-        api_key=QDRANT_API_KEY,
-        timeout=120,
-        cloud_inference=True
-    )
-    
-    logger.info(f"✅ Connected to Qdrant: {QDRANT_URL}")
-    
-    # Check if collection exists
-    try:
-        collections = client.get_collections()
-        existing = [c.name for c in collections.collections]
-        
-        if collection_name in existing:
-            if replace_existing:
-                logger.info(f"⚠️  Collection '{collection_name}' exists. Deleting...")
-                client.delete_collection(collection_name=collection_name)
-                logger.info("✅ Deleted existing collection")
-            else:
-                logger.info(f"✅ Collection '{collection_name}' already exists (keeping)")
-                return client
-    except Exception as e:
-        logger.warning(f"Error checking collections: {e}")
-    
-    # Prepare sparse vector config
-    sparse_config = None
-    if enable_sparse:
-        sparse_config = {
-            "sparse": models.SparseVectorParams(
-                modifier=models.Modifier.IDF,
-            )
+def _patch_2bit_quantization(collection_name: str) -> None:
+    """Attempt 2-bit quantization patch using REST for Qdrant >=1.15."""
+    payload = {
+        "quantization_config": {
+            "binary": {
+                "type": "2bit",
+                "always_ram": True,
+            }
         }
-    
-    # Create collection
-    logger.info(f"\n📦 Creating collection: {collection_name}")
-    logger.info(f"   Dense vector size: {vector_size}")
-    logger.info(f"   Sparse vectors: {'Enabled' if enable_sparse else 'Disabled'}")
-    logger.info(f"   Binary quantization: Enabled")
-    logger.info(f"   Cloud Inference: Enabled")
-    logger.info(f"   Shards: {shard_number}")
-    
-    try:
+    }
+    headers = {"Content-Type": "application/json"}
+    if IngestionConfig.QDRANT_API_KEY:
+        headers["api-key"] = IngestionConfig.QDRANT_API_KEY
+
+    response = requests.patch(
+        f"{IngestionConfig.QDRANT_URL}/collections/{collection_name}",
+        json=payload,
+        headers=headers,
+        timeout=30,
+    )
+    if response.status_code >= 300:
+        logger.warning("2-bit quantization patch was not applied: %s", response.text[:300])
+    else:
+        logger.info("Applied 2-bit quantization patch")
+
+
+def setup_collection(collection_name: str, keep_existing: bool, shard_number: int, use_2bit: bool) -> None:
+    if not IngestionConfig.QDRANT_URL:
+        logger.error("QDRANT_URL is required")
+        sys.exit(1)
+
+    client = QdrantClient(
+        url=IngestionConfig.QDRANT_URL,
+        api_key=IngestionConfig.QDRANT_API_KEY or None,
+        timeout=120,
+        prefer_grpc=IngestionConfig.USE_GRPC,
+    )
+
+    existing = {c.name for c in client.get_collections().collections}
+    if collection_name in existing:
+        if keep_existing:
+            logger.info("Collection already exists and --keep-existing set: %s", collection_name)
+        else:
+            logger.info("Deleting existing collection: %s", collection_name)
+            client.delete_collection(collection_name=collection_name)
+
+    if collection_name not in existing or not keep_existing:
+        logger.info("Creating collection: %s", collection_name)
+        sparse_vectors_config = None
+        if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
+            sparse_vectors_config = {
+                "sparse": models.SparseVectorParams(modifier=models.Modifier.IDF)
+            }
+
         client.create_collection(
             collection_name=collection_name,
             vectors_config=models.VectorParams(
-                size=vector_size,
+                size=1024,
                 distance=models.Distance.COSINE,
                 on_disk=True,
             ),
-            sparse_vectors_config=sparse_config,
+            sparse_vectors_config=sparse_vectors_config,
             quantization_config=models.BinaryQuantization(
-                binary=models.BinaryQuantizationConfig(
-                    always_ram=False,
-                )
+                binary=models.BinaryQuantizationConfig(always_ram=True)
             ),
             hnsw_config=models.HnswConfigDiff(
                 m=16,
-                ef_construct=200,
+                ef_construct=128,
+                on_disk=True,
             ),
             shard_number=shard_number,
             on_disk_payload=True,
+            optimizers_config=models.OptimizersConfigDiff(indexing_threshold=0),
         )
-        
-        logger.info("\n✅ Collection created successfully!")
-        
-    except Exception as e:
-        logger.error(f"❌ Error creating collection: {e}")
-        raise
-    
-    # Create payload indexes for filtering
-    logger.info("\n📊 Creating payload indexes...")
-    
-    indexes = [
-        ("year", models.PayloadSchemaType.INTEGER),
-        ("source", models.PayloadSchemaType.KEYWORD),
-        ("article_type", models.PayloadSchemaType.KEYWORD),
-        ("journal", models.PayloadSchemaType.KEYWORD),
-        ("country", models.PayloadSchemaType.KEYWORD),
-        ("evidence_grade", models.PayloadSchemaType.KEYWORD),
-    ]
-    
-    for field_name, field_type in indexes:
+
+    if use_2bit:
+        _patch_2bit_quantization(collection_name)
+
+    indexes = {
+        "year": models.PayloadSchemaType.INTEGER,
+        "source": models.PayloadSchemaType.KEYWORD,
+        "article_type": models.PayloadSchemaType.KEYWORD,
+        "journal": models.PayloadSchemaType.KEYWORD,
+        "evidence_grade": models.PayloadSchemaType.KEYWORD,
+        "country": models.PayloadSchemaType.KEYWORD,
+    }
+
+    for field_name, field_type in indexes.items():
         try:
             client.create_payload_index(
                 collection_name=collection_name,
                 field_name=field_name,
                 field_schema=field_type,
             )
-            logger.info(f"   ✅ Created index: {field_name}")
-        except Exception as e:
-            logger.warning(f"   ⚠️  Index {field_name}: {e}")
-    
-    # Verify collection
+            logger.info("Index ready: %s", field_name)
+        except Exception as exc:
+            logger.warning("Index %s: %s", field_name, exc)
+
     info = client.get_collection(collection_name)
-    
-    logger.info("\n" + "=" * 70)
-    logger.info("📊 Collection Info")
-    logger.info("=" * 70)
-    logger.info(f"   Name: {collection_name}")
-    logger.info(f"   Points: {info.points_count:,}")
-    logger.info(f"   Status: {info.status}")
-    logger.info(f"   Vectors: {vector_size}-dimensional")
-    logger.info(f"   Shards: {shard_number}")
-    
-    return client
+    logger.info("Collection status=%s points=%s", info.status, info.points_count)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Setup Qdrant collection")
-    parser.add_argument(
-        "--collection-name",
-        type=str,
-        default=DEFAULT_COLLECTION_NAME,
-        help="Collection name"
-    )
-    parser.add_argument(
-        "--vector-size",
-        type=int,
-        default=VECTOR_SIZE,
-        help="Vector dimension"
-    )
-    parser.add_argument(
-        "--shards",
-        type=int,
-        default=SHARD_NUMBER,
-        help="Number of shards"
-    )
-    parser.add_argument(
-        "--keep-existing",
-        action="store_true",
-        help="Keep existing collection if present"
-    )
-    parser.add_argument(
-        "--no-sparse",
-        action="store_true",
-        help="Disable sparse vector support"
-    )
-    
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Setup self-hosted Qdrant collection")
+    parser.add_argument("--collection-name", default=IngestionConfig.COLLECTION_NAME)
+    parser.add_argument("--keep-existing", action="store_true")
+    parser.add_argument("--shards", type=int, default=4)
+    parser.add_argument("--no-2bit", action="store_true", help="Skip 2-bit patch and keep standard binary")
     args = parser.parse_args()
-    
+
     setup_collection(
         collection_name=args.collection_name,
-        vector_size=args.vector_size,
-        replace_existing=not args.keep_existing,
+        keep_existing=args.keep_existing,
         shard_number=args.shards,
-        enable_sparse=not args.no_sparse,
+        use_2bit=not args.no_2bit,
     )
-    
-    print("\n✅ Collection setup complete!")
 
 
 if __name__ == "__main__":
     main()
-

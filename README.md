@@ -324,9 +324,9 @@ cp env.example .env
 
 ```bash
 # .env file
-QDRANT_URL=https://your-cluster.qdrant.io:6333
-QDRANT_API_KEY=your_qdrant_api_key
-OPENROUTER_API_KEY=your_openrouter_api_key
+QDRANT_URL=http://your-hetzner-server-ip:6333
+QDRANT_API_KEY=your_self_hosted_qdrant_api_key
+EMBEDDING_PROVIDER=local  # or qdrant_cloud_inference
 COHERE_API_KEY=your_cohere_api_key
 ```
 
@@ -371,6 +371,18 @@ The frontend connects to the backend at `http://localhost:8000` and provides:
 - Expandable references with clickable DOI links
 - Split-screen PDF viewer for source articles
 - Modern glassmorphism UI design
+
+### 6. Hetzner Deployment Assets
+
+Self-hosted production assets are in:
+
+- `deploy/hetzner/docker-compose.yml`
+- `deploy/hetzner/qdrant-production.yaml`
+- `deploy/hetzner/cron/*.cron`
+- `deploy/hetzner/backup.sh`
+- `deploy/hetzner/healthcheck.sh`
+
+Follow `deploy/hetzner/README.md` for server bootstrap and cron installation.
 
 ---
 
@@ -463,37 +475,37 @@ The frontend connects to the backend at `http://localhost:8000` and provides:
 
 ---
 
-## 🔧 Data Ingestion (EC2)
+## 🔧 Data Ingestion (Self-Hosted)
 
-See [docs/PRD-Pipeline.md](docs/PRD-Pipeline.md) for detailed instructions.
+See these docs:
+
+- [PRD-Migration-Hetzner-Qdrant-v3.md](PRD-Migration-Hetzner-Qdrant-v3.md) for the self-hosted migration plan
+- [deploy/hetzner/README.md](deploy/hetzner/README.md) for deployment/runbook steps
 
 ### Quick Commands
 
 ```bash
-# On EC2 (r6i.4xlarge recommended)
+# On your Hetzner host or ingestion worker
 
-# 1. Download PMC articles (4-8 hours)
-python scripts/01_download_pmc.py
+# 1. Download PMC OA bulk files (no AWS dependency)
+python scripts/01_download_pmc.py --output-dir /data/ingestion/pmc_xml
 
-# 2. Extract to JSONL (3-4 hours)
-python scripts/02_extract_pmc.py --xml-dir /data/pmc_fulltext/xml --output /data/pmc_articles.jsonl
+# 2. Extract to JSONL (supports .xml and .xml.gz)
+python scripts/02_extract_pmc.py --xml-dir /data/ingestion/pmc_xml --output /data/ingestion/pmc_articles.jsonl
 
 # 3. Download DailyMed (30 mins)
-python scripts/03_download_dailymed.py
+python scripts/03_download_dailymed.py --output-dir /data/ingestion/dailymed/xml
 
-# 4. Process DailyMed (10 mins)
-python scripts/04_process_dailymed.py --spl-dir /data/dailymed/xml --output /data/dailymed_drugs.jsonl
+# 4. Setup self-hosted Qdrant collection
+python scripts/05_setup_qdrant.py --collection-name medical_rag
 
-# 5. Setup Qdrant collection
-python scripts/05_setup_qdrant.py
+# 5. Ingest PMC
+python scripts/06_ingest_pmc.py --articles-file /data/ingestion/pmc_articles.jsonl
 
-# 6. Ingest PMC (~60 mins)
-python scripts/06_ingest_pmc.py --articles-file /data/pmc_articles.jsonl
+# 6. Ingest DailyMed
+python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
 
-# 7. Ingest DailyMed (~5 mins)
-python scripts/07_ingest_dailymed.py --xml-dir /data/dailymed/xml
-
-# 8. Monthly updates
+# 7. Monthly updates (cron-safe, tracks processed update files)
 python scripts/08_monthly_update.py
 ```
 

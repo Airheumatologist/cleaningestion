@@ -270,7 +270,7 @@ def apply_evidence_boosts(
 class AbstractReranker:
     """Abstract base class for rerankers."""
     
-    def get_scores(self, query: str, documents: List[str]) -> List[float]:
+    def get_scores(self, query: str, documents: List[str], top_n: Optional[int] = None) -> List[float]:
         raise NotImplementedError
 
 
@@ -282,11 +282,11 @@ class CohereReranker(AbstractReranker):
     """
     Cohere-based reranker as substitute for ScholarQA's CrossEncoder.
     
-    Uses Cohere rerank-v4.0-pro (upgraded from v3.5) for better healthcare performance.
+    Uses Cohere rerank-v4-fast for better throughput in production.
     Formats documents as YAML for optimal reranking performance.
     """
     
-    def __init__(self, model: str = "rerank-v4.0-pro"):
+    def __init__(self, model: str = "rerank-v4-fast"):
         if not COHERE_API_KEY:
             raise ValueError("COHERE_API_KEY not set")
         
@@ -294,7 +294,7 @@ class CohereReranker(AbstractReranker):
         self.model = model
         logger.info(f"✅ Cohere Reranker initialized with {model}")
     
-    def get_scores(self, query: str, documents: List[str]) -> List[float]:
+    def get_scores(self, query: str, documents: List[str], top_n: Optional[int] = None) -> List[float]:
         """
         Get relevance scores for documents.
         
@@ -303,6 +303,7 @@ class CohereReranker(AbstractReranker):
         Args:
             query: Search query
             documents: List of document strings (can be plain text or YAML)
+            top_n: Number of top docs to score/return from provider
             
         Returns:
             List of relevance scores
@@ -315,7 +316,8 @@ class CohereReranker(AbstractReranker):
                 model=self.model,
                 query=query,
                 documents=documents,
-                top_n=len(documents),  # Return all scores (Cohere best practice)
+                top_n=top_n or len(documents),
+                max_tokens_per_doc=1024,
             )
             
             # Create score array indexed by original position
@@ -460,8 +462,8 @@ class PaperFinderWithReranker:
             text = doc.get("text", "")
             full_text = doc.get("full_text", "")
             
-            # Use full text if available, otherwise use abstract/text
-            content = full_text if full_text else (text if text else abstract)
+            # Prefer chunk/snippet text for chunked corpora; fall back to abstract/full-text.
+            content = text if text else (abstract if abstract else full_text)
             
             # Format as YAML for better performance
             if isinstance(self.reranker_engine, CohereReranker):
@@ -476,7 +478,10 @@ class PaperFinderWithReranker:
                 passages.append((title + " " + content).strip()[:2000])
         
         # Stage 2: Get rerank scores from Cohere (0-1 normalized, query-dependent)
-        rerank_scores = self.reranker_engine.get_scores(query, passages)
+        top_n_for_rerank = len(passages)
+        if self.n_rerank > 0:
+            top_n_for_rerank = min(self.n_rerank, len(passages))
+        rerank_scores = self.reranker_engine.get_scores(query, passages, top_n=top_n_for_rerank)
         
         # Attach rerank scores to contexts for filtering
         for i, score in enumerate(rerank_scores):

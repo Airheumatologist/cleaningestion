@@ -7,6 +7,13 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 # Load environment variables from .env file
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(env_path)
@@ -14,11 +21,11 @@ load_dotenv(env_path)
 # =============================================================================
 # Qdrant Cloud Configuration
 # =============================================================================
-QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-COLLECTION_NAME = "pmc_medical_rag_fulltext"
-GRAPHRAG_COLLECTION_NAME = "pmc_medical_graphrag"  # New Graph RAG enhanced collection
-QDRANT_CLOUD_INFERENCE = True  # Use Qdrant cloud inference for embeddings
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", os.getenv("QDRANT_COLLECTION", "medical_rag"))
+GRAPHRAG_COLLECTION_NAME = os.getenv("GRAPHRAG_COLLECTION_NAME", "pmc_medical_graphrag")
+QDRANT_CLOUD_INFERENCE = _env_bool("QDRANT_CLOUD_INFERENCE", default=False)
 QDRANT_TIMEOUT = 180  # Client timeout in seconds
 QDRANT_RETRY_COUNT = 3  # Number of retries for transient failures
 QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
@@ -26,7 +33,7 @@ QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
 # =============================================================================
 # LLM Configuration (DeepInfra)
 # =============================================================================
-DEEPINFRA_API_KEY = "Huum9P1B1P9UHu92sMY2AWF99GaVthTw"
+DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
 DEEPINFRA_MODEL = "nvidia/Nemotron-3-Nano-30B-A3B"  # NVIDIA Nemotron 3 Nano model via DeepInfra
 DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
 
@@ -58,16 +65,27 @@ EMBEDDING_DIMENSION = 1024
 
 # SPLADE Sparse Vector Configuration
 SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
-USE_HYBRID_SEARCH = True  # Enabled - 100% of documents have sparse vectors
+USE_HYBRID_SEARCH = _env_bool("USE_HYBRID_SEARCH", default=True)
 DENSE_WEIGHT = 0.7  # Weight for dense vector scores in hybrid search
 SPARSE_WEIGHT = 0.3  # Weight for sparse vector scores in hybrid search
+SPARSE_RETRIEVAL_MODE = os.getenv("SPARSE_RETRIEVAL_MODE", "bm25").strip().lower()
+SPARSE_MAX_TERMS_QUERY = int(os.getenv("SPARSE_MAX_TERMS_QUERY", "64"))
+SPARSE_MIN_TOKEN_LEN = int(os.getenv("SPARSE_MIN_TOKEN_LEN", "2"))
+SPARSE_REMOVE_STOPWORDS = _env_bool("SPARSE_REMOVE_STOPWORDS", default=True)
 
 # =============================================================================
-# Search Configuration - OPTIMIZED FOR 150+ ARTICLES
+# Search Configuration
 # =============================================================================
 TOP_K_RESULTS = 5  # Number of documents to retrieve
 SCORE_THRESHOLD = 0.25  # Lowered from 0.3 to capture more relevant papers
 # Lower threshold helps retrieve more candidates before aggressive filtering
+
+# Chunk retrieval/reranking profile for chunk-level indexing
+RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "800"))
+MAX_CHUNKS_PER_ARTICLE_PRE_RERANK = int(os.getenv("MAX_CHUNKS_PER_ARTICLE_PRE_RERANK", "3"))
+RERANK_INPUT_CHUNK_LIMIT = int(os.getenv("RERANK_INPUT_CHUNK_LIMIT", "450"))
+RERANK_TOP_CHUNKS = int(os.getenv("RERANK_TOP_CHUNKS", "220"))
+FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "100"))
 
 # =============================================================================
 # Cohere Rerank Configuration
@@ -75,13 +93,13 @@ SCORE_THRESHOLD = 0.25  # Lowered from 0.3 to capture more relevant papers
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
 # =============================================================================
-# Query Preprocessing Configuration - SCALED UP FOR 150+ ARTICLES
+# Query Preprocessing Configuration
 # =============================================================================
 QUERY_EXPANSION_COUNT = 2  # Number of expanded query variations (3 total with base query)
 BULK_RETRIEVAL_LIMIT = 600  # Increased from 300 for better coverage
 BULK_RETRIEVAL_PER_QUERY = 150  # Increased from 75 - more candidates before reranking
-RERANK_TOP_K = 100  # Increased from 30 to 100 - Final articles after reranking (keep more before aggregation)
-MAX_ABSTRACTS = 100  # Maximum abstracts to use in context - reduced from 150 to save tokens
+RERANK_TOP_K = FINAL_TOP_ARTICLES  # Final articles after paper-level aggregation
+MAX_ABSTRACTS = FINAL_TOP_ARTICLES  # Context article cap
 MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)
 
 
