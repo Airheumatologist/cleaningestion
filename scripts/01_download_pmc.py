@@ -22,6 +22,17 @@ S3_BASE_URL = "https://pmc-oa-opendata.s3.amazonaws.com"
 ALLOWED_SUFFIXES = (".xml.gz", ".tar.gz")
 
 
+def _iter_remote_files(ftp: ftplib.FTP, max_files: int | None = None) -> Iterable[str]:
+    """List remote files matching ALLOWED_SUFFIXES, optionally limited to max_files."""
+    entries: list[str] = []
+    ftp.retrlines("NLST", entries.append)
+
+    matched = [f for f in sorted(entries) if any(f.endswith(s) for s in ALLOWED_SUFFIXES)]
+    if max_files is not None:
+        matched = matched[:max_files]
+    yield from matched
+
+
 def _download_file_http(remote_path: str, local_path: Path, chunk_size: int = 1024 * 1024) -> bool:
     """Download file via HTTP (S3), returning True if successful."""
     # Map FTP path to S3 URL: /pub/pmc/oa_bulk/oa_comm/xml/ -> /oa_comm/xml/
