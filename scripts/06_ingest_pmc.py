@@ -54,19 +54,32 @@ class EmbeddingProvider:
         return [v.tolist() for v in vectors]
 
     def _embed_cohere(self, texts: List[str]) -> List[List[float]]:
-        """Embed texts via Cohere API with batching (max 96 per call)."""
+        """Embed texts via Cohere API with batching and rate-limit retry."""
         all_vectors: List[List[float]] = []
         batch_size = min(IngestionConfig.EMBEDDING_BATCH_SIZE, 96)  # Cohere API limit
+        max_retries = 5
 
         for i in range(0, len(texts), batch_size):
             chunk = texts[i : i + batch_size]
-            response = self.cohere_client.embed(
-                texts=chunk,
-                model=self.model,
-                input_type="search_document",
-                embedding_types=["float"],
-            )
-            all_vectors.extend([list(v) for v in response.embeddings.float_])
+            for attempt in range(max_retries):
+                try:
+                    response = self.cohere_client.embed(
+                        texts=chunk,
+                        model=self.model,
+                        input_type="search_document",
+                        embedding_types=["float"],
+                    )
+                    all_vectors.extend([list(v) for v in response.embeddings.float_])
+                    break  # Success
+                except Exception as e:
+                    if "429" in str(e) or "too_many_requests" in str(type(e).__name__).lower():
+                        wait = 10 * (2 ** attempt)  # 10s, 20s, 40s, 80s, 160s
+                        logger.warning("Rate limited (attempt %d/%d), waiting %ds...", attempt + 1, max_retries, wait)
+                        time.sleep(wait)
+                    else:
+                        raise  # Non-rate-limit error, re-raise
+            else:
+                raise RuntimeError(f"Cohere embed failed after {max_retries} retries (rate limit)")
 
         return all_vectors
 
