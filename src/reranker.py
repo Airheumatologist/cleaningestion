@@ -2,21 +2,25 @@
 ScholarQA-Style Reranker with Paper Aggregation.
 
 Implements ai2-scholarqa-lib's exact reranking methodology:
-- Passage-level reranking using Cohere (substitute for CrossEncoder)
+- Passage-level reranking using CrossEncoder or Cohere
 - Paper aggregation using max rerank_score
 - DataFrame output with ScholarQA reference_string format
 
-No custom criteria (evidence hierarchy, article count limits, etc.)
+Supports self-hosted reranking (mxbai-rerank-large-v2) and Cohere API.
 """
 
 import logging
 from typing import List, Dict, Any, Optional
 import pandas as pd
-import cohere
 from anyascii import anyascii
 import yaml
 
-from .config import COHERE_API_KEY
+try:
+    import cohere
+except ImportError:
+    cohere = None
+
+from .config import COHERE_API_KEY, RERANKER_PROVIDER, RERANKER_MODEL
 
 # Try to import medical entity expander for entity matching
 try:
@@ -275,7 +279,65 @@ class AbstractReranker:
 
 
 # =============================================================================
-# Cohere Reranker (substitute for CrossEncoder)
+# Self-Hosted Cross-Encoder Reranker (default)
+# =============================================================================
+
+class CrossEncoderReranker(AbstractReranker):
+    """
+    Self-hosted reranker using sentence-transformers CrossEncoder.
+    
+    Default model: mixedbread-ai/mxbai-rerank-large-v2 (Apache 2.0, 1.5B params)
+    - SOTA on BEIR (57.49), 8K token context, 100+ languages
+    - Eliminates Cohere API costs entirely
+    """
+    
+    def __init__(self, model_name: str = None):
+        model_name = model_name or RERANKER_MODEL
+        try:
+            from sentence_transformers import CrossEncoder
+            self.model = CrossEncoder(model_name, trust_remote_code=True)
+            self.model_name = model_name
+            logger.info(f"✅ CrossEncoder Reranker initialized with {model_name}")
+        except Exception as e:
+            raise ValueError(f"Failed to load CrossEncoder model '{model_name}': {e}")
+    
+    def get_scores(self, query: str, documents: List[str], top_n: Optional[int] = None) -> List[float]:
+        """
+        Get relevance scores using local cross-encoder model.
+        
+        Args:
+            query: Search query
+            documents: List of document strings
+            top_n: Number of top docs to score (scores all, returns all)
+            
+        Returns:
+            List of relevance scores (0-1 range via sigmoid)
+        """
+        if not documents:
+            return []
+        
+        try:
+            results = self.model.rank(
+                query,
+                documents,
+                top_k=top_n or len(documents),
+                return_documents=False,
+            )
+            
+            # Create score array indexed by original position
+            scores = [0.0] * len(documents)
+            for r in results:
+                scores[r["corpus_id"]] = float(r["score"])
+            
+            return scores
+            
+        except Exception as e:
+            logger.error(f"CrossEncoder reranking failed: {e}")
+            return [0.5] * len(documents)
+
+
+# =============================================================================
+# Cohere Reranker (API-based alternative)
 # =============================================================================
 
 class CohereReranker(AbstractReranker):
@@ -289,6 +351,8 @@ class CohereReranker(AbstractReranker):
     def __init__(self, model: str = "rerank-v4-fast"):
         if not COHERE_API_KEY:
             raise ValueError("COHERE_API_KEY not set")
+        if cohere is None:
+            raise ValueError("cohere package not installed. Run: pip install cohere")
         
         self.client = cohere.ClientV2(api_key=COHERE_API_KEY)
         self.model = model
@@ -383,11 +447,17 @@ class PaperFinderWithReranker:
         Initialize paper finder.
         
         Args:
-            reranker: Reranker engine (defaults to Cohere)
+            reranker: Reranker engine (defaults based on RERANKER_PROVIDER config)
             n_rerank: Max passages to keep after rerank (-1 = all)
             context_threshold: Min score threshold
         """
-        self.reranker_engine = reranker or CohereReranker()
+        if reranker is not None:
+            self.reranker_engine = reranker
+        elif RERANKER_PROVIDER == "cohere":
+            self.reranker_engine = CohereReranker()
+        else:
+            self.reranker_engine = CrossEncoderReranker()
+        
         self.n_rerank = n_rerank
         self.context_threshold = context_threshold
         

@@ -32,6 +32,7 @@ from .config import (
     RERANK_INPUT_CHUNK_LIMIT,
     RERANK_TOP_CHUNKS,
     FINAL_TOP_ARTICLES,
+    RERANKER_PROVIDER,
 )
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
@@ -49,7 +50,7 @@ class MedicalRAGPipeline:
     Optimized flow:
     1. Preprocess query (decompose, extract filters)
     2. Retrieve passages from Qdrant
-    3. Rerank passages with Cohere
+    3. Rerank passages with cross-encoder or Cohere
     4. Aggregate to paper level
     5. Direct LLM synthesis with ELIXIR prompt
     """
@@ -93,15 +94,15 @@ class MedicalRAGPipeline:
             logger.warning(f"Medical entity expander not available for filtering: {e}")
             self.entity_expander = None
 
-        # Initialize reranker only if Cohere API key is available
+        # Initialize reranker based on configured provider
         try:
             self.paper_finder = PaperFinderWithReranker(
                 n_rerank=n_rerank,
                 context_threshold=context_threshold
             )
-            logger.info("✅ Cohere reranker initialized")
+            logger.info(f"✅ Reranker initialized (provider: {RERANKER_PROVIDER})")
         except ValueError as e:
-            logger.warning(f"⚠️ Cohere reranker not available: {e}")
+            logger.warning(f"⚠️ Reranker not available: {e}")
             logger.warning("⚠️ Falling back to basic retrieval without reranking")
             # Create a basic paper finder without reranking
             self.paper_finder = None

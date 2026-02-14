@@ -101,6 +101,9 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
         "journal": models.PayloadSchemaType.KEYWORD,
         "evidence_grade": models.PayloadSchemaType.KEYWORD,
         "country": models.PayloadSchemaType.KEYWORD,
+        "doc_id": models.PayloadSchemaType.KEYWORD,
+        "chunk_id": models.PayloadSchemaType.KEYWORD,
+        "section_type": models.PayloadSchemaType.KEYWORD,
     }
 
     for field_name, field_type in indexes.items():

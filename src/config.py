@@ -88,8 +88,11 @@ RERANK_TOP_CHUNKS = int(os.getenv("RERANK_TOP_CHUNKS", "220"))
 FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "100"))
 
 # =============================================================================
-# Cohere Rerank Configuration
+# Reranker Configuration
 # =============================================================================
+# Provider: "cross-encoder" (self-hosted, default) or "cohere" (API)
+RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "cross-encoder").strip().lower()
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "mixedbread-ai/mxbai-rerank-large-v2")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
 # =============================================================================
@@ -124,8 +127,8 @@ def validate_config():
         errors.append("QDRANT_API_KEY not set in .env")
     if not DEEPINFRA_API_KEY:
         errors.append("DEEPINFRA_API_KEY not set")
-    if not COHERE_API_KEY:
-        errors.append("COHERE_API_KEY not set in .env")
+    if RERANKER_PROVIDER == "cohere" and not COHERE_API_KEY:
+        errors.append("COHERE_API_KEY not set in .env (required when RERANKER_PROVIDER=cohere)")
 
     if errors:
         raise ValueError(
