@@ -70,10 +70,14 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
                 "sparse": models.SparseVectorParams(modifier=models.Modifier.IDF)
             }
 
+        # Get vector size based on embedding provider
+        vector_size = IngestionConfig.get_vector_size()
+        logger.info("Using vector size %d for embedding provider: %s", vector_size, IngestionConfig.EMBEDDING_PROVIDER)
+        
         client.create_collection(
             collection_name=collection_name,
             vectors_config=models.VectorParams(
-                size=1024,
+                size=vector_size,
                 distance=models.Distance.COSINE,
                 on_disk=True,
             ),

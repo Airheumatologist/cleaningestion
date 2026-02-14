@@ -60,6 +60,24 @@ class IngestionConfig:
     SPARSE_MIN_TOKEN_LEN = int(os.getenv("SPARSE_MIN_TOKEN_LEN", "2"))
     SPARSE_REMOVE_STOPWORDS = _as_bool(os.getenv("SPARSE_REMOVE_STOPWORDS"), default=True)
 
+    # Vector dimensions for different embedding providers
+    # This ensures collection is created with the correct vector size
+    EMBEDDING_DIMENSIONS = {
+        "cohere": 1536,  # Cohere embed-v4.0 and earlier models
+        "local": 1024,   # mixedbread-ai/mxbai-embed-large-v1
+        "qdrant_cloud_inference": 1024,  # Default for cloud inference
+    }
+
+    @classmethod
+    def get_vector_size(cls) -> int:
+        """Get the vector size for the current embedding provider."""
+        provider = cls.EMBEDDING_PROVIDER.lower().strip()
+        # Handle Cohere model variants
+        if provider == "cohere":
+            # Cohere embed-v4.0 outputs 1536 dimensions
+            return 1536
+        return cls.EMBEDDING_DIMENSIONS.get(provider, 1024)
+
 
 def ensure_data_dirs() -> None:
     IngestionConfig.DATA_DIR.mkdir(parents=True, exist_ok=True)
