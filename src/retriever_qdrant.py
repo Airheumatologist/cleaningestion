@@ -19,22 +19,28 @@ from qdrant_client.http.models import Document
 
 from .config import (
     QDRANT_URL, QDRANT_API_KEY, COLLECTION_NAME, SCORE_THRESHOLD, 
-    EMBEDDING_MODEL, QDRANT_CLOUD_INFERENCE, QDRANT_TIMEOUT, 
+    EMBEDDING_MODEL, EMBEDDING_PROVIDER, QDRANT_CLOUD_INFERENCE, QDRANT_TIMEOUT, 
     QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY, USE_HYBRID_SEARCH,
     SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
-    SPARSE_REMOVE_STOPWORDS,
+    SPARSE_REMOVE_STOPWORDS, COHERE_API_KEY,
 )
 from .bm25_sparse import BM25SparseEncoder
 
 logger = logging.getLogger(__name__)
 
-# Local embedding fallback
+# Cohere embedding client (lazy init)
+try:
+    import cohere as cohere_sdk
+    COHERE_AVAILABLE = True
+except ImportError:
+    COHERE_AVAILABLE = False
+
+# Local embedding fallback (only if provider is 'local')
 try:
     from sentence_transformers import SentenceTransformer
     LOCAL_EMBEDDINGS_AVAILABLE = True
 except ImportError:
     LOCAL_EMBEDDINGS_AVAILABLE = False
-    logger.warning("sentence-transformers not available, local embeddings disabled")
 
 # SPLADE encoder for sparse vectors (optional legacy mode)
 try:
@@ -92,29 +98,43 @@ class QdrantRetriever(AbstractRetriever):
             n_keyword_search: Number of additional papers from keyword search
             score_threshold: Minimum similarity score
         """
+        # Disable cloud_inference unless explicitly using qdrant_cloud_inference provider
+        use_cloud = QDRANT_CLOUD_INFERENCE and EMBEDDING_PROVIDER == "qdrant_cloud_inference"
         self.client = QdrantClient(
             url=QDRANT_URL,
             api_key=QDRANT_API_KEY,
-            timeout=QDRANT_TIMEOUT,  # Use configurable timeout
-            cloud_inference=QDRANT_CLOUD_INFERENCE,
+            timeout=QDRANT_TIMEOUT,
+            cloud_inference=use_cloud,
         )
         self.retry_count = QDRANT_RETRY_COUNT
         self.retry_delay = QDRANT_RETRY_DELAY
         self.collection_name = COLLECTION_NAME
         self.embedding_model = EMBEDDING_MODEL
+        self.embedding_provider = EMBEDDING_PROVIDER
         self.n_retrieval = n_retrieval
         self.n_keyword_search = n_keyword_search
         self.score_threshold = score_threshold
 
-        # Initialize local embedding model as fallback (ALWAYS load for resilience)
+        # Initialize embedding backend based on provider
+        self.cohere_client = None
         self.local_encoder = None
-        if LOCAL_EMBEDDINGS_AVAILABLE:
-            try:
-                logger.info("Loading local embedding model for fallback...")
-                self.local_encoder = SentenceTransformer('mixedbread-ai/mxbai-embed-large-v1')
-                logger.info("✅ Local embedding model loaded (fallback ready)")
-            except Exception as e:
-                logger.warning(f"Failed to load local embedding model: {e}")
+
+        if self.embedding_provider == "cohere":
+            if COHERE_AVAILABLE and COHERE_API_KEY:
+                self.cohere_client = cohere_sdk.ClientV2(api_key=COHERE_API_KEY)
+                logger.info("✅ Cohere embedding initialized (model: %s)", EMBEDDING_MODEL)
+            else:
+                raise ValueError("Cohere embedding requires cohere package and COHERE_API_KEY")
+        elif self.embedding_provider == "local":
+            if LOCAL_EMBEDDINGS_AVAILABLE:
+                try:
+                    logger.info("Loading local embedding model...")
+                    self.local_encoder = SentenceTransformer(EMBEDDING_MODEL)
+                    logger.info("✅ Local embedding model loaded")
+                except Exception as e:
+                    logger.warning(f"Failed to load local embedding model: {e}")
+            else:
+                logger.warning("sentence-transformers not installed, local embeddings unavailable")
 
 
         # Initialize sparse query encoder for hybrid search.
@@ -157,10 +177,9 @@ class QdrantRetriever(AbstractRetriever):
             logger.warning(f"Failed to load drug lookup: {e}")
         
         logger.info(
-            "Initialized QdrantRetriever: %s (Cloud Inference: %s, Local Fallback: %s, Sparse Mode: %s)",
+            "Initialized QdrantRetriever: %s (Embedding: %s, Sparse Mode: %s)",
             COLLECTION_NAME,
-            QDRANT_CLOUD_INFERENCE,
-            self.local_encoder is not None,
+            self.embedding_provider,
             self.sparse_mode if USE_HYBRID_SEARCH else "disabled",
         )
 
@@ -181,6 +200,40 @@ class QdrantRetriever(AbstractRetriever):
     def _doc_id_from_payload(self, payload: Dict[str, Any]) -> str:
         """Stable document ID for paper-level aggregation."""
         return str(payload.get("pmcid") or payload.get("doc_id") or payload.get("pmid") or "")
+
+    def _embed_query(self, query: str):
+        """
+        Embed a single query using the configured embedding provider.
+        
+        Returns a vector (list of floats) or Qdrant Document object,
+        suitable for passing to client.query_points(query=...).
+        Returns None if no embedding method is available.
+        """
+        if self.embedding_provider == "cohere" and self.cohere_client is not None:
+            try:
+                response = self.cohere_client.embed(
+                    texts=[query],
+                    model=self.embedding_model,
+                    input_type="search_query",
+                    embedding_types=["float"],
+                )
+                return list(response.embeddings.float_[0])
+            except Exception as e:
+                logger.error(f"Cohere query embedding failed: {e}")
+                return None
+
+        if self.embedding_provider == "qdrant_cloud_inference":
+            return Document(text=query, model=self.embedding_model)
+
+        if self.local_encoder is not None:
+            try:
+                vec = self.local_encoder.encode(query, normalize_embeddings=True)
+                return vec.tolist()
+            except Exception as e:
+                logger.error(f"Local query embedding failed: {e}")
+                return None
+
+        return None
 
     def _build_sparse_query_vector(self, query: str) -> Optional[SparseVector]:
         """Build sparse query vector from configured sparse mode."""
@@ -320,76 +373,31 @@ class QdrantRetriever(AbstractRetriever):
                 precomputed_sparse_vector=precomputed_sparse_vector
             )
 
-        # Fall back to dense-only search
-        # Try cloud inference first if enabled
-        use_cloud_inference = QDRANT_CLOUD_INFERENCE
-        results = None
+        # Dense-only search using configured embedding provider
+        query_embedding = self._embed_query(query)
+        if query_embedding is None:
+            logger.error("No embedding method available")
+            return []
 
-        if use_cloud_inference:
-            # Retry with exponential backoff for cloud inference
-            import time
-            last_error = None
-            for attempt in range(self.retry_count):
-                try:
-                    results = self.client.query_points(
-                        collection_name=self.collection_name,
-                        query=Document(
-                            text=query,
-                            model=self.embedding_model,
-                        ),
-                        limit=self.n_retrieval,
-                        score_threshold=self.score_threshold,
-                        query_filter=search_filter,
-                        with_payload=True,
-                        search_params=SearchParams(
-                            quantization=QuantizationSearchParams(
-                                rescore=True,
-                                oversampling=2.0
-                            )
-                        )
-                    )
-                    logger.info(f"✅ Cloud inference successful (attempt {attempt + 1}), retrieved {len(results.points)} passages")
-                    break  # Success, exit retry loop
-                except Exception as e:
-                    last_error = e
-                    delay = self.retry_delay * (2 ** attempt)  # Exponential backoff: 2s, 4s, 8s
-                    logger.warning(f"Cloud inference attempt {attempt + 1}/{self.retry_count} failed: {e}")
-                    if attempt < self.retry_count - 1:
-                        logger.info(f"Retrying in {delay}s...")
-                        time.sleep(delay)
-                    else:
-                        logger.warning(f"Cloud inference exhausted all retries, falling back to local embeddings")
-                        use_cloud_inference = False  # Fall back to local embeddings
-
-
-        # Use local embeddings if cloud inference is disabled or failed
-        if not use_cloud_inference:
-            if self.local_encoder is None:
-                logger.error("No embedding method available (cloud inference disabled and local encoder not loaded)")
-                return []
-
-            try:
-                # Generate embedding locally
-                query_embedding = self.local_encoder.encode(query, normalize_embeddings=True)
-
-                results = self.client.query_points(
-                    collection_name=self.collection_name,
-                    query=query_embedding.tolist(),
-                    limit=self.n_retrieval,
-                    score_threshold=self.score_threshold,
-                    query_filter=search_filter,
-                    with_payload=True,
-                    search_params=SearchParams(
-                        quantization=QuantizationSearchParams(
-                            rescore=True,
-                            oversampling=2.0
-                        )
+        try:
+            results = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_embedding,
+                limit=self.n_retrieval,
+                score_threshold=self.score_threshold,
+                query_filter=search_filter,
+                with_payload=True,
+                search_params=SearchParams(
+                    quantization=QuantizationSearchParams(
+                        rescore=True,
+                        oversampling=2.0
                     )
                 )
-                logger.info(f"✅ Local embeddings successful, retrieved {len(results.points)} passages")
-            except Exception as e:
-                logger.error(f"Local embedding search failed: {e}")
-                return []
+            )
+            logger.info(f"✅ Dense search successful, retrieved {len(results.points)} passages")
+        except Exception as e:
+            logger.error(f"Dense search failed: {e}")
+            return []
 
         passages = []
         for point in results.points:
@@ -465,14 +473,12 @@ class QdrantRetriever(AbstractRetriever):
         
         # Perform dense search
         dense_results = None
-        try:
-            if QDRANT_CLOUD_INFERENCE:
+        query_embedding = self._embed_query(query)
+        if query_embedding is not None:
+            try:
                 dense_results = self.client.query_points(
                     collection_name=self.collection_name,
-                    query=Document(
-                        text=query,
-                        model=self.embedding_model,
-                    ),
+                    query=query_embedding,
                     limit=self.n_retrieval * 2,  # Get more for fusion
                     query_filter=search_filter,
                     with_payload=True,
@@ -483,24 +489,8 @@ class QdrantRetriever(AbstractRetriever):
                         )
                     )
                 )
-            else:
-                if self.local_encoder:
-                    query_embedding = self.local_encoder.encode(query, normalize_embeddings=True)
-                    dense_results = self.client.query_points(
-                        collection_name=self.collection_name,
-                        query=query_embedding.tolist(),
-                        limit=self.n_retrieval * 2,
-                        query_filter=search_filter,
-                        with_payload=True,
-                        search_params=SearchParams(
-                            quantization=QuantizationSearchParams(
-                                rescore=True,
-                                oversampling=2.0
-                            )
-                        )
-                    )
-        except Exception as e:
-            logger.warning(f"Dense search failed: {e}")
+            except Exception as e:
+                logger.warning(f"Dense search failed: {e}")
         
         # Perform sparse search
         sparse_results = None
@@ -677,14 +667,11 @@ class QdrantRetriever(AbstractRetriever):
         )
         
         for i, query_text in enumerate(queries):
-            # Dense query using cloud inference text model or local embedding fallback.
-            if QDRANT_CLOUD_INFERENCE:
-                dense_query = Document(text=query_text, model=self.embedding_model)
-            else:
-                if self.local_encoder is None:
-                    logger.warning("Skipping query without dense encoder available: %s", query_text[:80])
-                    continue
-                dense_query = self.local_encoder.encode(query_text, normalize_embeddings=True).tolist()
+            # Dense query using configured embedding provider
+            dense_query = self._embed_query(query_text)
+            if dense_query is None:
+                logger.warning("Skipping query without dense encoder available: %s", query_text[:80])
+                continue
 
             dense_request = QueryRequest(
                 query=dense_query,

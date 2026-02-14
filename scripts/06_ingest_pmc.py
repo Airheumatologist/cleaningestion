@@ -28,10 +28,17 @@ class EmbeddingProvider:
         self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
         self.model = IngestionConfig.EMBEDDING_MODEL
         self.local_encoder = None
+        self.cohere_client = None
 
-        if self.provider == "local":
+        if self.provider == "cohere":
+            import cohere
+            api_key = IngestionConfig.COHERE_API_KEY
+            if not api_key:
+                raise ValueError("COHERE_API_KEY not set — required for cohere embedding provider")
+            self.cohere_client = cohere.ClientV2(api_key=api_key)
+            logger.info("✅ Cohere embedding provider initialized (model: %s)", self.model)
+        elif self.provider == "local":
             from sentence_transformers import SentenceTransformer
-
             logger.info("Loading local embedding model: %s", self.model)
             self.local_encoder = SentenceTransformer(self.model)
 
@@ -39,10 +46,29 @@ class EmbeddingProvider:
         return self.provider == "qdrant_cloud_inference"
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        if self.provider == "cohere":
+            return self._embed_cohere(texts)
         if self.local_encoder is None:
             raise RuntimeError("Local encoder not initialized")
         vectors = self.local_encoder.encode(texts, normalize_embeddings=True, batch_size=IngestionConfig.EMBEDDING_BATCH_SIZE)
         return [v.tolist() for v in vectors]
+
+    def _embed_cohere(self, texts: List[str]) -> List[List[float]]:
+        """Embed texts via Cohere API with batching (max 96 per call)."""
+        all_vectors: List[List[float]] = []
+        batch_size = min(IngestionConfig.EMBEDDING_BATCH_SIZE, 96)  # Cohere API limit
+
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            response = self.cohere_client.embed(
+                texts=chunk,
+                model=self.model,
+                input_type="search_document",
+                embedding_types=["float"],
+            )
+            all_vectors.extend([list(v) for v in response.embeddings.float_])
+
+        return all_vectors
 
 
 

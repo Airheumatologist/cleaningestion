@@ -24,9 +24,10 @@ class IngestionConfig:
     QDRANT_GRPC_URL = os.getenv("QDRANT_GRPC_URL", "localhost:6334")
     COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", os.getenv("COLLECTION_NAME", "medical_rag"))
 
-    # Embedding options
-    EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
-    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "mixedbread-ai/mxbai-embed-large-v1")
+    # Embedding options: "cohere" (API, default) or "local" (needs GPU)
+    EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "cohere")
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "embed-v4.0")
+    COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
     QDRANT_INFERENCE_URL = os.getenv("QDRANT_INFERENCE_URL", "")
     QDRANT_INFERENCE_KEY = os.getenv("QDRANT_INFERENCE_KEY", "")
 

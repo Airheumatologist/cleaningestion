@@ -58,10 +58,10 @@ GROQ_MODEL = "llama-3.1-8b-instant"  # Fast and cost-effective
 # =============================================================================
 # Embedding Model Configuration
 # =============================================================================
-# Using mixedbread mxbai-embed-large-v1 with Qdrant Cloud Inference (1024-d)
-# Embeddings are generated server-side in Qdrant Cloud
-EMBEDDING_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
-EMBEDDING_DIMENSION = 1024
+# Provider: "cohere" (API, default) or "local" (needs GPU) or "qdrant_cloud_inference"
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "cohere").strip().lower()
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "embed-v4.0")
+EMBEDDING_DIMENSION = 1024  # Cohere embed-v4.0 supports 256/512/1024/1536; we use 1024
 
 # SPLADE Sparse Vector Configuration
 SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
