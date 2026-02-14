@@ -90,8 +90,8 @@ FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "100"))
 # =============================================================================
 # Reranker Configuration
 # =============================================================================
-# Provider: "cross-encoder" (self-hosted, default) or "cohere" (API)
-RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "cross-encoder").strip().lower()
+# Provider: "cohere" (API, default) or "cross-encoder" (self-hosted, needs GPU)
+RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "cohere").strip().lower()
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "mixedbread-ai/mxbai-rerank-large-v2")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 
