@@ -127,14 +127,30 @@ class SectionFilter:
         return False
 
 
+
+_GLOBAL_TOKENIZER = None
+
 class Chunker:
     def __init__(self, chunk_size: int = 512, overlap: int = 128):
         self.chunk_size = chunk_size
         self.overlap = overlap
+        self._load_tokenizer()
+            
+    def _load_tokenizer(self):
+        global _GLOBAL_TOKENIZER
+        if _GLOBAL_TOKENIZER is not None:
+            self.tokenizer = _GLOBAL_TOKENIZER
+            return
+
         try:
             from transformers import AutoTokenizer
             # Use Qwen2.5-0.5B tokenizer as proxy for Qwen3 if exact model is heavy to load
-            self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
+            # Set local_files_only=False to allow download first time, but we rely on cache after
+            # Adding fast=True usually helps.
+            logger.info("Loading tokenizer (Qwen/Qwen2.5-0.5B)...")
+            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
+            _GLOBAL_TOKENIZER = tokenizer
+            self.tokenizer = tokenizer
         except Exception as e:
             logger.warning(f"Failed to load tokenizer (Qwen/Qwen2.5-0.5B): {e}")
             self.tokenizer = None
