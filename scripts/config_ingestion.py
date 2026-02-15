@@ -41,7 +41,7 @@ class IngestionConfig:
     # Each batch creates many chunks; smaller batches = fewer open files
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
     EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.getenv("PARALLEL_WORKERS", "4")))
+    MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.getenv("PARALLEL_WORKERS", "64")))
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
     USE_GRPC = _as_bool(os.getenv("USE_GRPC"), default=True)
     CLOUD_INFERENCE = _as_bool(os.getenv("QDRANT_CLOUD_INFERENCE"), default=False)
