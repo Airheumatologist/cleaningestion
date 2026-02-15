@@ -44,19 +44,27 @@ def _download_file_http(remote_path: str, local_path: Path, chunk_size: int = 10
     
     url = f"https://ftp.ncbi.nlm.nih.gov{remote_path}"
     
+    temp_path = local_path.with_suffix(local_path.suffix + ".tmp")
     try:
         logger.info("Downloading via HTTP: %s", url)
         with requests.get(url, stream=True, timeout=60) as r:
             if r.status_code == 200:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(local_path, "wb") as f:
+                with open(temp_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=chunk_size):
                         f.write(chunk)
+                
+                # Atomic move
+                temp_path.rename(local_path)
                 return True
             else:
                 logger.warning("HTTP missing (status %s): %s", r.status_code, url)
+                if temp_path.exists():
+                    temp_path.unlink()
     except Exception as e:
         logger.warning("HTTP download failed: %s", e)
+        if temp_path.exists():
+            temp_path.unlink()
     
     return False
 
@@ -139,9 +147,7 @@ def download_pmc(output_dir: Path, remote_dir: str, max_files: int | None = None
 
     # Use a persistent FTP connection with retry logic
     ftp = None
-    downloaded = 0
-    extracted_count = 0
-
+    
     def get_ftp():
         nonlocal ftp
         try:
@@ -162,38 +168,62 @@ def download_pmc(output_dir: Path, remote_dir: str, max_files: int | None = None
         ftp_conn = get_ftp()
         files = list(_iter_remote_files(ftp_conn, max_files=max_files))
         logger.info("Found %s files in %s", len(files), remote_dir)
-        
-        for idx, remote_name in enumerate(files, start=1):
-            logger.info("[%s/%s] %s", idx, len(files), remote_name)
-            local_path = output_dir / remote_name
-            
-            # Check existence first
-            if local_path.exists() and local_path.stat().st_size > 0:
-                logger.info("Skipping existing: %s", remote_name)
-            else:
-                # Try HTTP first (preferred stability)
-                remote_full_path = f"{remote_dir.rstrip('/')}/{remote_name}"
-                if _download_file_http(remote_full_path, local_path):
-                    downloaded += 1
-                else:
-                     logger.error("Failed to download %s via HTTP. Skipping FTP fallback to avoid timeouts.", remote_name)
-                     # FTP fallback removed as requested for stability - HTTP should work
-            
-            # Extract downloaded archives
-            if local_path.exists() and local_path.stat().st_size > 0:
-                if remote_name.endswith('.tar.gz'):
-                    extracted = _extract_tar_gz(local_path, output_dir, delete_after=True)
-                    extracted_count += extracted
-                elif remote_name.endswith('.xml.gz'):
-                    extracted_file = _extract_xml_gz(local_path, delete_after=True)
-                    if extracted_file:
-                        extracted_count += 1
     finally:
         if ftp:
             try:
                 ftp.quit()
             except:
                 pass
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    total_files = len(files)
+    downloaded = 0
+    extracted_count = 0
+    
+    def process_file(remote_name):
+        local_path = output_dir / remote_name
+        
+        # Check existence first
+        if local_path.exists() and local_path.stat().st_size > 0:
+            logger.info("Skipping existing: %s", remote_name)
+            return (0, 0) # downloaded, extracted
+
+        # Try HTTP first (preferred stability)
+        remote_full_path = f"{remote_dir.rstrip('/')}/{remote_name}"
+        if _download_file_http(remote_full_path, local_path):
+            current_downloaded = 1
+        else:
+            logger.error("Failed to download %s via HTTP.", remote_name)
+            return (0, 0)
+        
+        current_extracted = 0
+        # Extract downloaded archives
+        if local_path.exists() and local_path.stat().st_size > 0:
+            if remote_name.endswith('.tar.gz'):
+                extracted = _extract_tar_gz(local_path, output_dir, delete_after=True)
+                current_extracted += extracted
+            elif remote_name.endswith('.xml.gz'):
+                extracted_file = _extract_xml_gz(local_path, delete_after=True)
+                if extracted_file:
+                    current_extracted += 1
+        
+        return (current_downloaded, current_extracted)
+
+    # Use 4 workers for parallel download/extraction
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_file = {executor.submit(process_file, f): f for f in files}
+        
+        for idx, future in enumerate(as_completed(future_to_file), start=1):
+            remote_name = future_to_file[future]
+            try:
+                d, e = future.result()
+                downloaded += d
+                extracted_count += e
+                if idx % 1 == 0: # Log every file completion
+                     logger.info("[%s/%s] Completed %s (Downloaded: %s, Extracted: %s)", idx, total_files, remote_name, d, e)
+            except Exception as exc:
+                logger.error("%s generated an exception: %s", remote_name, exc)
 
     logger.info("Download complete. Files downloaded: %s", downloaded)
     logger.info("Extraction complete. XML files extracted: %s", extracted_count)
