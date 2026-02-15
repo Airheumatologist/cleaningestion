@@ -138,8 +138,8 @@ log_step "2B" "DailyMed Processing"
 python scripts/04_process_dailymed.py
 
 log_step "2C" "DailyMed Ingestion (Improved - Multi-chunk)"
-rm -f /data/ingestion/dailymed_ingested_improved_ids.txt
-python scripts/07_ingest_dailymed_improved.py --xml-dir /data/ingestion/dailymed/xml
+rm -f /data/ingestion/dailymed_ingested_ids.txt
+python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
 
 check_stats
 

@@ -18,7 +18,7 @@ This document summarizes the improvements made to the PMC and DailyMed ingestion
 
 ## Improved Ingestion
 
-### PMC Improved (`06_ingest_pmc_improved.py`)
+### PMC Improved (`06_ingest_pmc.py`)
 
 | Feature | Original | Improved |
 |---------|----------|----------|
@@ -42,7 +42,7 @@ Article: PMC123456
 └── ...
 ```
 
-### DailyMed Improved (`07_ingest_dailymed_improved.py`)
+### DailyMed Improved (`07_ingest_dailymed.py`)
 
 | Feature | Original | Improved |
 |---------|----------|----------|
@@ -63,7 +63,7 @@ Drug: Ibuprofen
 ├── Warnings chunk
 ├── Description chunk
 ├── Table 1: Dosage Schedule chunk
-└── Table 2: Contraindications chunk
+├── Table 2: Contraindications chunk
 ```
 
 ## Benefits of Improved Ingestion
@@ -92,7 +92,7 @@ export PYTHONPATH=/opt/RAG-pipeline:$PYTHONPATH
 export EMBEDDING_PROVIDER=cohere
 export COHERE_API_KEY=your_key
 
-python scripts/06_ingest_pmc_improved.py \
+python scripts/06_ingest_pmc.py \
     --xml-dir /data/ingestion/pmc_xml \
     --articles-file /data/ingestion/pmc_articles.jsonl
 ```
@@ -103,7 +103,7 @@ export PYTHONPATH=/opt/RAG-pipeline:$PYTHONPATH
 export EMBEDDING_PROVIDER=cohere
 export COHERE_API_KEY=your_key
 
-python scripts/07_ingest_dailymed_improved.py \
+python scripts/07_ingest_dailymed.py \
     --xml-dir /data/ingestion/dailymed/xml
 ```
 
@@ -146,3 +146,4 @@ Plus original data:
 - PubMed: ~35GB
 
 **Total disk needed: ~6TB** (you have 1.5TB free - may need to delete XML after ingestion)
+

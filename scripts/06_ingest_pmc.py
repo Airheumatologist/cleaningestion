@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Ingest PMC content into self-hosted Qdrant with checkpoint support."""
+"""Ingest PMC content into self-hosted Qdrant with improved section and table handling."""
 
 from __future__ import annotations
 
@@ -16,73 +16,49 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Document, PointStruct
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
+from ingestion_utils import Chunker, SectionFilter, EmbeddingProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_ingested_ids.txt"
+CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_ingested_improved_ids.txt"
 
 
-class EmbeddingProvider:
-    def __init__(self) -> None:
-        self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
-        self.model = IngestionConfig.EMBEDDING_MODEL
-        self.local_encoder = None
-        self.cohere_client = None
 
-        if self.provider == "cohere":
-            import cohere
-            api_key = IngestionConfig.COHERE_API_KEY
-            if not api_key:
-                raise ValueError("COHERE_API_KEY not set — required for cohere embedding provider")
-            self.cohere_client = cohere.ClientV2(api_key=api_key)
-            logger.info("✅ Cohere embedding provider initialized (model: %s)", self.model)
-        elif self.provider == "local":
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading local embedding model: %s", self.model)
-            self.local_encoder = SentenceTransformer(self.model)
 
-    def use_cloud(self) -> bool:
-        return self.provider == "qdrant_cloud_inference"
 
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        if self.provider == "cohere":
-            return self._embed_cohere(texts)
-        if self.local_encoder is None:
-            raise RuntimeError("Local encoder not initialized")
-        vectors = self.local_encoder.encode(texts, normalize_embeddings=True, batch_size=IngestionConfig.EMBEDDING_BATCH_SIZE)
-        return [v.tolist() for v in vectors]
+# Import BM25SparseEncoder
+spec = importlib.util.find_spec("src.bm25_sparse")
+if spec is not None:
+    from src.bm25_sparse import BM25SparseEncoder
+else:
+    BM25SparseEncoder = None  # type: ignore
 
-    def _embed_cohere(self, texts: List[str]) -> List[List[float]]:
-        """Embed texts via Cohere API with batching and rate-limit retry."""
-        all_vectors: List[List[float]] = []
-        batch_size = min(IngestionConfig.EMBEDDING_BATCH_SIZE, 96)  # Cohere API limit
-        max_retries = 5
 
-        for i in range(0, len(texts), batch_size):
-            chunk = texts[i : i + batch_size]
-            for attempt in range(max_retries):
-                try:
-                    response = self.cohere_client.embed(
-                        texts=chunk,
-                        model=self.model,
-                        input_type="search_document",
-                        embedding_types=["float"],
-                    )
-                    all_vectors.extend([list(v) for v in response.embeddings.float_])
-                    break  # Success
-                except Exception as e:
-                    if "429" in str(e) or "too_many_requests" in str(type(e).__name__).lower():
-                        wait = 10 * (2 ** attempt)  # 10s, 20s, 40s, 80s, 160s
-                        logger.warning("Rate limited (attempt %d/%d), waiting %ds...", attempt + 1, max_retries, wait)
-                        time.sleep(wait)
-                    else:
-                        raise  # Non-rate-limit error, re-raise
-            else:
-                raise RuntimeError(f"Cohere embed failed after {max_retries} retries (rate limit)")
-
-        return all_vectors
-
+def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
+    """Create base payload for a PMC article."""
+    pmcid = str(article.get("pmcid") or "")
+    pmid = str(article.get("pmid") or "")
+    
+    return {
+        "doc_id": pmcid or pmid,
+        "pmcid": pmcid,
+        "pmid": pmid,
+        "doi": article.get("doi", ""),
+        "title": (article.get("title") or "")[:300],
+        "journal": article.get("journal", "")[:100],
+        "year": article.get("year"),
+        "authors": article.get("authors", [])[:20],
+        "keywords": article.get("keywords", [])[:20],
+        "mesh_terms": article.get("mesh_terms", [])[:30],
+        "article_type": article.get("article_type", "")[:50],
+        "evidence_grade": article.get("evidence_grade", ""),
+        "evidence_level": article.get("evidence_level"),
+        "country": article.get("country", ""),
+        "affiliations": article.get("affiliations", [])[:10],
+        "table_count": article.get("table_count", 0),
+        "source": "pmc",
+    }
 
 
 def load_checkpoint() -> set[str]:
@@ -91,57 +67,159 @@ def load_checkpoint() -> set[str]:
     return set()
 
 
-
 def append_checkpoint(ids: Iterable[str]) -> None:
-    if not ids:
-        return
     with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
-        for item in ids:
-            f.write(f"{item}\n")
+        for value in ids:
+            f.write(f"{value}\n")
 
 
+def create_chunks_from_article(article: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Create multiple chunks from an article: sections + tables."""
+    chunks = []
+    doc_id = str(article.get("pmcid") or article.get("pmid") or "")
+    title = article.get("title", "")
+    
+    # 1. Abstract chunk (most important)
+    abstract = article.get("abstract", "")
+    if abstract and len(abstract) > 50:
+        chunks.append({
+            "chunk_id": f"{doc_id}_abstract",
+            "doc_id": doc_id,
+            "text": f"Title: {title}\n\nAbstract: {abstract}",
+            "section_type": "abstract",
+            "section_title": "Abstract",
+            "is_table": False,
+        })
+    
+    # 2. Section chunks
+    sections = article.get("structured_sections", [])
+    for i, section in enumerate(sections):
+        sec_text = section.get("text", "")
+        if len(sec_text) < 50:
+            continue
+            
+        # Section context with title
+        section_context = f"Title: {title}\n\nSection: {section.get('title', 'Body')}\n\n{sec_text}"
+        
+        # Split long sections into smaller chunks (5000 chars each)
+        max_chunk_size = 5000
+        if len(section_context) > max_chunk_size:
+            for j in range(0, len(section_context), max_chunk_size):
+                chunk_text = section_context[j:j+max_chunk_size]
+                chunks.append({
+                    "chunk_id": f"{doc_id}_sec{i}_part{j//max_chunk_size}",
+                    "doc_id": doc_id,
+                    "text": chunk_text,
+                    "section_type": section.get("type", "body"),
+                    "section_title": section.get("title", "Body"),
+                    "is_table": False,
+                })
+        else:
+            chunks.append({
+                "chunk_id": f"{doc_id}_sec{i}",
+                "doc_id": doc_id,
+                "text": section_context,
+                "section_type": section.get("type", "body"),
+                "section_title": section.get("title", "Body"),
+                "is_table": False,
+            })
+    
+    # 3. Table chunks (NEW - embed each table separately)
+    tables = article.get("tables", [])
+    for i, table in enumerate(tables):
+        # Use row-by-row format for better semantic search
+        table_text = table.get("row_by_row", "")
+        caption = table.get("caption", "")
+        
+        if not table_text and table.get("markdown"):
+            # Fallback to markdown if row_by_row not available
+            table_text = table.get("markdown", "")
+        
+        if table_text and len(table_text) > 20:
+            # Create context-rich table text
+            table_context = f"Title: {title}\n\nTable: {caption}\n\n{table_text}"
+            
+            chunks.append({
+                "chunk_id": f"{doc_id}_table{i}",
+                "doc_id": doc_id,
+                "text": table_context[:8000],  # Tables can be long
+                "section_type": "table",
+                "section_title": f"Table: {caption[:100]}",
+                "is_table": True,
+                "table_caption": caption,
+                "table_id": table.get("id", f"table-{i}"),
+            })
+    
+    return chunks
 
-def create_embedding_text(article: Dict[str, Any], max_chars: int = 2000) -> str:
-    title = article.get("title", "") or ""
-    abstract = article.get("abstract", "") or ""
-    full_text = article.get("full_text", "") or ""
-    combined = f"{title}. {abstract}".strip()
-    if full_text and len(combined) < max_chars - 128:
-        remaining = max_chars - len(combined) - 2
-        combined = f"{combined}\n{full_text[:remaining]}"
-    return combined[:max_chars]
 
-
-
-def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "pmcid": article.get("pmcid"),
-        "pmid": article.get("pmid"),
-        "doi": article.get("doi"),
-        "title": (article.get("title") or "")[:300],
-        "abstract": (article.get("abstract") or "")[:2000],
-        "full_text": (article.get("full_text") or "")[:12000],
-        "year": article.get("year"),
-        "journal": article.get("journal", ""),
-        "article_type": article.get("article_type", "research_article"),
-        "publication_type": (article.get("publication_type_list") or [])[:5],
-        "evidence_grade": article.get("evidence_grade"),
-        "evidence_level": article.get("evidence_level"),
-        "country": article.get("country"),
-        "institutions": (article.get("institutions") or [])[:5],
-        "keywords": (article.get("keywords") or [])[:15],
-        "mesh_terms": (article.get("mesh_terms") or [])[:20],
-        "authors": (article.get("authors") or [])[:8],
-        "first_author": article.get("first_author"),
-        "author_count": article.get("author_count", 0),
-        "source": article.get("source", "pmc"),
-        "has_full_text": bool(article.get("full_text")),
-        "has_methods": bool(article.get("has_methods")),
-        "has_results": bool(article.get("has_results")),
-        "table_count": article.get("table_count", 0),
-        "figure_count": article.get("figure_count", 0),
-    }
-
+def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider) -> tuple[List[PointStruct], List[str]]:
+    chunker = Chunker(
+        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+    )
+    sparse_encoder = None
+    use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
+    if use_sparse and BM25SparseEncoder is not None:
+        sparse_encoder = BM25SparseEncoder(
+            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
+            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
+            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
+            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
+        )
+    
+    points: List[PointStruct] = []
+    all_chunk_ids: List[str] = []
+    
+    # Collect all chunks for batch embedding
+    all_chunks: List[Dict[str, Any]] = []
+    all_texts: List[str] = []
+    
+    for article in batch:
+        chunks = create_chunks_from_article(article)
+        all_chunks.extend(chunks)
+        all_texts.extend([c["text"] for c in chunks])
+    
+    if not all_texts:
+        return [], []
+    
+    # Embed all texts in batch
+    try:
+        vectors = embedding_provider.embed_batch(all_texts)
+    except Exception as e:
+        logger.error("Embedding failed: %s", e)
+        return [], []
+    
+    # Create points
+    for chunk, vector in zip(all_chunks, vectors):
+        chunk_id = chunk["chunk_id"]
+        all_chunk_ids.append(chunk_id)
+        
+        # Create sparse vector if enabled
+        vector_data: Any = vector
+        if sparse_encoder is not None:
+            sparse_vector = sparse_encoder.encode_document(chunk["text"])
+            vector_data = {"": vector, "sparse": sparse_vector}
+        
+        # Create payload
+        payload = {
+            "doc_id": chunk["doc_id"],
+            "chunk_id": chunk_id,
+            "section_type": chunk["section_type"],
+            "section_title": chunk["section_title"],
+            "is_table": chunk.get("is_table", False),
+            "table_caption": chunk.get("table_caption", ""),
+            "source": "pmc",
+            "article_type": "research_article",
+            "text_preview": chunk["text"][:500],
+        }
+        
+        # Create deterministic point ID
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pmc:{chunk_id}"))
+        
+        points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
+    
+    return points, all_chunk_ids
 
 
 def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
@@ -150,7 +228,7 @@ def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
             client.upsert(
                 collection_name=IngestionConfig.COLLECTION_NAME,
                 points=points,
-                wait=False,
+                wait=True,  # Changed to True for reliability
             )
             return
         except Exception as exc:
@@ -161,183 +239,36 @@ def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
             time.sleep(wait_for)
 
 
-
-from ingestion_utils import Chunker, SectionFilter
-from src.bm25_sparse import BM25SparseEncoder
-
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider) -> tuple[List[PointStruct], List[str]]:
-    chunker = Chunker(
-        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
-    )
-    sparse_encoder = None
-    use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
-    if use_sparse:
-        sparse_encoder = BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
-    
-    points: List[PointStruct] = []
-    source_ids: List[str] = [] # Doc IDs processed
-    
-    # Batch collection for embeddings
-    all_chunks_text: List[str] = []
-    all_chunks_sparse = []
-    chunk_metadata: List[Dict[str, Any]] = []
-
-    for article in batch:
-        doc_id = str(article.get("pmcid") or article.get("pmid") or "").strip()
-        if not doc_id:
-            continue
-            
-        source_ids.append(doc_id)
-        
-        # Base payload (article metadata)
-        base_payload = create_payload(article)
-        
-        # Iterating over sections
-        sections = article.get("sections", [])
-        if not sections:
-            # Fallback for old extraction or empty body
-            full_text = article.get("full_text", "")
-            if full_text:
-                sections = [{"title": "Body", "text": full_text, "type": "body"}]
-            else:
-                # Abstract fallback
-                abstract = article.get("abstract", "")
-                if abstract:
-                    sections = [{"title": "Abstract", "text": abstract, "type": "abstract"}]
-        
-        chunk_index = 0
-        for section in sections:
-            # Filter Backmatter
-            if IngestionConfig.EMBED_FILTER_ENABLED and SectionFilter.should_exclude(section):
-                continue
-                
-            # Create Chunks
-            text_chunks = chunker.chunk_text(section.get("text", ""))
-            
-            for chunk in text_chunks:
-                text = chunk["text"]
-                if len(text) < 20:
+def iter_articles(xml_dir: Path, articles_file: Optional[Path] = None):
+    """Iterate articles from JSONL file or XML directory."""
+    if articles_file and articles_file.exists():
+        logger.info("Reading from JSONL: %s", articles_file)
+        with open(articles_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
-                    
-                # Store text for embedding
-                all_chunks_text.append(text)
-                if sparse_encoder is not None:
-                    all_chunks_sparse.append(sparse_encoder.encode_document(text))
-                else:
-                    all_chunks_sparse.append(None)
-                
-                # Create Payload
-                payload = base_payload.copy()
-                payload.update({
-                    "doc_id": doc_id,
-                    "chunk_id": f"{doc_id}_{chunk_index}",
-                    "chunk_index": chunk_index,
-                    "chunk_token_count": chunk["token_count"],
-                    "section_title": section.get("title", ""),
-                    "section_type": section.get("type", "body"),
-                    "page_content": text, # Store chunk text
-                    "is_backmatter_excluded": False,
-                    "full_text": "" # Clear full_text to save space (rely on chunk text)
-                })
-                chunk_metadata.append(payload)
-                chunk_index += 1
-
-    if not all_chunks_text:
-        return [], source_ids
-
-    # Embed all chunks
-    if embedding_provider.use_cloud():
-        for i, text in enumerate(all_chunks_text):
-            payload = chunk_metadata[i]
-            # ID is deterministic based on chunk_id (pmcid_index)
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chunk:{payload['chunk_id']}"))
-            sparse_vector = all_chunks_sparse[i]
-            vector_data: Any = Document(text=text, model=embedding_provider.model)
-            if sparse_vector is not None:
-                vector_data = {"": vector_data, "sparse": sparse_vector}
-            
-            points.append(
-                PointStruct(
-                    id=point_id,
-                    vector=vector_data,
-                    payload=payload,
-                )
-            )
-    else:
-        vectors = embedding_provider.embed_batch(all_chunks_text)
-        for i, vector in enumerate(vectors):
-            payload = chunk_metadata[i]
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chunk:{payload['chunk_id']}"))
-            sparse_vector = all_chunks_sparse[i]
-            vector_data: Any = vector
-            if sparse_vector is not None:
-                vector_data = {"": vector, "sparse": sparse_vector}
-            
-            points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
-
-    return points, source_ids
-
-
-
-def _load_parse_xml_file():
-    script_path = Path(__file__).with_name("02_extract_pmc.py")
-    spec = importlib.util.spec_from_file_location("extract_pmc_script", script_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Could not load parser from 02_extract_pmc.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.parse_xml_file
-
-
-
-def iter_articles_from_jsonl(jsonl_path: Path) -> Iterable[Dict[str, Any]]:
-    with jsonl_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-
-
-def iter_articles_from_xml(xml_dir: Path, delete_source: bool = False) -> Iterable[Dict[str, Any]]:
-    parse_xml_file = _load_parse_xml_file()
-    xml_files = sorted(list(xml_dir.rglob("*.xml")) + list(xml_dir.rglob("*.xml.gz")))
-
-    for path in xml_files:
-        article = parse_xml_file(path)
-        if article:
-            yield article
-            if delete_source:
                 try:
-                    path.unlink(missing_ok=True)
-                except Exception as exc:
-                    logger.debug("Delete failed for %s: %s", path, exc)
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    else:
+        # Fallback to XML processing
+        from scripts.ingestion_utils import parse_pmc_xml
+        logger.info("Reading from XML directory: %s", xml_dir)
+        for xml_path in sorted(xml_dir.rglob("*.xml*")):
+            article = parse_pmc_xml(xml_path)
+            if article:
+                yield article
 
 
-
-def run_ingestion(
-    articles_file: Optional[Path],
-    xml_dir: Optional[Path],
-    delete_source: bool,
-    embedding_provider: EmbeddingProvider,
-) -> None:
+def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provider: EmbeddingProvider) -> None:
     ensure_data_dirs()
-    IngestionConfig.DATA_DIR.mkdir(parents=True, exist_ok=True)
-
+    
     client = QdrantClient(
         url=IngestionConfig.QDRANT_URL,
         api_key=IngestionConfig.QDRANT_API_KEY or None,
         timeout=600,
-        cloud_inference=embedding_provider.use_cloud(),
         prefer_grpc=IngestionConfig.USE_GRPC,
     )
 
@@ -347,15 +278,12 @@ def run_ingestion(
     processed_ids = load_checkpoint()
     logger.info("Already ingested from checkpoint: %s", len(processed_ids))
 
-    if articles_file:
-        article_stream = iter_articles_from_jsonl(articles_file)
-    else:
-        article_stream = iter_articles_from_xml(xml_dir or IngestionConfig.PMC_XML_DIR, delete_source=delete_source)
-
     batch: List[Dict[str, Any]] = []
     inserted = 0
     skipped = 0
     start = time.time()
+
+    article_stream = iter_articles(xml_dir, articles_file)
 
     for article in article_stream:
         source_id = str(article.get("pmcid") or article.get("pmid") or "").strip()
@@ -392,14 +320,11 @@ def run_ingestion(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest PMC into self-hosted Qdrant")
+    parser = argparse.ArgumentParser(description="Ingest PMC into self-hosted Qdrant with improved section/table handling")
     parser.add_argument("--articles-file", type=Path, default=None, help="Path to pre-extracted JSONL")
     parser.add_argument("--xml-dir", type=Path, default=IngestionConfig.PMC_XML_DIR, help="Directory with .xml/.xml.gz")
     parser.add_argument("--delete-source", action="store_true", help="Delete XML file after successful ingestion")
     args = parser.parse_args()
 
-    if args.articles_file is None and not args.xml_dir.exists():
-        raise SystemExit(f"XML directory not found: {args.xml_dir}")
-
-    embedding_provider = EmbeddingProvider()
-    run_ingestion(args.articles_file, args.xml_dir, args.delete_source, embedding_provider=embedding_provider)
+    provider = EmbeddingProvider()
+    run_ingestion(args.xml_dir, args.articles_file, provider)
