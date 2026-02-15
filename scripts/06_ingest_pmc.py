@@ -245,18 +245,32 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
     # 1. Parse all files in this batch
     for xml_path in batch_files:
         try:
+            # Optimization: Fast skip based on filename
+            # PMC files are usually named PMCxxxxxx.xml
+            stem_id = xml_path.stem
+            if xml_path.name.endswith(".xml.gz"):
+                stem_id = stem_id.replace(".xml", "")
+                
+            # Check against checkpoint relative to lock - but `processed_ids` is a set, so generic read is thread-safe enough for hit check
+            # We strictly only need lock for updates, or if we want perfect consistency. 
+            # Given the speed requirement, direct read is better. "set" lookup is atomic in Python CPython.
+            if stem_id in processed_ids:
+                continue
+
             article = parse_pmc_xml(xml_path)
             if not article:
                 continue
                 
             source_id = str(article.get("pmcid") or article.get("pmid") or "").strip()
             
-            # Check against global processed set (with lock for safety if needed, though read overlaps are fine)
-            # strictly speaking, we should check before parsing, but parsing is fast enough
-            with processed_lock:
-                if not source_id or source_id in processed_ids:
-                    continue
-            
+            # Double check with exact ID from content
+            if not source_id:
+                continue
+                
+            if source_id != stem_id and source_id in processed_ids:
+                 continue
+
+            # If we get here, it's a new article
             articles.append(article)
             new_ids.append(source_id)
         except Exception as e:
@@ -288,6 +302,15 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
 
 def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provider: EmbeddingProvider) -> None:
     ensure_data_dirs()
+    
+    # Preload tokenizer once in main thread to avoid race conditions in workers
+    logger.info("Preloading tokenizer...")
+    try:
+        from scripts.ingestion_utils import Chunker
+        Chunker() # This triggers _load_tokenizer with the global lock
+        logger.info("Tokenizer preloaded successfully.")
+    except Exception as e:
+        logger.warning("Tokenizer preload warning: %s", e)
     
     # Qdrant client is thread-safe (connection pooling)
     client = QdrantClient(
