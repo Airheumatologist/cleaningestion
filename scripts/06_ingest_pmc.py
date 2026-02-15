@@ -86,7 +86,154 @@ def append_checkpoint(ids: Iterable[str]) -> None:
             for value in ids:
                 f.write(f"{value}\n")
 
-# ... (create_payload, create_chunks_from_article, build_points remain unchanged) ...
+
+def create_chunks_from_article(article: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Create multiple chunks from an article: sections + tables."""
+    chunks = []
+    doc_id = str(article.get("pmcid") or article.get("pmid") or "")
+    title = article.get("title", "")
+    
+    # 1. Abstract chunk (most important)
+    abstract = article.get("abstract", "")
+    if abstract and len(abstract) > 50:
+        chunks.append({
+            "chunk_id": f"{doc_id}_abstract",
+            "doc_id": doc_id,
+            "text": f"Title: {title}\n\nAbstract: {abstract}",
+            "section_type": "abstract",
+            "section_title": "Abstract",
+            "is_table": False,
+        })
+    
+    # 2. Section chunks
+    sections = article.get("structured_sections", [])
+    for i, section in enumerate(sections):
+        sec_text = section.get("text", "")
+        if len(sec_text) < 50:
+            continue
+            
+        # Section context with title
+        section_context = f"Title: {title}\n\nSection: {section.get('title', 'Body')}\n\n{sec_text}"
+        
+        # Split long sections into smaller chunks (5000 chars each)
+        max_chunk_size = 5000
+        if len(section_context) > max_chunk_size:
+            for j in range(0, len(section_context), max_chunk_size):
+                chunk_text = section_context[j:j+max_chunk_size]
+                chunks.append({
+                    "chunk_id": f"{doc_id}_sec{i}_part{j//max_chunk_size}",
+                    "doc_id": doc_id,
+                    "text": chunk_text,
+                    "section_type": section.get("type", "body"),
+                    "section_title": section.get("title", "Body"),
+                    "is_table": False,
+                })
+        else:
+            chunks.append({
+                "chunk_id": f"{doc_id}_sec{i}",
+                "doc_id": doc_id,
+                "text": section_context,
+                "section_type": section.get("type", "body"),
+                "section_title": section.get("title", "Body"),
+                "is_table": False,
+            })
+    
+    # 3. Table chunks (NEW - embed each table separately)
+    tables = article.get("tables", [])
+    for i, table in enumerate(tables):
+        # Use row-by-row format for better semantic search
+        table_text = table.get("row_by_row", "")
+        caption = table.get("caption", "")
+        
+        if not table_text and table.get("markdown"):
+            # Fallback to markdown if row_by_row not available
+            table_text = table.get("markdown", "")
+        
+        if table_text and len(table_text) > 20:
+            # Create context-rich table text
+            table_context = f"Title: {title}\n\nTable: {caption}\n\n{table_text}"
+            
+            chunks.append({
+                "chunk_id": f"{doc_id}_table{i}",
+                "doc_id": doc_id,
+                "text": table_context[:8000],  # Tables can be long
+                "section_type": "table",
+                "section_title": f"Table: {caption[:100]}",
+                "is_table": True,
+                "table_caption": caption,
+                "table_id": table.get("id", f"table-{i}"),
+            })
+    
+    return chunks
+
+
+def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider) -> tuple[List[PointStruct], List[str]]:
+    chunker = Chunker(
+        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+    )
+    sparse_encoder = None
+    use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
+    if use_sparse and BM25SparseEncoder is not None:
+        sparse_encoder = BM25SparseEncoder(
+            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
+            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
+            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
+            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
+        )
+    
+    points: List[PointStruct] = []
+    all_chunk_ids: List[str] = []
+    
+    # Collect all chunks for batch embedding
+    all_chunks: List[Dict[str, Any]] = []
+    all_texts: List[str] = []
+    
+    for article in batch:
+        chunks = create_chunks_from_article(article)
+        all_chunks.extend(chunks)
+        all_texts.extend([c["text"] for c in chunks])
+    
+    if not all_texts:
+        return [], []
+    
+    # Embed all texts in batch
+    try:
+        vectors = embedding_provider.embed_batch(all_texts)
+    except Exception as e:
+        logger.error("Embedding failed: %s", e)
+        return [], []
+    
+    # Create points
+    for chunk, vector in zip(all_chunks, vectors):
+        chunk_id = chunk["chunk_id"]
+        all_chunk_ids.append(chunk_id)
+        
+        # Create sparse vector if enabled
+        vector_data: Any = vector
+        if sparse_encoder is not None:
+            sparse_vector = sparse_encoder.encode_document(chunk["text"])
+            vector_data = {"": vector, "sparse": sparse_vector}
+        
+        # Create payload
+        payload = {
+            "doc_id": chunk["doc_id"],
+            "chunk_id": chunk_id,
+            "section_type": chunk["section_type"],
+            "section_title": chunk["section_title"],
+            "is_table": chunk.get("is_table", False),
+            "table_caption": chunk.get("table_caption", ""),
+            "source": "pmc",
+            "article_type": "research_article",
+            "text_preview": chunk["text"][:500],
+        }
+        
+        # Create deterministic point ID
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pmc:{chunk_id}"))
+        
+        points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
+    
+    return points, all_chunk_ids
 
 def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, processed_ids: set[str], processed_lock: threading.Lock) -> tuple[int, int]:
     """Process a batch of XML files in a single thread."""
