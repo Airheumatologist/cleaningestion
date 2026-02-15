@@ -12,10 +12,18 @@ cd "$PROJECT_ROOT"
 LOG_FILE="download_pmc.log"
 
 echo "Starting PMC download in background..."
-echo "Logs will be written to: $PROJECT_ROOT/$LOG_FILE"
+# Check for virtual environment
+if [ -f "venv/bin/python3" ]; then
+    PYTHON_CMD="venv/bin/python3"
+elif [ -f ".venv/bin/python3" ]; then
+    PYTHON_CMD=".venv/bin/python3"
+else
+    PYTHON_CMD="python3"
+    echo "Warning: No virtual environment found. Using system python3."
+fi
 
 # Run with nohup, unbuffered output
-nohup python3 -u scripts/01_download_pmc.py > "$LOG_FILE" 2>&1 &
+nohup $PYTHON_CMD -u scripts/01_download_pmc.py > "$LOG_FILE" 2>&1 &
 
 PID=$!
 echo "Process started with PID $PID"
