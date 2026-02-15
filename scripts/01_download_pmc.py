@@ -183,32 +183,52 @@ def download_pmc(output_dir: Path, remote_dir: str, max_files: int | None = None
     
     def process_file(remote_name):
         local_path = output_dir / remote_name
+        marker_path = output_dir / f".{remote_name}.done"
         
-        # Check existence first
-        if local_path.exists() and local_path.stat().st_size > 0:
-            logger.info("Skipping existing: %s", remote_name)
-            return (0, 0) # downloaded, extracted
+        # Check marker first (best for restartability)
+        if marker_path.exists():
+             logger.info("Skipping processed: %s", remote_name)
+             return (0, 0)
 
+        # Check existence of tarball (fallback)
+        if local_path.exists() and local_path.stat().st_size > 0:
+            logger.info("Skipping existing tarball: %s", remote_name)
+            # If tarball exists but no marker, we might need to extract it? 
+            # For now, let's assume if tarball exists it wasn't extracted/deleted yet.
+        
         # Try HTTP first (preferred stability)
         remote_full_path = f"{remote_dir.rstrip('/')}/{remote_name}"
-        if _download_file_http(remote_full_path, local_path):
-            current_downloaded = 1
+        download_success = False
+        
+        if local_path.exists() and local_path.stat().st_size > 0:
+             download_success = True
+        elif _download_file_http(remote_full_path, local_path):
+             download_success = True
         else:
             logger.error("Failed to download %s via HTTP.", remote_name)
             return (0, 0)
         
+        current_downloaded = 1 if download_success and not (local_path.exists() and local_path.stat().st_size > 0) else 0 # simple approximation
+        if not download_success: return (0,0)
+
         current_extracted = 0
         # Extract downloaded archives
         if local_path.exists() and local_path.stat().st_size > 0:
-            if remote_name.endswith('.tar.gz'):
-                extracted = _extract_tar_gz(local_path, output_dir, delete_after=True)
-                current_extracted += extracted
-            elif remote_name.endswith('.xml.gz'):
-                extracted_file = _extract_xml_gz(local_path, delete_after=True)
-                if extracted_file:
-                    current_extracted += 1
+            try:
+                if remote_name.endswith('.tar.gz'):
+                    extracted = _extract_tar_gz(local_path, output_dir, delete_after=True)
+                    current_extracted += extracted
+                elif remote_name.endswith('.xml.gz'):
+                    extracted_file = _extract_xml_gz(local_path, delete_after=True)
+                    if extracted_file:
+                        current_extracted += 1
+                
+                # Create marker file on success
+                marker_path.touch()
+            except Exception as e:
+                logger.error("Failed to extract %s: %s", remote_name, e)
         
-        return (current_downloaded, current_extracted)
+        return (1, current_extracted)
 
     # Use 4 workers for parallel download/extraction
     with ThreadPoolExecutor(max_workers=4) as executor:
