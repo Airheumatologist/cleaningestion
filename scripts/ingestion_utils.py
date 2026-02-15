@@ -51,18 +51,30 @@ class EmbeddingProvider:
             raise RuntimeError("No embedding provider available")
 
     def _embed_cohere(self, texts: List[str]) -> List[List[float]]:
-        """Embed using Cohere API."""
-        try:
-            response = self.cohere_client.embed(
-                texts=texts,
-                model=self.model,
-                input_type="search_document",
-                embedding_types=["float"]
-            )
-            return [embedding for embedding in response.embeddings.float]
-        except Exception as e:
-            logger.error("Cohere embedding failed: %s", e)
-            raise
+        """Embed using Cohere API with batching to respect limits."""
+        all_embeddings = []
+        batch_size = 96  # Cohere v2 limit
+        
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
+            try:
+                response = self.cohere_client.embed(
+                    texts=batch_texts,
+                    model=self.model,
+                    input_type="search_document",
+                    embedding_types=["float"]
+                )
+                if response.embeddings and response.embeddings.float:
+                    all_embeddings.extend(response.embeddings.float)
+                else:
+                    # Fallback or empty?
+                    logger.warning(f"Empty embeddings response for batch {i}")
+                    all_embeddings.extend([[] for _ in batch_texts])
+            except Exception as e:
+                logger.error("Cohere embedding failed for batch %s: %s", i, e)
+                raise
+
+        return all_embeddings
 
 
 # Evidence hierarchy for article types
