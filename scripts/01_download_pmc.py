@@ -139,6 +139,8 @@ def download_pmc(output_dir: Path, remote_dir: str, max_files: int | None = None
 
     # Use a persistent FTP connection with retry logic
     ftp = None
+    downloaded = 0
+    extracted_count = 0
 
     def get_ftp():
         nonlocal ftp
