@@ -13,4 +13,9 @@ services:
       QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?set-in-env-file}
       QDRANT__LOG_LEVEL: INFO
       QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+    # Fix: Increase file descriptor limits for RocksDB
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     command: ["./qdrant", "--config-path", "/qdrant/config/production.yaml"]

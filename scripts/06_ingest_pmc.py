@@ -301,6 +301,8 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
             append_checkpoint(ids)
             processed_ids.update(ids)
             inserted += len(points)
+            # Throttle: small delay to allow RocksDB compaction
+            time.sleep(0.1)
         batch.clear()
 
         if inserted and inserted % (IngestionConfig.BATCH_SIZE * 10) == 0:
