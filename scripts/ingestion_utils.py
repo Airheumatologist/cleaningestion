@@ -14,6 +14,9 @@ import lxml.etree as ET
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
 class EmbeddingProvider:
     """Support for local, Cohere, and cloud inference embeddings."""
     
