@@ -32,38 +32,27 @@ echo "Step 2: Create collection with 1536 dimensions (for Cohere)..."
 python scripts/05_setup_qdrant.py --collection-name rag_pipeline
 echo ""
 
-echo "Step 3: Verify collection configuration..."
-curl -s -H "api-key: ${QDRANT_API_KEY}" \
-  http://localhost:6333/collections/rag_pipeline | python3 -c "
-import json, sys
-d = json.load(sys.stdin)['result']
-print(f\"Vector size: {d['config']['params']['vectors']['size']}\")
-print(f\"Distance: {d['config']['params']['vectors']['distance']}\")
-print(f\"Sparse vectors: {'sparse' in d['config']['params'].get('sparse_vectors', {})}\")
-"
+echo "Step 3: Resetting Data Directories (Full Fresh Start)..."
+# Wipe data directories to ensure a clean slate as requested
+rm -rf /data/ingestion/pmc_xml
+rm -rf /data/ingestion/dailymed
+rm -rf /data/ingestion/pubmed_baseline
+rm -f /data/ingestion/*.jsonl
+rm -f /data/ingestion/*_ingested_ids.txt
+echo "Data directories cleared."
 
 echo ""
-echo "Step 4: Clear ingestion checkpoint..."
-rm -f /data/ingestion/pmc_ingested_ids.txt
-echo "Checkpoint cleared"
+echo "Step 4: Running Complete Ingestion Pipeline (Phase 1: Test with 2 files)..."
+# This script handles downloading PMC, DailyMed, PubMed and ingesting them
+# We limit to 2 files (~15GB extracted) to confirm end-to-end success before full download
+export PMC_MAX_FILES=2
+chmod +x scripts/run_complete_ingestion.sh
+./scripts/run_complete_ingestion.sh
 
 echo ""
-echo "Step 5: Re-ingest PMC data with Cohere embeddings..."
-python scripts/06_ingest_pmc.py --xml-dir /data/ingestion/pmc_xml
-
-echo ""
-echo "Step 6: Ingest DailyMed data..."
-# DailyMed script uses config for paths, defaults to /data/ingestion/dailymed/xml
-python scripts/07_ingest_dailymed.py
-
-echo ""
-echo "Step 7: Ingest PubMed Abstracts..."
-# PubMed script defaults to /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl
-if [ -f "/data/pubmed_baseline/filtered/pubmed_abstracts.jsonl" ]; then
-    python scripts/21_ingest_pubmed_abstracts.py --input /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl
-else
-    echo "PubMed filtered file not found at /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl - skipping"
-fi
+echo "=========================================="
+echo "  Full Reset & Ingestion Complete"
+echo "=========================================="
 
 echo ""
 echo "=========================================="
@@ -73,9 +62,9 @@ curl -s -H "api-key: ${QDRANT_API_KEY}" \
   http://localhost:6333/collections/rag_pipeline | python3 -c "
 import json, sys
 d = json.load(sys.stdin)['result']
-print(f\"Points:  {d['points_count']}\")
-print(f\"Vectors: {d['vectors_count']}\")
-print(f\"Status:  {d['status']}\")
+print(f\"Points:  {d.get('points_count', 'N/A')}\")
+print(f\"Vectors: {d.get('vectors_count', 'N/A')}\")
+print(f\"Status:  {d.get('status', 'N/A')}\")
 print(f\"Vector size: {d['config']['params']['vectors']['size']}\")
 "
 

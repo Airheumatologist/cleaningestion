@@ -65,56 +65,15 @@ print(f'Vector:  {d[\"config\"][\"params\"][\"vectors\"][\"size\"]} dims')
 
 log_step "1A" "PMC Baseline Download"
 echo "Downloading PMC baseline files (several TB)..."
-python3 << 'PYEOF'
-import ftplib
-import logging
-from pathlib import Path
-import time
+# Use the modular download script
+# If PMC_MAX_FILES is set (e.g. to 2), it will limit the download for testing/bootstrapping.
+echo "Running download script (Max files: ${PMC_MAX_FILES:-"ALL"})..."
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-FTP_HOST = "ftp.ncbi.nlm.nih.gov"
-REMOTE_DIR = "/pub/pmc/oa_bulk/oa_comm/xml/"
-OUTPUT_DIR = Path("/data/ingestion/pmc_xml")
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-ftp = ftplib.FTP(FTP_HOST, timeout=300)
-ftp.login()
-ftp.cwd(REMOTE_DIR)
-
-entries = []
-ftp.retrlines('NLST', entries.append)
-
-# Only baseline tar.gz files
-baseline_files = sorted([f for f in entries if 'baseline' in f and f.endswith('.tar.gz')])
-logger.info(f"Found {len(baseline_files)} baseline files to download")
-
-for i, filename in enumerate(baseline_files, 1):
-    local_path = OUTPUT_DIR / filename
-    
-    if local_path.exists() and local_path.stat().st_size > 100000000:  # > 100MB
-        size_gb = local_path.stat().st_size / (1024**3)
-        logger.info(f"[{i}/{len(baseline_files)}] ✓ Already exists ({size_gb:.2f} GB): {filename}")
-        continue
-    
-    logger.info(f"[{i}/{len(baseline_files)}] Downloading: {filename}")
-    start_time = time.time()
-    
-    try:
-        with open(local_path, 'wb') as f:
-            ftp.retrbinary(f'RETR {filename}', f.write)
-        
-        elapsed = time.time() - start_time
-        size_gb = local_path.stat().st_size / (1024**3)
-        speed_mbps = (size_gb * 1024) / (elapsed / 60) if elapsed > 0 else 0
-        logger.info(f"  -> Downloaded {size_gb:.2f} GB in {elapsed/60:.1f} min ({speed_mbps:.1f} MB/s)")
-    except Exception as e:
-        logger.error(f"  -> Failed: {e}")
-
-ftp.quit()
-logger.info("PMC baseline download complete!")
-PYEOF
+if [ -n "$PMC_MAX_FILES" ]; then
+    python scripts/01_download_pmc.py --max-files "$PMC_MAX_FILES"
+else
+    python scripts/01_download_pmc.py
+fi
 
 log_step "1B" "PMC Extraction"
 python scripts/02_extract_pmc.py \
