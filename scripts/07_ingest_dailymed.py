@@ -18,6 +18,7 @@ from qdrant_client.models import Document, PointStruct
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from config_ingestion import IngestionConfig, ensure_data_dirs
+from ingestion_utils import upsert_with_retry
 from src.bm25_sparse import BM25SparseEncoder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -406,21 +407,7 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
     return points, chunk_ids
 
 
-def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
-    for attempt in range(IngestionConfig.MAX_RETRIES):
-        try:
-            client.upsert(
-                collection_name=IngestionConfig.COLLECTION_NAME, 
-                points=points, 
-                wait=True
-            )
-            return
-        except Exception as exc:
-            if attempt == IngestionConfig.MAX_RETRIES - 1:
-                raise
-            wait_time = 2 ** attempt
-            logger.warning("Upsert retry %d/%d after error: %s", attempt + 1, IngestionConfig.MAX_RETRIES, str(exc)[:200])
-            time.sleep(wait_time)
+
 
 
 def process_file_batch(

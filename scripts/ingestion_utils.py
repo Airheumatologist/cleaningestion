@@ -13,6 +13,10 @@ import lxml.etree as ET
 
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+import grpc
+import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -503,3 +507,38 @@ def parse_pmc_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
         logger.debug(f"Error parsing {xml_path}: {e}")
         return None
 
+
+def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
+    """Upsert points with robust retry logic for 'Too many open files'."""
+    for attempt in range(IngestionConfig.MAX_RETRIES):
+        try:
+            client.upsert(
+                collection_name=IngestionConfig.COLLECTION_NAME,
+                points=points,
+                wait=True,
+            )
+            return
+        except Exception as exc:
+            error_str = str(exc)
+            
+            # Check for specific "Too many open files" error (RocksDB/GRPC)
+            is_file_limit = "Too many open files" in error_str
+            
+            if attempt == IngestionConfig.MAX_RETRIES - 1:
+                if is_file_limit:
+                    logger.critical("Failed after retries due to file limit. Server ulimits need increasing.")
+                raise
+            
+            # Backoff strategy
+            if is_file_limit:
+                # Aggressive backoff for file/resource limits
+                wait_for = 30 * (attempt + 1)
+                logger.warning("File limit hit during upsert. Waiting %ss for cleanup... (Attempt %s/%s)", 
+                             wait_for, attempt + 1, IngestionConfig.MAX_RETRIES)
+            else:
+                # Standard exponential backoff
+                wait_for = 2**attempt
+                logger.warning("Upsert retry %s/%s after error: %s", 
+                             attempt + 1, IngestionConfig.MAX_RETRIES, error_str[:200])
+            
+            time.sleep(wait_for)

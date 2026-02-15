@@ -16,7 +16,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Document, PointStruct
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
-from ingestion_utils import Chunker, SectionFilter, EmbeddingProvider
+from ingestion_utils import Chunker, SectionFilter, EmbeddingProvider, upsert_with_retry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -222,21 +222,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     return points, all_chunk_ids
 
 
-def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
-    for attempt in range(IngestionConfig.MAX_RETRIES):
-        try:
-            client.upsert(
-                collection_name=IngestionConfig.COLLECTION_NAME,
-                points=points,
-                wait=True,  # Changed to True for reliability
-            )
-            return
-        except Exception as exc:
-            if attempt == IngestionConfig.MAX_RETRIES - 1:
-                raise
-            wait_for = 2**attempt
-            logger.warning("Upsert retry %s/%s after error: %s", attempt + 1, IngestionConfig.MAX_RETRIES, str(exc)[:200])
-            time.sleep(wait_for)
+
 
 
 def iter_articles(xml_dir: Path, articles_file: Optional[Path] = None):
