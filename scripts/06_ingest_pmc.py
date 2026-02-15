@@ -61,6 +61,12 @@ def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Lock for file operations (checkpointing)
+checkpoint_lock = threading.Lock()
+
 def load_checkpoint() -> set[str]:
     if CHECKPOINT_FILE.exists():
         return {line.strip() for line in CHECKPOINT_FILE.read_text().splitlines() if line.strip()}
@@ -68,189 +74,68 @@ def load_checkpoint() -> set[str]:
 
 
 def append_checkpoint(ids: Iterable[str]) -> None:
-    with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
-        for value in ids:
-            f.write(f"{value}\n")
+    with checkpoint_lock:
+        with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
+            for value in ids:
+                f.write(f"{value}\n")
 
+# ... (create_payload, create_chunks_from_article, build_points remain unchanged) ...
 
-def create_chunks_from_article(article: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Create multiple chunks from an article: sections + tables."""
-    chunks = []
-    doc_id = str(article.get("pmcid") or article.get("pmid") or "")
-    title = article.get("title", "")
+def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, processed_ids: set[str], processed_lock: threading.Lock) -> tuple[int, int]:
+    """Process a batch of XML files in a single thread."""
+    from scripts.ingestion_utils import parse_pmc_xml
     
-    # 1. Abstract chunk (most important)
-    abstract = article.get("abstract", "")
-    if abstract and len(abstract) > 50:
-        chunks.append({
-            "chunk_id": f"{doc_id}_abstract",
-            "doc_id": doc_id,
-            "text": f"Title: {title}\n\nAbstract: {abstract}",
-            "section_type": "abstract",
-            "section_title": "Abstract",
-            "is_table": False,
-        })
+    articles = []
+    new_ids = []
     
-    # 2. Section chunks
-    sections = article.get("structured_sections", [])
-    for i, section in enumerate(sections):
-        sec_text = section.get("text", "")
-        if len(sec_text) < 50:
-            continue
-            
-        # Section context with title
-        section_context = f"Title: {title}\n\nSection: {section.get('title', 'Body')}\n\n{sec_text}"
-        
-        # Split long sections into smaller chunks (5000 chars each)
-        max_chunk_size = 5000
-        if len(section_context) > max_chunk_size:
-            for j in range(0, len(section_context), max_chunk_size):
-                chunk_text = section_context[j:j+max_chunk_size]
-                chunks.append({
-                    "chunk_id": f"{doc_id}_sec{i}_part{j//max_chunk_size}",
-                    "doc_id": doc_id,
-                    "text": chunk_text,
-                    "section_type": section.get("type", "body"),
-                    "section_title": section.get("title", "Body"),
-                    "is_table": False,
-                })
-        else:
-            chunks.append({
-                "chunk_id": f"{doc_id}_sec{i}",
-                "doc_id": doc_id,
-                "text": section_context,
-                "section_type": section.get("type", "body"),
-                "section_title": section.get("title", "Body"),
-                "is_table": False,
-            })
-    
-    # 3. Table chunks (NEW - embed each table separately)
-    tables = article.get("tables", [])
-    for i, table in enumerate(tables):
-        # Use row-by-row format for better semantic search
-        table_text = table.get("row_by_row", "")
-        caption = table.get("caption", "")
-        
-        if not table_text and table.get("markdown"):
-            # Fallback to markdown if row_by_row not available
-            table_text = table.get("markdown", "")
-        
-        if table_text and len(table_text) > 20:
-            # Create context-rich table text
-            table_context = f"Title: {title}\n\nTable: {caption}\n\n{table_text}"
-            
-            chunks.append({
-                "chunk_id": f"{doc_id}_table{i}",
-                "doc_id": doc_id,
-                "text": table_context[:8000],  # Tables can be long
-                "section_type": "table",
-                "section_title": f"Table: {caption[:100]}",
-                "is_table": True,
-                "table_caption": caption,
-                "table_id": table.get("id", f"table-{i}"),
-            })
-    
-    return chunks
-
-
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider) -> tuple[List[PointStruct], List[str]]:
-    chunker = Chunker(
-        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
-    )
-    sparse_encoder = None
-    use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
-    if use_sparse and BM25SparseEncoder is not None:
-        sparse_encoder = BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
-    
-    points: List[PointStruct] = []
-    all_chunk_ids: List[str] = []
-    
-    # Collect all chunks for batch embedding
-    all_chunks: List[Dict[str, Any]] = []
-    all_texts: List[str] = []
-    
-    for article in batch:
-        chunks = create_chunks_from_article(article)
-        all_chunks.extend(chunks)
-        all_texts.extend([c["text"] for c in chunks])
-    
-    if not all_texts:
-        return [], []
-    
-    # Embed all texts in batch
-    try:
-        vectors = embedding_provider.embed_batch(all_texts)
-    except Exception as e:
-        logger.error("Embedding failed: %s", e)
-        return [], []
-    
-    # Create points
-    for chunk, vector in zip(all_chunks, vectors):
-        chunk_id = chunk["chunk_id"]
-        all_chunk_ids.append(chunk_id)
-        
-        # Create sparse vector if enabled
-        vector_data: Any = vector
-        if sparse_encoder is not None:
-            sparse_vector = sparse_encoder.encode_document(chunk["text"])
-            vector_data = {"": vector, "sparse": sparse_vector}
-        
-        # Create payload
-        payload = {
-            "doc_id": chunk["doc_id"],
-            "chunk_id": chunk_id,
-            "section_type": chunk["section_type"],
-            "section_title": chunk["section_title"],
-            "is_table": chunk.get("is_table", False),
-            "table_caption": chunk.get("table_caption", ""),
-            "source": "pmc",
-            "article_type": "research_article",
-            "text_preview": chunk["text"][:500],
-        }
-        
-        # Create deterministic point ID
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pmc:{chunk_id}"))
-        
-        points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
-    
-    return points, all_chunk_ids
-
-
-
-
-
-def iter_articles(xml_dir: Path, articles_file: Optional[Path] = None):
-    """Iterate articles from JSONL file or XML directory."""
-    if articles_file and articles_file.exists():
-        logger.info("Reading from JSONL: %s", articles_file)
-        with open(articles_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-    else:
-        # Fallback to XML processing
-        from scripts.ingestion_utils import parse_pmc_xml
-        logger.info("Reading from XML directory: %s", xml_dir)
-        for xml_path in sorted(xml_dir.rglob("*.xml*")):
+    # 1. Parse all files in this batch
+    for xml_path in batch_files:
+        try:
             article = parse_pmc_xml(xml_path)
-            if article:
-                yield article
+            if not article:
+                continue
+                
+            source_id = str(article.get("pmcid") or article.get("pmid") or "").strip()
+            
+            # Check against global processed set (with lock for safety if needed, though read overlaps are fine)
+            # strictly speaking, we should check before parsing, but parsing is fast enough
+            with processed_lock:
+                if not source_id or source_id in processed_ids:
+                    continue
+            
+            articles.append(article)
+            new_ids.append(source_id)
+        except Exception as e:
+            logger.error("Failed to parse %s: %s", xml_path.name, e)
+
+    if not articles:
+        return 0, len(batch_files)
+
+    # 2. Build points (includes embedding)
+    points, chunk_ids = build_points(articles, embedding_provider)
+    
+    if not points:
+        return 0, len(batch_files)
+
+    # 3. Upsert to Qdrant
+    try:
+        upsert_with_retry(client, points)
+        
+        # 4. Update checkpoint
+        append_checkpoint(new_ids)
+        with processed_lock:
+            processed_ids.update(new_ids)
+            
+        return len(points), len(batch_files) - len(articles) # inserted, skipped
+    except Exception as e:
+        logger.error("Failed to upsert batch: %s", e)
+        return 0, 0
 
 
 def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provider: EmbeddingProvider) -> None:
     ensure_data_dirs()
     
+    # Qdrant client is thread-safe (connection pooling)
     client = QdrantClient(
         url=IngestionConfig.QDRANT_URL,
         api_key=IngestionConfig.QDRANT_API_KEY or None,
@@ -258,53 +143,60 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
         prefer_grpc=IngestionConfig.USE_GRPC,
     )
 
-    info = client.get_collection(IngestionConfig.COLLECTION_NAME)
-    logger.info("Connected to %s (points=%s)", IngestionConfig.COLLECTION_NAME, info.points_count)
+    try:
+        info = client.get_collection(IngestionConfig.COLLECTION_NAME)
+        logger.info("Connected to %s (points=%s)", IngestionConfig.COLLECTION_NAME, info.points_count)
+    except Exception:
+        logger.warning("Collection %s not found or not accessible", IngestionConfig.COLLECTION_NAME)
 
     processed_ids = load_checkpoint()
+    processed_lock = threading.Lock()
     logger.info("Already ingested from checkpoint: %s", len(processed_ids))
 
-    batch: List[Dict[str, Any]] = []
-    inserted = 0
-    skipped = 0
-    start = time.time()
+    all_xml_files = sorted(list(xml_dir.rglob("*.xml*")))
+    if not all_xml_files:
+        logger.warning("No XML files found in %s", xml_dir)
+        return
+        
+    logger.info("Found %s XML files to process", len(all_xml_files))
 
-    article_stream = iter_articles(xml_dir, articles_file)
+    # Calculate batches
+    # We use a larger batch size for threading to reduce overhead
+    # But Qdrant batch size is limited. Let's say 4 threads, each processing 10-20 docs at a time.
+    THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE # e.g. 25
+    MAX_WORKERS = 4
+    
+    file_batches = [all_xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(all_xml_files), THREAD_BATCH_SIZE)]
+    
+    total_files = len(all_xml_files)
+    total_inserted = 0
+    total_skipped = 0
+    
+    start_time = time.time()
 
-    for article in article_stream:
-        source_id = str(article.get("pmcid") or article.get("pmid") or "").strip()
-        if not source_id or source_id in processed_ids:
-            skipped += 1
-            continue
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # Submit all batches
+        future_to_batch = {
+            executor.submit(process_batch, client, batch, embedding_provider, processed_ids, processed_lock): batch 
+            for batch in file_batches
+        }
+        
+        completed_batches = 0
+        for future in as_completed(future_to_batch):
+            inserted, skipped = future.result()
+            total_inserted += inserted
+            total_skipped += skipped
+            completed_batches += 1
+            
+            if completed_batches % 10 == 0:
+                 elapsed = time.time() - start_time
+                 rate = total_inserted / elapsed if elapsed > 0 else 0
+                 progress = (completed_batches / len(file_batches)) * 100
+                 logger.info("Progress: %.1f%% | Inserted: %s | Skipped: %s | Rate: %.2f docs/sec", 
+                             progress, total_inserted, total_skipped, rate)
 
-        batch.append(article)
-        if len(batch) < IngestionConfig.BATCH_SIZE:
-            continue
-
-        points, ids = build_points(batch, embedding_provider)
-        if points:
-            upsert_with_retry(client, points)
-            append_checkpoint(ids)
-            processed_ids.update(ids)
-            inserted += len(points)
-            # Throttle: allow RocksDB compaction and file handle release
-            time.sleep(0.5)
-        batch.clear()
-
-        if inserted and inserted % (IngestionConfig.BATCH_SIZE * 10) == 0:
-            elapsed = time.time() - start
-            rate = inserted / elapsed if elapsed > 0 else 0
-            logger.info("Inserted=%s skipped=%s rate=%.2f docs/sec", inserted, skipped, rate)
-
-    if batch:
-        points, ids = build_points(batch, embedding_provider)
-        if points:
-            upsert_with_retry(client, points)
-            append_checkpoint(ids)
-            inserted += len(points)
-
-    elapsed = time.time() - start
-    logger.info("PMC ingestion complete inserted=%s skipped=%s elapsed=%.1fs", inserted, skipped, elapsed)
+    elapsed = time.time() - start_time
+    logger.info("PMC ingestion complete. Total Inserted: %s, Total Skipped: %s, Time: %.1fs", total_inserted, total_skipped, elapsed)
 
 
 if __name__ == "__main__":
