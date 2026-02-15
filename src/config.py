@@ -45,23 +45,13 @@ LLM_TOP_P = 0.9  # Nucleus sampling threshold
 FALLBACK_LLM_MODEL = "deepseek-ai/DeepSeek-V3.2"
 FALLBACK_LLM_ENABLED = True
 
-# Legacy OpenAI (for backward compatibility)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = "gpt-5-nano"  # GPT-5 Nano model
-
-# =============================================================================
-# Groq LLM Configuration (legacy)
-# =============================================================================
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = "llama-3.1-8b-instant"  # Fast and cost-effective
-
 # =============================================================================
 # Embedding Model Configuration
 # =============================================================================
-# Provider: "cohere" (API, default) or "local" (needs GPU) or "qdrant_cloud_inference"
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "cohere").strip().lower()
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "embed-v4.0")
-EMBEDDING_DIMENSION = 1024  # Cohere embed-v4.0 supports 256/512/1024/1536; we use 1024
+# Provider: "deepinfra" (default), "local", or "qdrant_cloud_inference"
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra").strip().lower()
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B-batch")
+EMBEDDING_DIMENSION = 1024  # Qwen/Qwen3-Embedding-0.6B output dimension
 
 # SPLADE Sparse Vector Configuration
 SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
@@ -90,10 +80,9 @@ FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "100"))
 # =============================================================================
 # Reranker Configuration
 # =============================================================================
-# Provider: "cohere" (API, default) or "cross-encoder" (self-hosted, needs GPU)
-RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "cohere").strip().lower()
-RERANKER_MODEL = os.getenv("RERANKER_MODEL", "mixedbread-ai/mxbai-rerank-large-v2")
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+# Provider: "deepinfra" (default) or "cross-encoder" (self-hosted)
+RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "deepinfra").strip().lower()
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
 
 # =============================================================================
 # Query Preprocessing Configuration
@@ -127,8 +116,6 @@ def validate_config():
         errors.append("QDRANT_API_KEY not set in .env")
     if not DEEPINFRA_API_KEY:
         errors.append("DEEPINFRA_API_KEY not set")
-    if RERANKER_PROVIDER == "cohere" and not COHERE_API_KEY:
-        errors.append("COHERE_API_KEY not set in .env (required when RERANKER_PROVIDER=cohere)")
 
     if errors:
         raise ValueError(

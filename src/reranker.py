@@ -15,12 +15,12 @@ import pandas as pd
 from anyascii import anyascii
 import yaml
 
-try:
-    import cohere
-except ImportError:
-    cohere = None
 
-from .config import COHERE_API_KEY, RERANKER_PROVIDER, RERANKER_MODEL
+import requests
+from .config import (
+    RERANKER_PROVIDER, RERANKER_MODEL,
+    DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL
+)
 
 # Try to import medical entity expander for entity matching
 try:
@@ -337,91 +337,65 @@ class CrossEncoderReranker(AbstractReranker):
 
 
 # =============================================================================
-# Cohere Reranker (API-based alternative)
+# DeepInfra Reranker (OpenAI-compatible / Custom API)
 # =============================================================================
 
-class CohereReranker(AbstractReranker):
+class DeepInfraReranker(AbstractReranker):
     """
-    Cohere-based reranker as substitute for ScholarQA's CrossEncoder.
-    
-    Uses Cohere rerank-v4-fast for better throughput in production.
-    Formats documents as YAML for optimal reranking performance.
+    Reranker using DeepInfra's rerank endpoint (Jina/Qwen/BGE models).
     """
     
-    def __init__(self, model: str = "rerank-v4-fast"):
-        if not COHERE_API_KEY:
-            raise ValueError("COHERE_API_KEY not set")
-        if cohere is None:
-            raise ValueError("cohere package not installed. Run: pip install cohere")
-        
-        self.client = cohere.ClientV2(api_key=COHERE_API_KEY)
-        self.model = model
-        logger.info(f"✅ Cohere Reranker initialized with {model}")
-    
+    def __init__(self, model: str = None):
+        self.model = model or "Qwen/Qwen3-Reranker-0.6B"
+        if not DEEPINFRA_API_KEY:
+            raise ValueError("DEEPINFRA_API_KEY not set")
+        self.api_key = DEEPINFRA_API_KEY
+        # DeepInfra uses a specific rerank endpoint, not standard OpenAI
+        self.api_url = "https://api.deepinfra.com/v1/rerank"
+        logger.info(f"✅ DeepInfra Reranker initialized with {self.model}")
+
     def get_scores(self, query: str, documents: List[str], top_n: Optional[int] = None) -> List[float]:
         """
-        Get relevance scores for documents.
-        
-        Formats documents as YAML for optimal performance (Cohere best practice).
-        
-        Args:
-            query: Search query
-            documents: List of document strings (can be plain text or YAML)
-            top_n: Number of top docs to score/return from provider
-            
-        Returns:
-            List of relevance scores
+        Get relevance scores for documents using DeepInfra API.
         """
         if not documents:
             return []
+
+        # DeepInfra allows strict top_n, but we want scores for all if possible
+        # or at least the top ones.
+        n_docs = len(documents)
         
         try:
-            response = self.client.rerank(
-                model=self.model,
-                query=query,
-                documents=documents,
-                top_n=top_n or len(documents),
-                max_tokens_per_doc=1024,
-            )
+            payload = {
+                "model": self.model,
+                "query": query,
+                "documents": documents,
+                "top_n": top_n or n_docs,
+                "return_documents": False
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            results = response.json().get("results", [])
             
             # Create score array indexed by original position
-            scores = [0.0] * len(documents)
-            for result in response.results:
-                scores[result.index] = result.relevance_score
+            scores = [0.0] * n_docs
+            for res in results:
+                idx = res.get("index")
+                score = res.get("relevance_score", 0.0)
+                if idx is not None and 0 <= idx < n_docs:
+                    scores[idx] = score
             
             return scores
             
         except Exception as e:
-            logger.error(f"Cohere reranking failed: {e}")
-            # Return default scores
-            return [0.5] * len(documents)
-    
-    def format_document_as_yaml(self, title: str, content: str, abstract: str = "") -> str:
-        """
-        Format document as YAML string for optimal Cohere reranking.
-        
-        Args:
-            title: Document title
-            content: Document content (abstract or full text)
-            abstract: Optional abstract (if content is full text)
-            
-        Returns:
-            YAML-formatted string
-        """
-        import yaml
-        
-        doc_dict = {
-            "Title": title,
-        }
-        
-        if abstract:
-            doc_dict["Abstract"] = abstract
-            doc_dict["Content"] = content
-        else:
-            doc_dict["Content"] = content
-        
-        return yaml.dump(doc_dict, sort_keys=False, allow_unicode=True)
-
+            logger.error(f"DeepInfra reranking failed: {e}")
+            return [0.5] * n_docs
 
 # =============================================================================
 # Paper Finder with Reranker (matches ScholarQA's PaperFinderWithReranker)
@@ -432,7 +406,7 @@ class PaperFinderWithReranker:
     ScholarQA-style paper finder with reranking.
     
     Flow:
-    1. Rerank passages using Cohere
+    1. Rerank passages using Cohere/DeepInfra/CrossEncoder
     2. Aggregate passages to paper level (max score)
     3. Format into DataFrame with reference strings
     """
@@ -453,8 +427,8 @@ class PaperFinderWithReranker:
         """
         if reranker is not None:
             self.reranker_engine = reranker
-        elif RERANKER_PROVIDER == "cohere":
-            self.reranker_engine = CohereReranker()
+        elif RERANKER_PROVIDER == "deepinfra":
+            self.reranker_engine = DeepInfraReranker(model=RERANKER_MODEL)
         else:
             self.reranker_engine = CrossEncoderReranker()
         

@@ -22,7 +22,8 @@ from .config import (
     EMBEDDING_MODEL, EMBEDDING_PROVIDER, QDRANT_CLOUD_INFERENCE, QDRANT_TIMEOUT, 
     QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY, USE_HYBRID_SEARCH,
     SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
-    SPARSE_REMOVE_STOPWORDS, COHERE_API_KEY,
+    SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
+    SPARSE_REMOVE_STOPWORDS, DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL
 )
 from .bm25_sparse import BM25SparseEncoder
 
@@ -116,15 +117,18 @@ class QdrantRetriever(AbstractRetriever):
         self.score_threshold = score_threshold
 
         # Initialize embedding backend based on provider
-        self.cohere_client = None
         self.local_encoder = None
+        self.openai_client = None
 
-        if self.embedding_provider == "cohere":
-            if COHERE_AVAILABLE and COHERE_API_KEY:
-                self.cohere_client = cohere_sdk.ClientV2(api_key=COHERE_API_KEY)
-                logger.info("✅ Cohere embedding initialized (model: %s)", EMBEDDING_MODEL)
-            else:
-                raise ValueError("Cohere embedding requires cohere package and COHERE_API_KEY")
+        if self.embedding_provider == "deepinfra":
+            from openai import OpenAI
+            if not DEEPINFRA_API_KEY:
+                raise ValueError("DEEPINFRA_API_KEY not set in config")
+            self.openai_client = OpenAI(
+                api_key=DEEPINFRA_API_KEY,
+                base_url=DEEPINFRA_BASE_URL
+            )
+            logger.info("✅ DeepInfra embedding initialized (model: %s)", EMBEDDING_MODEL)
         elif self.embedding_provider == "local":
             if LOCAL_EMBEDDINGS_AVAILABLE:
                 try:
@@ -209,17 +213,17 @@ class QdrantRetriever(AbstractRetriever):
         suitable for passing to client.query_points(query=...).
         Returns None if no embedding method is available.
         """
-        if self.embedding_provider == "cohere" and self.cohere_client is not None:
+        
+        if self.embedding_provider == "deepinfra" and self.openai_client is not None:
             try:
-                response = self.cohere_client.embed(
-                    texts=[query],
+                response = self.openai_client.embeddings.create(
                     model=self.embedding_model,
-                    input_type="search_query",
-                    embedding_types=["float"],
+                    input=[query],
+                    encoding_format="float"
                 )
-                return list(response.embeddings.float_[0])
+                return response.data[0].embedding
             except Exception as e:
-                logger.error(f"Cohere query embedding failed: {e}")
+                logger.error(f"DeepInfra query embedding failed: {e}")
                 return None
 
         if self.embedding_provider == "qdrant_cloud_inference":

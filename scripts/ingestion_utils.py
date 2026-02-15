@@ -28,15 +28,18 @@ class EmbeddingProvider:
         self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
         self.model = IngestionConfig.EMBEDDING_MODEL
         self.local_encoder = None
-        self.cohere_client = None
+        self.openai_client = None
 
-        if self.provider == "cohere":
-            import cohere
-            api_key = IngestionConfig.COHERE_API_KEY
+        if self.provider == "deepinfra":
+            from openai import OpenAI
+            api_key = os.getenv("DEEPINFRA_API_KEY")
             if not api_key:
-                raise ValueError("COHERE_API_KEY not set - required for cohere embedding provider")
-            self.cohere_client = cohere.ClientV2(api_key=api_key)
-            logger.info("✅ Cohere embedding provider initialized (model: %s)", self.model)
+                raise ValueError("DEEPINFRA_API_KEY not set - required for deepinfra embedding provider")
+            self.openai_client = OpenAI(
+                api_key=api_key,
+                base_url="https://api.deepinfra.com/v1/openai"
+            )
+            logger.info("✅ DeepInfra embedding provider initialized (model: %s)", self.model)
         elif self.provider == "local":
             from sentence_transformers import SentenceTransformer
             logger.info("Loading local embedding model: %s", self.model)
@@ -46,39 +49,30 @@ class EmbeddingProvider:
         return self.provider == "qdrant_cloud_inference"
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        if self.provider == "cohere":
-            return self._embed_cohere(texts)
+        if self.provider == "deepinfra":
+            return self._embed_deepinfra(texts)
         elif self.local_encoder is not None:
             vectors = self.local_encoder.encode(texts, normalize_embeddings=True, batch_size=IngestionConfig.EMBEDDING_BATCH_SIZE)
             return [v.tolist() for v in vectors]
         else:
             raise RuntimeError("No embedding provider available")
 
-    def _embed_cohere(self, texts: List[str]) -> List[List[float]]:
-        """Embed using Cohere API with batching to respect limits."""
-        all_embeddings = []
-        batch_size = 96  # Cohere v2 limit
-        
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            try:
-                response = self.cohere_client.embed(
-                    texts=batch_texts,
-                    model=self.model,
-                    input_type="search_document",
-                    embedding_types=["float"]
-                )
-                if response.embeddings and response.embeddings.float:
-                    all_embeddings.extend(response.embeddings.float)
-                else:
-                    # Fallback or empty?
-                    logger.warning(f"Empty embeddings response for batch {i}")
-                    all_embeddings.extend([[] for _ in batch_texts])
-            except Exception as e:
-                logger.error("Cohere embedding failed for batch %s: %s", i, e)
-                raise
 
         return all_embeddings
+
+    def _embed_deepinfra(self, texts: List[str]) -> List[List[float]]:
+        """Embed using DeepInfra OpenAI-compatible API."""
+        try:
+            response = self.openai_client.embeddings.create(
+                model=self.model,
+                input=texts,
+                encoding_format="float"
+            )
+            # Maintain order
+            return [data.embedding for data in response.data]
+        except Exception as e:
+            logger.error("DeepInfra embedding failed: %s", e)
+            raise
 
 
 # Evidence hierarchy for article types
@@ -133,13 +127,15 @@ class SectionFilter:
 
 
 class Chunker:
-    def __init__(self, chunk_size: int = 384, overlap: int = 64):
+    def __init__(self, chunk_size: int = 512, overlap: int = 128):
         self.chunk_size = chunk_size
         self.overlap = overlap
         try:
             from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained("mixedbread-ai/mxbai-embed-large-v1")
-        except Exception:
+            # Use Qwen2.5-0.5B tokenizer as proxy for Qwen3 if exact model is heavy to load
+            self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
+        except Exception as e:
+            logger.warning(f"Failed to load tokenizer (Qwen/Qwen2.5-0.5B): {e}")
             self.tokenizer = None
             
     def chunk_text(self, text: str) -> List[Dict[str, Any]]:
