@@ -34,8 +34,8 @@ QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
 # LLM Configuration (DeepInfra)
 # =============================================================================
 DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
-DEEPINFRA_MODEL = "nvidia/Nemotron-3-Nano-30B-A3B"  # NVIDIA Nemotron 3 Nano model via DeepInfra
-DEEPINFRA_BASE_URL = "https://api.deepinfra.com/v1/openai"
+DEEPINFRA_MODEL = os.getenv("DEEPINFRA_MODEL", "nvidia/Nemotron-3-Nano-30B-A3B")
+DEEPINFRA_BASE_URL = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
 
 # LLM Generation Parameters
 LLM_TEMPERATURE = 0.7  # Controls randomness (0=deterministic, 1=creative)
