@@ -37,11 +37,12 @@ def _iter_remote_files(ftp: ftplib.FTP, max_files: int | None = None) -> Iterabl
 
 
 def _download_file_http(remote_path: str, local_path: Path, chunk_size: int = 1024 * 1024) -> bool:
-    """Download file via HTTP (S3), returning True if successful."""
-    # Map FTP path to S3 URL: /pub/pmc/oa_bulk/oa_comm/xml/ -> /oa_comm/xml/
-    # Effectively remove /pub/pmc/oa_bulk from start if present
-    rel_path = remote_path.replace("/pub/pmc/oa_bulk", "")
-    url = f"{S3_BASE_URL}{rel_path}"
+    """Download file via HTTP (NCBI), returning True if successful."""
+    # Construct NCBI HTTP URL from FTP path
+    # FTP path: /pub/pmc/oa_bulk/oa_comm/xml/filename.tar.gz
+    # HTTP URL: https://ftp.ncbi.nlm.nih.gov/pub/pmc/oa_bulk/oa_comm/xml/filename.tar.gz
+    
+    url = f"https://ftp.ncbi.nlm.nih.gov{remote_path}"
     
     try:
         logger.info("Downloading via HTTP: %s", url)
@@ -136,15 +137,28 @@ def _extract_xml_gz(gz_path: Path, delete_after: bool = True) -> Path | None:
 def download_pmc(output_dir: Path, remote_dir: str, max_files: int | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Connecting to %s for listing", FTP_HOST)
-    ftp = ftplib.FTP(FTP_HOST, timeout=120)
-    ftp.login()
-    ftp.cwd(remote_dir)
+    # Use a persistent FTP connection with retry logic
+    ftp = None
 
-    downloaded = 0
-    extracted_count = 0
+    def get_ftp():
+        nonlocal ftp
+        try:
+            if ftp:
+                ftp.voidcmd("NOOP")
+        except:
+            ftp = None
+        
+        if not ftp:
+            logger.info("Connecting to %s...", FTP_HOST)
+            ftp = ftplib.FTP(FTP_HOST, timeout=120)
+            ftp.login()
+            ftp.cwd(remote_dir)
+        return ftp
+
     try:
-        files = list(_iter_remote_files(ftp, max_files=max_files))
+        # Initial connection to list files
+        ftp_conn = get_ftp()
+        files = list(_iter_remote_files(ftp_conn, max_files=max_files))
         logger.info("Found %s files in %s", len(files), remote_dir)
         
         for idx, remote_name in enumerate(files, start=1):
@@ -155,15 +169,13 @@ def download_pmc(output_dir: Path, remote_dir: str, max_files: int | None = None
             if local_path.exists() and local_path.stat().st_size > 0:
                 logger.info("Skipping existing: %s", remote_name)
             else:
-                # Try HTTP first
+                # Try HTTP first (preferred stability)
                 remote_full_path = f"{remote_dir.rstrip('/')}/{remote_name}"
                 if _download_file_http(remote_full_path, local_path):
                     downloaded += 1
                 else:
-                    # Fallback to FTP
-                    logger.info("Falling back to FTP for %s", remote_name)
-                    _download_file_ftp(ftp, remote_name, local_path)
-                    downloaded += 1
+                     logger.error("Failed to download %s via HTTP. Skipping FTP fallback to avoid timeouts.", remote_name)
+                     # FTP fallback removed as requested for stability - HTTP should work
             
             # Extract downloaded archives
             if local_path.exists() and local_path.stat().st_size > 0:
@@ -175,7 +187,11 @@ def download_pmc(output_dir: Path, remote_dir: str, max_files: int | None = None
                     if extracted_file:
                         extracted_count += 1
     finally:
-        ftp.quit()
+        if ftp:
+            try:
+                ftp.quit()
+            except:
+                pass
 
     logger.info("Download complete. Files downloaded: %s", downloaded)
     logger.info("Extraction complete. XML files extracted: %s", extracted_count)
