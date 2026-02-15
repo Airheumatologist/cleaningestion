@@ -328,7 +328,7 @@ def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingPro
             if points:
                 upsert_with_retry(client, points)
                 inserted += len(points)
-                time.sleep(0.1)  # Throttle: allow RocksDB compaction
+                time.sleep(0.5)  # Throttle: allow RocksDB compaction
             batch.clear()
 
         if batch:

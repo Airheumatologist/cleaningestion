@@ -38,8 +38,9 @@ class IngestionConfig:
     DAILYMED_XML_DIR = Path(os.getenv("DAILYMED_XML_DIR", str(DATA_DIR / "dailymed" / "xml")))
 
     # Tuning
-    # Reduced from 100 to 50 to prevent "too many open files" errors with RocksDB
-    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
+    # Reduced from 100 to 25 to prevent "too many open files" errors with RocksDB
+    # Each batch creates many chunks; smaller batches = fewer open files
+    BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
     EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
     MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.getenv("PARALLEL_WORKERS", "8")))
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
