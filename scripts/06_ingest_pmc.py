@@ -168,39 +168,49 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
     logger.info("Found %s XML files to process", len(all_xml_files))
 
     # Calculate batches
-    # We use a larger batch size for threading to reduce overhead
-    # But Qdrant batch size is limited. Let's say 4 threads, each processing 10-20 docs at a time.
     THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE # e.g. 25
     MAX_WORKERS = 4
     
+    # Create batches generator/list
     file_batches = [all_xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(all_xml_files), THREAD_BATCH_SIZE)]
+    total_batches = len(file_batches)
     
-    total_files = len(all_xml_files)
     total_inserted = 0
     total_skipped = 0
+    completed_batches = 0
     
     start_time = time.time()
+    
+    # Process in "super-batches" to avoid overloading the executor queue with 100k+ tasks
+    # Submit 1000 batches at a time
+    SUPER_BATCH_SIZE = 1000 
+    
+    logger.info("Processing in super-batches of %s (total batches: %s)", SUPER_BATCH_SIZE, total_batches)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all batches
-        future_to_batch = {
-            executor.submit(process_batch, client, batch, embedding_provider, processed_ids, processed_lock): batch 
-            for batch in file_batches
-        }
-        
-        completed_batches = 0
-        for future in as_completed(future_to_batch):
-            inserted, skipped = future.result()
-            total_inserted += inserted
-            total_skipped += skipped
-            completed_batches += 1
+        for i in range(0, total_batches, SUPER_BATCH_SIZE):
+            current_super_batch = file_batches[i : i + SUPER_BATCH_SIZE]
             
-            if completed_batches % 10 == 0:
-                 elapsed = time.time() - start_time
-                 rate = total_inserted / elapsed if elapsed > 0 else 0
-                 progress = (completed_batches / len(file_batches)) * 100
-                 logger.info("Progress: %.1f%% | Inserted: %s | Skipped: %s | Rate: %.2f docs/sec", 
-                             progress, total_inserted, total_skipped, rate)
+            future_to_batch = {
+                executor.submit(process_batch, client, batch, embedding_provider, processed_ids, processed_lock): batch 
+                for batch in current_super_batch
+            }
+            
+            for future in as_completed(future_to_batch):
+                inserted, skipped = future.result()
+                total_inserted += inserted
+                total_skipped += skipped
+                completed_batches += 1
+                
+                if completed_batches % 10 == 0:
+                     elapsed = time.time() - start_time
+                     rate = total_inserted / elapsed if elapsed > 0 else 0
+                     progress = (completed_batches / total_batches) * 100
+                     logger.info("Progress: %.1f%% | Inserted: %s | Skipped: %s | Rate: %.2f docs/sec", 
+                                 progress, total_inserted, total_skipped, rate)
+            
+            # Optional: explicit garbage collection if memory is tight
+            future_to_batch.clear()
 
     elapsed = time.time() - start_time
     logger.info("PMC ingestion complete. Total Inserted: %s, Total Skipped: %s, Time: %.1fs", total_inserted, total_skipped, elapsed)
