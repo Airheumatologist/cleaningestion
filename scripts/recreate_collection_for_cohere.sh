@@ -52,6 +52,20 @@ echo "Step 5: Re-ingest PMC data with Cohere embeddings..."
 python scripts/06_ingest_pmc.py --xml-dir /data/ingestion/pmc_xml
 
 echo ""
+echo "Step 6: Ingest DailyMed data..."
+# DailyMed script uses config for paths, defaults to /data/ingestion/dailymed/xml
+python scripts/07_ingest_dailymed.py
+
+echo ""
+echo "Step 7: Ingest PubMed Abstracts..."
+# PubMed script defaults to /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl
+if [ -f "/data/pubmed_baseline/filtered/pubmed_abstracts.jsonl" ]; then
+    python scripts/21_ingest_pubmed_abstracts.py --input /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl
+else
+    echo "PubMed filtered file not found at /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl - skipping"
+fi
+
+echo ""
 echo "=========================================="
 echo "  Final Collection Stats"
 echo "=========================================="
