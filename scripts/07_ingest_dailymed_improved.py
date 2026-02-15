@@ -7,10 +7,11 @@ import argparse
 import logging
 import time
 import uuid
-import xml.etree.ElementTree as ET
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import lxml.etree as ET
 from qdrant_client import QdrantClient
 from qdrant_client.models import Document, PointStruct
 
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "dailymed_ingested_improved_ids.txt"
 NS = {"hl7": "urn:hl7-org:v3"}
 
+# Standard sections we want to identify specifically
 SECTION_CODES = {
     "34067-9": ("indications", "Indications and Usage"),
     "34070-3": ("contraindications", "Contraindications"),
@@ -41,7 +43,6 @@ SECTION_CODES = {
     "34072-9": ("storage", "Storage and Handling"),
     "51727-6": ("supply", "Supply Information"),
 }
-
 
 class EmbeddingProvider:
     """Support for local, Cohere, and cloud inference embeddings."""
@@ -95,95 +96,160 @@ def get_text(element: Optional[ET.Element]) -> str:
     """Extract all text from element."""
     if element is None:
         return ""
-    return " ".join(element.itertext()).strip()
+    return " ".join(element.xpath(".//text()")).strip()
 
 
-def parse_table(table_elem: ET.Element) -> str:
-    """Parse an HTML table to a readable text format."""
+def parse_table_to_markdown(table_elem: ET.Element) -> str:
+    """Parse an HTML table to Markdown format, handling colspans and rowspans."""
     if table_elem is None:
         return ""
-    
+
     rows = []
-    for tr in table_elem.findall(".//hl7:tr", NS):
-        row = []
-        for cell in tr.findall("hl7:th|hl7:td", NS):
-            cell_text = " ".join(cell.itertext()).strip()
-            row.append(cell_text)
-        if row:
-            rows.append(" | ".join(row))
+    # Find all rows (thead and tbody)
+    # Note: SPL tables often use thead/tbody, but sometimes just trs directly
+    tr_elements = table_elem.xpath(".//hl7:tr", namespaces=NS)
     
-    return "\n".join(rows)
+    if not tr_elements:
+        return ""
+
+    # Calculate max columns to normalize table width
+    max_cols = 0
+    parsed_rows = []
+
+    for tr in tr_elements:
+        row_cells = []
+        cells = tr.xpath("hl7:th|hl7:td", namespaces=NS)
+        for cell in cells:
+            cell_text = get_text(cell).replace("\n", " ").strip()
+            # Handle colspan (default to 1)
+            colspan = int(cell.get("colspan", "1"))
+            # We don't perfectly handle rowspan in markdown, but we can fill empty cells or just repeat
+            # For simplicity in RAG, repeating the value or leaving blank is often okay.
+            # Here we just expand colspan.
+            row_cells.append(cell_text)
+            for _ in range(colspan - 1):
+                row_cells.append("") # Empty cell for skipped col
+        
+        parsed_rows.append(row_cells)
+        max_cols = max(max_cols, len(row_cells))
+
+    # Build Markdown
+    md_lines = []
+    
+    # Header
+    if parsed_rows:
+        header_row = parsed_rows[0]
+        # Ensure header has max_cols
+        header_row.extend([""] * (max_cols - len(header_row)))
+        md_lines.append("| " + " | ".join(header_row) + " |")
+        md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
+        
+        # Body
+        for row in parsed_rows[1:]:
+            row.extend([""] * (max_cols - len(row)))
+            md_lines.append("| " + " | ".join(row) + " |")
+
+    return "\n".join(md_lines)
 
 
 def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
-    """Parse DailyMed SPL XML file with full section and table extraction."""
+    """Parse DailyMed SPL XML file with full section and table extraction using lxml."""
     try:
-        tree = ET.parse(xml_path)
+        tree = ET.parse(str(xml_path))
         root = tree.getroot()
 
-        set_id_elem = root.find(".//hl7:setId", NS)
-        set_id = set_id_elem.get("root", "") if set_id_elem is not None else ""
+        set_id_elem = root.xpath(".//hl7:setId", namespaces=NS)
+        set_id = set_id_elem[0].get("root", "") if set_id_elem else ""
         if not set_id:
             set_id = xml_path.stem
 
-        title = get_text(root.find(".//hl7:title", NS))
+        title_elem = root.xpath(".//hl7:title", namespaces=NS)
+        title = get_text(title_elem[0]) if title_elem else ""
 
         # Drug name
         drug_name = title
-        name_elem = root.find(".//hl7:manufacturedProduct/hl7:manufacturedProduct/hl7:name", NS)
-        if name_elem is not None and name_elem.text:
-            drug_name = name_elem.text.strip()
+        name_elem = root.xpath(".//hl7:manufacturedProduct/hl7:manufacturedProduct/hl7:name", namespaces=NS)
+        if name_elem:
+            drug_name = get_text(name_elem[0]).strip()
 
         # Active ingredients
         active_ingredients: List[str] = []
-        for ingredient in root.findall('.//hl7:ingredient[@classCode="ACTIB"]', NS):
-            ing_name = ingredient.find('.//hl7:ingredientSubstance/hl7:name', NS)
-            if ing_name is not None and ing_name.text:
-                active_ingredients.append(ing_name.text.strip())
+        ingredients = root.xpath('.//hl7:ingredient[@classCode="ACTIB"]', namespaces=NS)
+        for ingredient in ingredients:
+            ing_name = ingredient.xpath('.//hl7:ingredientSubstance/hl7:name', namespaces=NS)
+            if ing_name:
+                active_ingredients.append(get_text(ing_name[0]))
 
         # Manufacturer
         manufacturer = ""
-        org_name = root.find(".//hl7:representedOrganization/hl7:name", NS)
-        if org_name is not None and org_name.text:
-            manufacturer = org_name.text.strip()
+        org_name = root.xpath(".//hl7:representedOrganization/hl7:name", namespaces=NS)
+        if org_name:
+            manufacturer = get_text(org_name[0])
 
-        # Parse sections with tables
+        # Parse ALL sections
         sections: Dict[str, Dict[str, Any]] = {}
-        for section in root.findall(".//hl7:section", NS):
-            code_elem = section.find("hl7:code", NS)
-            if code_elem is None:
-                continue
+        
+        # Find all sections that have codes or titles
+        section_elements = root.xpath(".//hl7:section", namespaces=NS)
+        
+        for section in section_elements:
+            code_elem = section.xpath("hl7:code", namespaces=NS)
+            title_elem = section.xpath("hl7:title", namespaces=NS)
+            text_elem = section.xpath("hl7:text", namespaces=NS)
             
-            code = code_elem.get("code", "")
-            if code not in SECTION_CODES:
-                continue
+            # Determine section key and title
+            section_key = ""
+            section_title = ""
             
-            section_key, section_title = SECTION_CODES[code]
-            text_elem = section.find("hl7:text", NS)
+            if code_elem:
+                code = code_elem[0].get("code", "")
+                if code in SECTION_CODES:
+                    section_key, section_title = SECTION_CODES[code]
+                else:
+                    # Non-standard section, use code as fallback key or generate one
+                    section_key = code or "unknown_section"
             
-            if text_elem is None:
-                continue
+            if not section_title and title_elem:
+                section_title = get_text(title_elem[0])
             
+            if not section_key and section_title:
+                # Slugify title for key
+                section_key = section_title.lower().replace(" ", "_").replace("/", "_")[:30]
+
+            if not section_key:
+                section_key = f"section_{uuid.uuid4().hex[:8]}"
+
             # Get section text
-            section_text = get_text(text_elem)
+            section_text = get_text(text_elem[0]) if text_elem else ""
             
             # Parse tables within this section
             tables = []
-            for i, table in enumerate(text_elem.findall(".//hl7:table", NS)):
-                table_content = parse_table(table)
-                if table_content:
-                    tables.append({
-                        "index": i,
-                        "content": table_content,
-                        "type": f"table_{i}"
-                    })
+            if text_elem:
+                table_elements = text_elem[0].xpath(".//hl7:table", namespaces=NS)
+                for i, table in enumerate(table_elements):
+                    table_content = parse_table_to_markdown(table)
+                    if table_content:
+                        tables.append({
+                            "index": i,
+                            "content": table_content,
+                            "type": f"table_{i}"
+                        })
             
-            sections[section_key] = {
-                "title": section_title,
-                "text": section_text[:10000],  # Store more text
-                "tables": tables,
-                "has_tables": len(tables) > 0
-            }
+            # Only add if interesting
+            if section_text or tables:
+                # If we already have this section (e.g. repeated codes), append
+                if section_key in sections:
+                    existing = sections[section_key]
+                    existing["text"] += "\n\n" + section_text
+                    existing["tables"].extend(tables)
+                    existing["has_tables"] = existing["has_tables"] or (len(tables) > 0)
+                else:
+                    sections[section_key] = {
+                        "title": section_title,
+                        "text": section_text[:20000],  # Increased limit
+                        "tables": tables,
+                        "has_tables": len(tables) > 0
+                    }
 
         return {
             "set_id": set_id,
@@ -235,12 +301,13 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
         section_text = section_data["text"]
         section_title = section_data["title"]
         
-        # Skip very short sections
-        if len(section_text) < 50:
+        # Skip very short sections without tables
+        if len(section_text) < 50 and not section_data.get("has_tables"):
             continue
         
         # Create chunk with drug context
-        chunk_text = f"{drug_name} - {section_title}: {section_text}"
+        # Use markdown header for section title
+        chunk_text = f"# {drug_name} - {section_title}\n\n{section_text}"
         
         chunks.append({
             "chunk_id": f"{set_id}_{section_key}",
@@ -248,7 +315,7 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
             "drug_name": drug_name,
             "section_type": section_key,
             "section_title": section_title,
-            "text": chunk_text[:2000],
+            "text": chunk_text[:3000], # Increased limit
             "has_tables": section_data.get("has_tables", False),
             "manufacturer": drug.get("manufacturer", ""),
             "active_ingredients": drug.get("active_ingredients", []),
@@ -256,7 +323,7 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
         
         # 3. Table chunks (if present)
         for table in section_data.get("tables", []):
-            table_text = f"{drug_name} - {section_title} Table: {table['content']}"
+            table_text = f"# {drug_name} - {section_title} Table\n\n{table['content']}"
             chunks.append({
                 "chunk_id": f"{set_id}_{section_key}_table_{table['index']}",
                 "set_id": set_id,
@@ -264,7 +331,7 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "section_type": "table",
                 "section_title": f"{section_title} Table",
                 "table_type": section_key,
-                "text": table_text[:2000],
+                "text": table_text[:2500],
                 "manufacturer": drug.get("manufacturer", ""),
                 "active_ingredients": drug.get("active_ingredients", []),
             })
@@ -284,22 +351,13 @@ def append_checkpoint(ids: Iterable[str]) -> None:
             f.write(f"{value}\n")
 
 
-def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProvider) -> Tuple[List[PointStruct], List[str]]:
+def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder]) -> Tuple[List[PointStruct], List[str]]:
     """Build Qdrant points from chunks."""
     chunk_ids: List[str] = []
     texts: List[str] = []
     sparse_vectors = []
     payloads: List[Dict[str, Any]] = []
     
-    sparse_encoder = None
-    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
-        sparse_encoder = BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
-
     for chunk in chunks:
         chunk_id = chunk.get("chunk_id", "")
         text = chunk.get("text", "")
@@ -354,7 +412,7 @@ def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
             client.upsert(
                 collection_name=IngestionConfig.COLLECTION_NAME, 
                 points=points, 
-                wait=True  # Changed to wait=True for reliability
+                wait=True
             )
             return
         except Exception as exc:
@@ -365,9 +423,51 @@ def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
             time.sleep(wait_time)
 
 
+def process_file_batch(
+    xml_files: List[Path], 
+    seen: set,
+    embedding_provider: EmbeddingProvider,
+    sparse_encoder: Optional[BM25SparseEncoder],
+    client: QdrantClient
+) -> Tuple[int, int]:
+    """Process a batch of files (to be run in loop)."""
+    inserted = 0
+    skipped = 0
+    
+    for xml_file in xml_files:
+        drug = parse_spl_xml(xml_file)
+        if not drug:
+            continue
+
+        chunks = create_chunks(drug)
+        new_chunks = [c for c in chunks if c.get("chunk_id") not in seen]
+        
+        if not new_chunks:
+            skipped += 1
+            continue
+
+        # Build and upsert points
+        try:
+            points, chunk_ids = build_points(new_chunks, embedding_provider, sparse_encoder)
+            if points:
+                upsert_with_retry(client, points)
+                append_checkpoint(chunk_ids)
+                # We don't update 'seen' in real-time across processes easily, but this is a batch
+                inserted += len(points)
+        except Exception as e:
+            logger.error("Error processing %s: %s", xml_file, e)
+
+    return inserted, skipped
+
+
 def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     ensure_data_dirs()
+    # Use rglob to find all XMLs
     xml_files = sorted(xml_dir.rglob("*.xml"))
+    
+    if not xml_files:
+        logger.warning("No XML files found in %s", xml_dir)
+        return
 
     client = QdrantClient(
         url=IngestionConfig.QDRANT_URL,
@@ -377,41 +477,69 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
         prefer_grpc=IngestionConfig.USE_GRPC,
     )
 
-    info = client.get_collection(IngestionConfig.COLLECTION_NAME)
-    logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
+    try:
+        info = client.get_collection(IngestionConfig.COLLECTION_NAME)
+        logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
+    except Exception as e:
+         logger.error("Failed to connect to collection: %s", e)
+         return
 
     seen = load_checkpoint()
     logger.info("DailyMed checkpoint size=%s", len(seen))
 
+    sparse_encoder = None
+    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
+        sparse_encoder = BM25SparseEncoder(
+            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
+            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
+            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
+            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
+        )
+
+    # Simple sequential for now to avoid pickling issues with QdrantClient/EmbeddingProvider in ProcessPool
+    # unless we architect it differently (e.g. init client in worker).
+    # Correct parallel approach: distribute file paths, init resources in worker.
+    # For now, let's Stick to sequential to ensure Stability with shared resources OR use threads.
+    # Given EmbeddingProvider might be not thread safe or picklable (local encoder), sequential/threading.
+    # Qdrant client is thread safe.
+    # But Python GIL limits threads for parsing.
+    # Let's use simple sequential loop as in original but optimized, unless dataset is huge.
+    # If huge, we process in chunks.
+    
     inserted = 0
     skipped = 0
     started = time.time()
 
-    for xml_file in xml_files:
-        drug = parse_spl_xml(xml_file)
-        if not drug:
-            continue
+    total_files = len(xml_files)
+    logger.info("Starting ingestion of %d files...", total_files)
 
-        # Create multiple chunks per drug
-        chunks = create_chunks(drug)
-        
-        # Filter out already processed chunks
-        new_chunks = [c for c in chunks if c.get("chunk_id") not in seen]
-        if not new_chunks:
-            skipped += 1
-            continue
+    for i, xml_file in enumerate(xml_files):
+        try:
+            drug = parse_spl_xml(xml_file)
+            if not drug:
+                continue
 
-        # Build and upsert points
-        points, chunk_ids = build_points(new_chunks, embedding_provider)
-        if points:
-            upsert_with_retry(client, points)
-            append_checkpoint(chunk_ids)
-            seen.update(chunk_ids)
-            inserted += len(points)
+            chunks = create_chunks(drug)
+            new_chunks = [c for c in chunks if c.get("chunk_id") not in seen]
             
-            if inserted % 100 == 0:
-                elapsed = time.time() - started
-                logger.info("DailyMed inserted=%s skipped=%s elapsed=%.1fs", inserted, skipped, elapsed)
+            if not new_chunks:
+                skipped += 1
+                continue
+
+            points, chunk_ids = build_points(new_chunks, embedding_provider, sparse_encoder)
+            if points:
+                upsert_with_retry(client, points)
+                append_checkpoint(chunk_ids)
+                seen.update(chunk_ids)
+                inserted += len(points)
+                
+            if (i + 1) % 10 == 0:
+                 elapsed = time.time() - started
+                 rate = (i + 1) / elapsed
+                 logger.info("Processed %d/%d files. Inserted points: %d. Rate: %.2f files/s", i + 1, total_files, inserted, rate)
+
+        except Exception as e:
+            logger.error("Failed to process file %s: %s", xml_file, e)
 
     logger.info(
         "DailyMed ingestion complete inserted=%s skipped=%s elapsed=%.1fs",
@@ -427,7 +555,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if not args.xml_dir.exists():
-        raise SystemExit(f"Directory not found: {args.xml_dir}")
+        # Just warn, don't exit, might be mounting issue
+        logger.warning(f"Directory not found: {args.xml_dir}")
 
-    provider = EmbeddingProvider()
-    run_ingestion(args.xml_dir, provider)
+    try:
+        provider = EmbeddingProvider()
+        run_ingestion(args.xml_dir, provider)
+    except Exception as e:
+        logger.error("Ingestion failed: %s", e)
+        sys.exit(1)
+
