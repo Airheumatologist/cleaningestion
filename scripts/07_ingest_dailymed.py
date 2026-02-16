@@ -20,6 +20,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config_ingestion import IngestionConfig, ensure_data_dirs
 from ingestion_utils import EmbeddingProvider, upsert_with_retry
 
+# Initialize logger
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 def get_text(element: Optional[ET.Element]) -> str:
     """Extract all text from element."""
