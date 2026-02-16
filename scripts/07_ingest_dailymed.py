@@ -340,6 +340,13 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
     return chunks
 
 
+
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Lock for file operations (checkpointing)
+checkpoint_lock = threading.Lock()
+
 def load_checkpoint() -> set[str]:
     if CHECKPOINT_FILE.exists():
         return {line.strip() for line in CHECKPOINT_FILE.read_text().splitlines() if line.strip()}
@@ -347,108 +354,90 @@ def load_checkpoint() -> set[str]:
 
 
 def append_checkpoint(ids: Iterable[str]) -> None:
-    with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
-        for value in ids:
-            f.write(f"{value}\n")
+    with checkpoint_lock:
+        with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
+            for value in ids:
+                f.write(f"{value}\n")
 
 
-def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder]) -> Tuple[List[PointStruct], List[str]]:
-    """Build Qdrant points from chunks."""
-    chunk_ids: List[str] = []
-    texts: List[str] = []
-    sparse_vectors = []
-    payloads: List[Dict[str, Any]] = []
-    
-    for chunk in chunks:
-        chunk_id = chunk.get("chunk_id", "")
-        text = chunk.get("text", "")
-        
-        if len(text) < 20:
-            continue
-
-        chunk_ids.append(chunk_id)
-        texts.append(text)
-        sparse_vectors.append(sparse_encoder.encode_document(text) if sparse_encoder is not None else None)
-        
-        payloads.append({
-            "doc_id": chunk.get("set_id", ""),
-            "chunk_id": chunk_id,
-            "drug_name": chunk.get("drug_name", "")[:200],
-            "section_type": chunk.get("section_type", ""),
-            "section_title": chunk.get("section_title", "")[:100],
-            "table_type": chunk.get("table_type", ""),
-            "active_ingredients": chunk.get("active_ingredients", [])[:10],
-            "manufacturer": chunk.get("manufacturer", ""),
-            "source": "dailymed",
-            "article_type": "drug_label",
-            "text_preview": text[:500],
-        })
-
-    points: List[PointStruct] = []
-    if not texts:
-        return points, []
-
-    if embedding_provider.use_cloud():
-        for chunk_id, text, sparse_vector, payload in zip(chunk_ids, texts, sparse_vectors, payloads):
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id))
-            vector_data: Any = Document(text=text, model=embedding_provider.model)
-            if sparse_vector is not None:
-                vector_data = {"": vector_data, "sparse": sparse_vector}
-            points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
-    else:
-        vectors = embedding_provider.embed_batch(texts)
-        for chunk_id, vector, sparse_vector, payload in zip(chunk_ids, vectors, sparse_vectors, payloads):
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_id))
-            vector_data: Any = vector
-            if sparse_vector is not None:
-                vector_data = {"": vector, "sparse": sparse_vector}
-            points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
-
-    return points, chunk_ids
-
-
-
-
-
-def process_file_batch(
-    xml_files: List[Path], 
-    seen: set,
-    embedding_provider: EmbeddingProvider,
-    sparse_encoder: Optional[BM25SparseEncoder],
-    client: QdrantClient
-) -> Tuple[int, int]:
-    """Process a batch of files (to be run in loop)."""
+def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock) -> Tuple[int, int]:
+    """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
     skipped = 0
     
-    for xml_file in xml_files:
-        drug = parse_spl_xml(xml_file)
-        if not drug:
-            continue
-
-        chunks = create_chunks(drug)
-        new_chunks = [c for c in chunks if c.get("chunk_id") not in seen]
-        
-        if not new_chunks:
-            skipped += 1
-            continue
-
-        # Build and upsert points
+    drugs = []
+    new_ids = []
+    
+    # 1. Parse and filter
+    for xml_file in batch_files:
         try:
-            points, chunk_ids = build_points(new_chunks, embedding_provider, sparse_encoder)
-            if points:
-                upsert_with_retry(client, points)
-                append_checkpoint(chunk_ids)
-                # We don't update 'seen' in real-time across processes easily, but this is a batch
-                inserted += len(points)
-        except Exception as e:
-            logger.error("Error processing %s: %s", xml_file, e)
+            # Fast skip: check filename (stem) against checkpoint
+            # parse_spl_xml uses stem if set_id is missing, so this is a safe heuristic
+            stem_id = xml_file.stem
+            if stem_id in processed_ids:
+                skipped += 1
+                continue
 
-    return inserted, skipped
+            drug = parse_spl_xml(xml_file)
+            if not drug:
+                continue
+            
+            set_id = drug.get("set_id")
+            if not set_id:
+                continue
+                
+            # Double check exact ID
+            if set_id != stem_id and set_id in processed_ids:
+                skipped += 1
+                continue
+            
+            drugs.append(drug)
+            new_ids.append(set_id)
+            
+        except Exception as e:
+            logger.warning("Failed to parse %s: %s", xml_file, e)
+
+    if not drugs:
+        return 0, len(batch_files)
+
+    # 2. Chunk and Embedding
+    all_chunks = []
+    for drug in drugs:
+        all_chunks.extend(create_chunks(drug))
+        
+    if not all_chunks:
+        return 0, len(batch_files)
+
+    try:
+        points, chunk_ids = build_points(all_chunks, embedding_provider, sparse_encoder)
+        
+        if points:
+            upsert_with_retry(client, points)
+            
+            # Update checkpoints
+            append_checkpoint(new_ids)
+            with processed_lock:
+                processed_ids.update(new_ids)
+                
+            inserted = len(points)
+    except Exception as e:
+        logger.error("Batch upsert failed: %s", e)
+        
+    return inserted, len(batch_files) - len(drugs) # skipped count approximation for stats
 
 
 def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     ensure_data_dirs()
+    
+    # Preload tokenizer
+    logger.info("Preloading tokenizer...")
+    try:
+        from ingestion_utils import Chunker
+        Chunker()
+        logger.info("Tokenizer preloaded.")
+    except Exception as e:
+        logger.warning("Tokenizer preload failed: %s", e)
+
     # Use rglob to find all XMLs
     xml_files = sorted(xml_dir.rglob("*.xml"))
     
@@ -460,7 +449,6 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
         url=IngestionConfig.QDRANT_URL,
         api_key=IngestionConfig.QDRANT_API_KEY or None,
         timeout=600,
-        cloud_inference=embedding_provider.use_cloud(),
         prefer_grpc=IngestionConfig.USE_GRPC,
     )
 
@@ -471,8 +459,9 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
          logger.error("Failed to connect to collection: %s", e)
          return
 
-    seen = load_checkpoint()
-    logger.info("DailyMed checkpoint size=%s", len(seen))
+    processed_ids = load_checkpoint()
+    processed_lock = threading.Lock()
+    logger.info("DailyMed checkpoint size=%s", len(processed_ids))
 
     sparse_encoder = None
     if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
@@ -483,57 +472,53 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
             remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
         )
 
-    # Simple sequential for now to avoid pickling issues with QdrantClient/EmbeddingProvider in ProcessPool
-    # unless we architect it differently (e.g. init client in worker).
-    # Correct parallel approach: distribute file paths, init resources in worker.
-    # For now, let's Stick to sequential to ensure Stability with shared resources OR use threads.
-    # Given EmbeddingProvider might be not thread safe or picklable (local encoder), sequential/threading.
-    # Qdrant client is thread safe.
-    # But Python GIL limits threads for parsing.
-    # Let's use simple sequential loop as in original but optimized, unless dataset is huge.
-    # If huge, we process in chunks.
+    logger.info("Starting ingestion of %d files...", len(xml_files))
     
-    inserted = 0
-    skipped = 0
-    started = time.time()
+    # Batching config
+    THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE
+    MAX_WORKERS = IngestionConfig.MAX_WORKERS # Should be 64 now
+    
+    file_batches = [xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(xml_files), THREAD_BATCH_SIZE)]
+    total_batches = len(file_batches)
+    
+    total_inserted = 0
+    total_skipped = 0
+    completed_batches = 0
+    start_time = time.time()
+    
+    SUPER_BATCH_SIZE = 1000
 
-    total_files = len(xml_files)
-    logger.info("Starting ingestion of %d files...", total_files)
-
-    for i, xml_file in enumerate(xml_files):
-        try:
-            drug = parse_spl_xml(xml_file)
-            if not drug:
-                continue
-
-            chunks = create_chunks(drug)
-            new_chunks = [c for c in chunks if c.get("chunk_id") not in seen]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for i in range(0, total_batches, SUPER_BATCH_SIZE):
+            current_super_batch = file_batches[i : i + SUPER_BATCH_SIZE]
             
-            if not new_chunks:
-                skipped += 1
-                continue
-
-            points, chunk_ids = build_points(new_chunks, embedding_provider, sparse_encoder)
-            if points:
-                upsert_with_retry(client, points)
-                append_checkpoint(chunk_ids)
-                seen.update(chunk_ids)
-                inserted += len(points)
+            future_to_batch = {
+                executor.submit(process_batch, client, batch, embedding_provider, sparse_encoder, processed_ids, processed_lock): batch 
+                for batch in current_super_batch
+            }
+            
+            for future in as_completed(future_to_batch):
+                inserted, skipped = future.result()
+                total_inserted += inserted
+                total_skipped += skipped
+                completed_batches += 1
                 
-            if (i + 1) % 10 == 0:
-                 elapsed = time.time() - started
-                 rate = (i + 1) / elapsed
-                 logger.info("Processed %d/%d files. Inserted points: %d. Rate: %.2f files/s", i + 1, total_files, inserted, rate)
-
-        except Exception as e:
-            logger.error("Failed to process file %s: %s", xml_file, e)
+                if completed_batches % 10 == 0:
+                     elapsed = time.time() - start_time
+                     rate = total_inserted / elapsed if elapsed > 0 else 0
+                     progress = (completed_batches / total_batches) * 100
+                     logger.info("Progress: %.1f%% | Inserted: %s | Skipped: %s | Rate: %.2f pts/sec", 
+                                 progress, total_inserted, total_skipped, rate)
+            
+            future_to_batch.clear()
 
     logger.info(
         "DailyMed ingestion complete inserted=%s skipped=%s elapsed=%.1fs",
-        inserted,
-        skipped,
-        time.time() - started,
+        total_inserted,
+        total_skipped,
+        time.time() - start_time,
     )
+
 
 
 if __name__ == "__main__":
