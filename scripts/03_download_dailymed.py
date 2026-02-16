@@ -12,31 +12,46 @@ IMPORTANT: DailyMed ZIPs contain NESTED ZIPs, not XML directly.
 Each nested ZIP contains one drug's SPL XML file.
 
 Usage:
-    python 03_download_dailymed.py [--output-dir /data/dailymed/xml]
+    # Server deployment (uses DAILYMED_XML_DIR from .env)
+    python scripts/03_download_dailymed.py
+    
+    # Or specify custom path
+    python scripts/03_download_dailymed.py --output-dir /data/ingestion/dailymed/xml
 
 Expected Duration: 30-60 minutes
 """
 
 import os
 import io
+import sys
 import zipfile
 import logging
 import argparse
 import requests
 from pathlib import Path
 
-try:
-    from tqdm import tqdm
-except ImportError:
-    print("Installing tqdm...")
-    os.system("pip3 install tqdm requests --quiet")
-    from tqdm import tqdm
-
+# Setup logging BEFORE any imports that might fail
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    logger.info("Installing tqdm...")
+    os.system("pip3 install tqdm requests --quiet")
+    from tqdm import tqdm
+
+# Import centralized config to ensure path consistency
+try:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from config_ingestion import IngestionConfig, ensure_data_dirs
+    HAS_CONFIG = True
+except Exception as e:
+    logger.warning("Could not import config_ingestion: %s", e)
+    HAS_CONFIG = False
 
 # DailyMed bulk download configuration
 DAILYMED_PUBLIC_RELEASE_BASE = "https://dailymed-data.nlm.nih.gov/public-release-files"
@@ -58,7 +73,11 @@ HUMAN_OTC_ZIPS = [
     "dm_spl_release_human_otc_part4.zip",
 ]
 
-DEFAULT_OUTPUT_DIR = Path("/data/dailymed/xml")
+# Default output dir - uses centralized config if available, otherwise fallback
+if HAS_CONFIG:
+    DEFAULT_OUTPUT_DIR = IngestionConfig.DAILYMED_XML_DIR
+else:
+    DEFAULT_OUTPUT_DIR = Path(os.getenv("DAILYMED_XML_DIR", "/data/ingestion/dailymed/xml"))
 
 
 def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 1024):
@@ -172,6 +191,11 @@ def download_dailymed(output_dir: Path, include_otc: bool = False):
     logger.info("💊 DailyMed Drug Labels Download")
     logger.info("=" * 70)
     
+    # Ensure all data directories exist (creates parent dirs as needed)
+    if HAS_CONFIG:
+        ensure_data_dirs()
+    
+    # Also ensure the specific output dir exists
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Determine which ZIPs to download

@@ -267,6 +267,7 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
         "text": overview_text[:1500],
         "manufacturer": drug.get("manufacturer", ""),
         "active_ingredients": drug.get("active_ingredients", []),
+        "source": "dailymed",
     })
     
     # 2. Individual section chunks (for detailed search)
@@ -292,6 +293,7 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
             "has_tables": section_data.get("has_tables", False),
             "manufacturer": drug.get("manufacturer", ""),
             "active_ingredients": drug.get("active_ingredients", []),
+            "source": "dailymed",
         })
         
         # 3. Table chunks (if present)
@@ -307,6 +309,7 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "text": table_text[:2500],
                 "manufacturer": drug.get("manufacturer", ""),
                 "active_ingredients": drug.get("active_ingredients", []),
+                "source": "dailymed",
             })
     
     return chunks
