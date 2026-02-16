@@ -82,3 +82,8 @@ class BM25SparseEncoder:
 
     def encode_queries(self, texts: List[str]) -> List[SparseVector]:
         return [self.encode_query(text) for text in texts]
+
+    def encode_batch(self, texts: List[str]) -> List[SparseVector]:
+        """Encode a batch of documents."""
+        return [self.encode_document(text) for text in texts]
+
