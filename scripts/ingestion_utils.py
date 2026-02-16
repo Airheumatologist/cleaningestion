@@ -58,18 +58,30 @@ class EmbeddingProvider:
         else:
             raise RuntimeError("No embedding provider available")
 
-
+    def _embed_deepinfra(self, texts: List[str]) -> List[List[float]]:
+        """Embed using DeepInfra OpenAI-compatible API with sub-batching."""
+        batch_size = IngestionConfig.EMBEDDING_BATCH_SIZE  # 64
+        
+        # Small enough to send in one call
+        if len(texts) <= batch_size:
+            return self._embed_deepinfra_single(texts)
+        
+        # Sub-batch large requests to avoid 500 errors
+        all_embeddings: List[List[float]] = []
+        for i in range(0, len(texts), batch_size):
+            sub_batch = texts[i:i + batch_size]
+            embeddings = self._embed_deepinfra_single(sub_batch)
+            all_embeddings.extend(embeddings)
         return all_embeddings
 
-    def _embed_deepinfra(self, texts: List[str]) -> List[List[float]]:
-        """Embed using DeepInfra OpenAI-compatible API."""
+    def _embed_deepinfra_single(self, texts: List[str]) -> List[List[float]]:
+        """Send a single embedding request to DeepInfra."""
         try:
             response = self.openai_client.embeddings.create(
                 model=self.model,
                 input=texts,
                 encoding_format="float"
             )
-            # Maintain order
             return [data.embedding for data in response.data]
         except Exception as e:
             logger.error("DeepInfra embedding failed: %s", e)

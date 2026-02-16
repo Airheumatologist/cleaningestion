@@ -167,20 +167,11 @@ def create_chunks_from_article(article: Dict[str, Any]) -> List[Dict[str, Any]]:
     return chunks
 
 
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider) -> tuple[List[PointStruct], List[str]]:
+def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder=None) -> tuple[List[PointStruct], List[str]]:
     chunker = Chunker(
         chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
         overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
     )
-    sparse_encoder = None
-    use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
-    if use_sparse and BM25SparseEncoder is not None:
-        sparse_encoder = BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
     
     points: List[PointStruct] = []
     all_chunk_ids: List[str] = []
@@ -235,7 +226,19 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     
     return points, all_chunk_ids
 
-def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, processed_ids: set[str], processed_lock: threading.Lock) -> tuple[int, int]:
+def _create_sparse_encoder():
+    """Create a BM25SparseEncoder instance if enabled."""
+    use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
+    if use_sparse and BM25SparseEncoder is not None:
+        return BM25SparseEncoder(
+            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
+            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
+            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
+            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
+        )
+    return None
+
+def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, processed_ids: set[str], processed_lock: threading.Lock, sparse_encoder=None) -> tuple[int, int]:
     """Process a batch of XML files in a single thread."""
     from scripts.ingestion_utils import parse_pmc_xml
     
@@ -280,7 +283,7 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
         return 0, len(batch_files)
 
     # 2. Build points (includes embedding)
-    points, chunk_ids = build_points(articles, embedding_provider)
+    points, chunk_ids = build_points(articles, embedding_provider, sparse_encoder=sparse_encoder)
     
     if not points:
         return 0, len(batch_files)
@@ -337,9 +340,12 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
         
     logger.info("Found %s XML files to process", len(all_xml_files))
 
+    # Create shared sparse encoder (thread-safe, stateless)
+    sparse_encoder = _create_sparse_encoder()
+
     # Calculate batches
     THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE # e.g. 25
-    MAX_WORKERS = 4
+    MAX_WORKERS = 32  # Use more of the 200 concurrent request rate limit
     
     # Create batches generator/list
     file_batches = [all_xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(all_xml_files), THREAD_BATCH_SIZE)]
@@ -362,7 +368,7 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
             current_super_batch = file_batches[i : i + SUPER_BATCH_SIZE]
             
             future_to_batch = {
-                executor.submit(process_batch, client, batch, embedding_provider, processed_ids, processed_lock): batch 
+                executor.submit(process_batch, client, batch, embedding_provider, processed_ids, processed_lock, sparse_encoder): batch 
                 for batch in current_super_batch
             }
             
