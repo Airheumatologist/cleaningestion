@@ -28,6 +28,11 @@ from typing import Any, Dict, List, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
+import sys
+# Add project root to path for src imports
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from config_ingestion import IngestionConfig, ensure_data_dirs
 from ingestion_utils import EmbeddingProvider, upsert_with_retry
 
