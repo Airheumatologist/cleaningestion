@@ -205,9 +205,16 @@ class QdrantRetriever(AbstractRetriever):
         """Stable document ID for paper-level aggregation."""
         return str(payload.get("pmcid") or payload.get("doc_id") or payload.get("pmid") or "")
 
-    def _embed_query(self, query: str):
+    def _embed_query(self, query: str, use_instruction: bool = True):
         """
         Embed a single query using the configured embedding provider.
+        
+        For DeepInfra API, manually prepends instruction for better retrieval performance
+        (1-5% improvement according to Qwen3 documentation).
+        
+        Args:
+            query: The search query string
+            use_instruction: Whether to prepend instruction (default True for queries)
         
         Returns a vector (list of floats) or Qdrant Document object,
         suitable for passing to client.query_points(query=...).
@@ -216,9 +223,16 @@ class QdrantRetriever(AbstractRetriever):
         
         if self.embedding_provider == "deepinfra" and self.openai_client is not None:
             try:
+                # For queries, add instruction to improve retrieval (1-5% improvement)
+                if use_instruction:
+                    instruction = "Given a medical question, retrieve relevant clinical passages that answer the query"
+                    query_with_instruct = f"Instruct: {instruction}\nQuery: {query}"
+                else:
+                    query_with_instruct = query
+                
                 response = self.openai_client.embeddings.create(
                     model=self.embedding_model,
-                    input=[query],
+                    input=[query_with_instruct],
                     encoding_format="float"
                 )
                 return response.data[0].embedding

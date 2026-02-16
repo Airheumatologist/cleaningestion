@@ -153,15 +153,19 @@ class Chunker:
 
             try:
                 from transformers import AutoTokenizer
-                # Use Qwen2.5-0.5B tokenizer as proxy for Qwen3 if exact model is heavy to load
-                # Set local_files_only=False to allow download first time, but we rely on cache after
-                # Adding fast=True usually helps.
-                logger.info("Loading tokenizer (Qwen/Qwen2.5-0.5B)...")
-                tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B", trust_remote_code=True)
+                # Use Qwen3-Embedding-0.6B tokenizer for consistency with embedding model
+                # This ensures token counts are accurate for chunking
+                logger.info("Loading tokenizer (Qwen/Qwen3-Embedding-0.6B)...")
+                tokenizer = AutoTokenizer.from_pretrained(
+                    "Qwen/Qwen3-Embedding-0.6B", 
+                    trust_remote_code=True,
+                    padding_side='left'  # Critical for correct last-token pooling
+                )
                 _GLOBAL_TOKENIZER = tokenizer
                 self.tokenizer = tokenizer
+                logger.info("✅ Tokenizer loaded with padding_side='left'")
             except Exception as e:
-                logger.warning(f"Failed to load tokenizer (Qwen/Qwen2.5-0.5B): {e}")
+                logger.warning(f"Failed to load tokenizer (Qwen/Qwen3-Embedding-0.6B): {e}")
                 self.tokenizer = None
             
     def chunk_text(self, text: str) -> List[Dict[str, Any]]:
