@@ -52,6 +52,12 @@ EVIDENCE_GRADES = {
 }
 
 
+
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+checkpoint_lock = threading.Lock()
+
 def load_checkpoint() -> set[str]:
     if CHECKPOINT_FILE.exists():
         return {line.strip() for line in CHECKPOINT_FILE.read_text().splitlines() if line.strip()}
@@ -59,9 +65,10 @@ def load_checkpoint() -> set[str]:
 
 
 def append_checkpoint(ids: List[str]) -> None:
-    with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
-        for value in ids:
-            f.write(f"{value}\n")
+    with checkpoint_lock:
+        with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
+            for value in ids:
+                f.write(f"{value}\n")
 
 
 def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
@@ -165,7 +172,21 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     return points, processed_pmids
 
 
-
+def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[Any]) -> int:
+    """Process a single batch in a worker thread."""
+    if not batch:
+        return 0
+    
+    try:
+        points, ids = build_points(batch, embedding_provider, sparse_encoder)
+        if points:
+            upsert_with_retry(client, points)
+            append_checkpoint(ids)
+            return len(points)
+    except Exception as e:
+        logger.error("Batch processing failed: %s", e)
+    
+    return 0
 
 
 def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: EmbeddingProvider) -> None:
@@ -182,6 +203,13 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
         prefer_grpc=IngestionConfig.USE_GRPC,
     )
 
+    try:
+        info = client.get_collection(IngestionConfig.COLLECTION_NAME)
+        logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
+    except Exception as e:
+         logger.error("Failed to connect to collection: %s", e)
+         return
+
     # Initialize Sparse Encoder if enabled
     sparse_encoder = None
     use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
@@ -195,54 +223,81 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
     processed_ids = load_checkpoint()
     logger.info("Loaded checkpoint with %d IDs", len(processed_ids))
 
-    batch: List[Dict[str, Any]] = []
+    current_batch: List[Dict[str, Any]] = []
     total_processed = 0
     start_time = time.time()
+    
+    MAX_WORKERS = IngestionConfig.MAX_WORKERS # Should be 64
+    BATCH_SIZE = IngestionConfig.BATCH_SIZE
+    
+    futures = []
+    
+    logger.info("Starting ingestion with %d workers...", MAX_WORKERS)
 
-    with open(input_file, "r", encoding="utf-8") as f:
-        for line in f:
-            if limit and total_processed >= limit:
-                break
-                
-            line = line.strip()
-            if not line:
-                continue
-                
-            try:
-                article = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            pmid = str(article.get("pmid"))
-            if pmid in processed_ids:
-                continue
-
-            batch.append(article)
-            
-            if len(batch) >= IngestionConfig.BATCH_SIZE:
-                points, ids = build_points(batch, embedding_provider, sparse_encoder)
-                if points:
-                    upsert_with_retry(client, points)
-                    append_checkpoint(ids)
-                    processed_ids.update(ids)
-                    total_processed += len(points)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        with open(input_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if limit and total_processed >= limit:
+                    break
                     
-                    if total_processed % 500 == 0:
-                        elapsed = time.time() - start_time
-                        rate = total_processed / elapsed
-                        logger.info("Ingested: %d (%.1f docs/sec)", total_processed, rate)
-                
-                batch.clear()
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                try:
+                    article = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-    # Final batch
-    if batch:
-        points, ids = build_points(batch, embedding_provider, sparse_encoder)
-        if points:
-            upsert_with_retry(client, points)
-            append_checkpoint(ids)
-            total_processed += len(points)
+                pmid = str(article.get("pmid"))
+                if pmid in processed_ids:
+                    continue
+
+                current_batch.append(article)
+                
+                # Check if batch full
+                if len(current_batch) >= BATCH_SIZE:
+                    # Submit job
+                    future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder)
+                    futures.append(future)
+                    current_batch.clear()
+                    
+                    # Periodic maintenance of futures
+                    # If we have too many pending futures, wait?
+                    # Or just collect done ones for stats
+                    if len(futures) >= MAX_WORKERS * 2:
+                        # Clean up done futures
+                        pending = []
+                        for fut in futures:
+                            if fut.done():
+                                try:
+                                    total_processed += fut.result()
+                                except Exception as e:
+                                    logger.error("Future failed: %s", e)
+                            else:
+                                pending.append(fut)
+                        
+                        futures = pending
+                        
+                        elapsed = time.time() - start_time
+                        if elapsed > 0 and total_processed > 0:
+                             rate = total_processed / elapsed
+                             logger.info("Ingested: %d (%.1f docs/sec)", total_processed, rate)
+
+        # Submit remaining
+        if current_batch:
+            future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder)
+            futures.append(future)
+            
+        # Wait for all remaining
+        for fut in as_completed(futures):
+            try:
+                total_processed += fut.result()
+            except Exception as e:
+                logger.error("Future failed: %s", e)
 
     logger.info("Start-to-finish ingestion complete. Total: %d", total_processed)
+
 
 
 if __name__ == "__main__":
