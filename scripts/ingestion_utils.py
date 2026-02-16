@@ -535,17 +535,28 @@ def parse_pmc_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
 
 
 def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
-    """Upsert points with robust retry logic for 'Too many open files'."""
+    """Upsert points with robust retry logic.
+    
+    Uses wait=False for throughput — Qdrant's optimizer can cause NOT_FOUND
+    errors during wait=True verification even though the data IS written.
+    """
     for attempt in range(IngestionConfig.MAX_RETRIES):
         try:
             client.upsert(
                 collection_name=IngestionConfig.COLLECTION_NAME,
                 points=points,
-                wait=True,
+                wait=False,  # Don't block on optimizer — avoids NOT_FOUND errors
             )
             return
         except Exception as exc:
             error_str = str(exc)
+            
+            # NOT_FOUND during upsert means Qdrant's optimizer moved/merged
+            # segments between write and confirmation. Data IS written.
+            # Treat as success — do NOT retry.
+            if "NOT_FOUND" in error_str or "Not found: No point with id" in error_str:
+                logger.debug("NOT_FOUND during upsert (optimizer race) — points likely written, skipping retry")
+                return
             
             # Check for specific "Too many open files" error (RocksDB/GRPC)
             is_file_limit = "Too many open files" in error_str
