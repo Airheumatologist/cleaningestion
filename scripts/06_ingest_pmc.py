@@ -210,10 +210,10 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         all_chunk_ids.append(chunk_id)
         
         # Create sparse vector if enabled
-        vector_data: Any = vector
+        vector_data: Any = {"dense": vector}
         if sparse_encoder is not None:
             sparse_vector = sparse_encoder.encode_document(chunk["text"])
-            vector_data = {"": vector, "sparse": sparse_vector}
+            vector_data["sparse"] = sparse_vector
         
         # Create payload
         payload = {

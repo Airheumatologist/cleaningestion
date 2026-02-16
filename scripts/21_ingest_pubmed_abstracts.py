@@ -163,10 +163,10 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         pmid = meta["pmid"]
         
         # Sparse vector
-        vector_data: Any = vector
+        vector_data: Any = {"dense": vector}
         if sparse_encoder:
             sparse_vector = sparse_encoder.encode_document(meta["text"])
-            vector_data = {"": vector, "sparse": sparse_vector}
+            vector_data["sparse"] = sparse_vector
             
         # Point ID (deterministic from PMID)
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pmid:{pmid}"))
