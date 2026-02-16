@@ -134,7 +134,8 @@ def verify_update(sample_size: int = 10) -> None:
         with_vectors=False,
     )
     
-    logger.info("\nSample points after update:")
+    logger.info("
+Sample points after update:")
     for point in response[0]:
         payload = point.payload or {}
         set_id = payload.get("set_id", "N/A")
@@ -155,5 +156,6 @@ if __name__ == "__main__":
     else:
         updated = update_dailymed_source(batch_size=args.batch_size)
         if updated > 0:
-            logger.info("\nVerifying update...")
+            logger.info("
+Verifying update...")
             verify_update()
