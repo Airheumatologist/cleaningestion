@@ -5,24 +5,65 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import lxml.etree as ET
-from qdrant_client import QdrantClient
-from qdrant_client.models import Document, PointStruct
-
-import sys
-sys.path.insert(0, str(Path(__file__).parent))
-from config_ingestion import IngestionConfig, ensure_data_dirs
-from ingestion_utils import EmbeddingProvider, upsert_with_retry
-
-# Initialize logger
+# Initialize logger FIRST before any imports that might fail
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+try:
+    import lxml.etree as ET
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import Document, PointStruct
+
+    sys.path.insert(0, str(Path(__file__).parent))         # Add scripts/ to path
+    sys.path.insert(0, str(Path(__file__).parent.parent))  # Add root to path for src
+    from config_ingestion import IngestionConfig, ensure_data_dirs
+    from ingestion_utils import EmbeddingProvider, upsert_with_retry
+    
+    # Import BM25SparseEncoder
+    import importlib.util
+    spec = importlib.util.find_spec("src.bm25_sparse")
+    if spec is not None:
+        from src.bm25_sparse import BM25SparseEncoder
+    else:
+        BM25SparseEncoder = None  # type: ignore
+except Exception as import_err:
+    logger.error("Failed to import required modules: %s", import_err)
+    logger.error("Please ensure all dependencies are installed: pip install -r requirements.txt")
+    sys.exit(1)
+
+# XML Namespaces for SPL (Structured Product Labeling)
+NS = {"hl7": "urn:hl7-org:v3"}
+
+# LOINC Codes for Common Drug Label Sections
+SECTION_CODES = {
+    "34067-9": ("indications", "Indications & Usage"),
+    "34068-7": ("dosage", "Dosage & Administration"), 
+    "43683-2": ("recent_major_changes", "Recent Major Changes"),
+    "34070-3": ("contraindications", "Contraindications"),
+    "34071-1": ("warnings", "Warnings & Precautions"), 
+    "34072-9": ("adverse_reactions", "Adverse Reactions"),
+    "34073-7": ("interactions", "Drug Interactions"),
+    "34066-1": ("boxed_warning", "Boxed Warning"),
+    "34074-5": ("use_in_specific_populations", "Use in Specific Populations"),
+    "34076-0": ("overdosage", "Overdosage"),
+    "34069-5": ("description", "Description"),
+    "34089-3": ("clinical_pharmacology", "Clinical Pharmacology"),
+    "34090-1": ("nonclinical_toxicology", "Nonclinical Toxicology"),
+    "34091-9": ("clinical_studies", "Clinical Studies"),
+    "34092-7": ("references", "References"),
+    "34093-5": ("supply", "How Supplied/Storage"),
+    "34075-2": ("patient_counseling", "Patient Counseling Information"),
+    "42232-9": ("precautions", "Precautions"),
+    "42229-5": ("spl_unclassified", "Unclassified Section"),
+    "51945-4": ("package_insert", "Package Insert"),
+}
 
 def get_text(element: Optional[ET.Element]) -> str:
     """Extract all text from element."""
@@ -271,6 +312,67 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
     return chunks
 
 
+
+
+def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder]) -> Tuple[List[PointStruct], List[str]]:
+    """Convert chunks into Qdrant PointStructs with embeddings."""
+    if not chunks:
+        return [], []
+        
+    texts = [chunk["text"] for chunk in chunks]
+    
+    # 1. Generate Dense Embeddings
+    try:
+        embeddings = embedding_provider.embed_batch(texts)
+    except Exception as e:
+        logger.error("Failed to generate embeddings: %s", e)
+        return [], []
+        
+    points = []
+    chunk_ids = []
+    
+    # 2. Generate Sparse Vectors (if enabled)
+    sparse_vectors = []
+    if sparse_encoder:
+        try:
+            sparse_vectors = sparse_encoder.encode_batch(texts)
+        except Exception as e:
+            logger.warning("Sparse parsing failed batch: %s", e)
+            # Fallback to empty if failed, or skip?
+            # Let's fill with empty to keep alignment
+            sparse_vectors = [None] * len(texts)
+    
+    # 3. Build Points
+    for i, chunk in enumerate(chunks):
+        try:
+            # Generate UUID from chunk_id for consistent ID
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk["chunk_id"]))
+            
+            vector = {"dense": embeddings[i]}
+            
+            if sparse_encoder and i < len(sparse_vectors) and sparse_vectors[i]:
+                vector["sparse"] = sparse_vectors[i].model_dump()
+            
+            # Add timestamp
+            chunk["ingestion_timestamp"] = time.time()
+            
+            points.append(PointStruct(
+                id=point_id,
+                vector=vector,
+                payload=chunk
+            ))
+            chunk_ids.append(chunk["chunk_id"])
+            
+        except Exception as e:
+            logger.error("Failed to build point for chunk %s: %s", chunk.get("chunk_id"), e)
+            
+    return points, chunk_ids
+
+
+# Checkpoint file for DailyMed ingestion
+CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "dailymed_ingested_ids.txt"
+
+# Checkpoint file for DailyMed ingestion
 
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
