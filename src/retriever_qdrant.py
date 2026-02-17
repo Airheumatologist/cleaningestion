@@ -29,20 +29,6 @@ from .bm25_sparse import BM25SparseEncoder
 
 logger = logging.getLogger(__name__)
 
-# Cohere embedding client (lazy init)
-try:
-    import cohere as cohere_sdk
-    COHERE_AVAILABLE = True
-except ImportError:
-    COHERE_AVAILABLE = False
-
-# Local embedding fallback (only if provider is 'local')
-try:
-    from sentence_transformers import SentenceTransformer
-    LOCAL_EMBEDDINGS_AVAILABLE = True
-except ImportError:
-    LOCAL_EMBEDDINGS_AVAILABLE = False
-
 # SPLADE encoder for sparse vectors (optional legacy mode)
 try:
     from .splade_encoder import get_splade_encoder
@@ -129,17 +115,8 @@ class QdrantRetriever(AbstractRetriever):
                 base_url=DEEPINFRA_BASE_URL
             )
             logger.info("✅ DeepInfra embedding initialized (model: %s)", EMBEDDING_MODEL)
-        elif self.embedding_provider == "local":
-            if LOCAL_EMBEDDINGS_AVAILABLE:
-                try:
-                    logger.info("Loading local embedding model...")
-                    self.local_encoder = SentenceTransformer(EMBEDDING_MODEL)
-                    logger.info("✅ Local embedding model loaded")
-                except Exception as e:
-                    logger.warning(f"Failed to load local embedding model: {e}")
-            else:
-                logger.warning("sentence-transformers not installed, local embeddings unavailable")
-
+        else:
+            raise ValueError(f"Unsupported embedding provider: {self.embedding_provider}. Only 'deepinfra' is supported.")
 
         # Initialize sparse query encoder for hybrid search.
         self.splade_encoder = None
@@ -407,8 +384,8 @@ class QdrantRetriever(AbstractRetriever):
                 with_payload=True,
                 search_params=SearchParams(
                     quantization=QuantizationSearchParams(
-                        rescore=True,
-                        oversampling=2.0
+                        rescore=QUANTIZATION_RESCORE,
+                        oversampling=QUANTIZATION_OVERSAMPLING
                     )
                 )
             )
@@ -679,8 +656,8 @@ class QdrantRetriever(AbstractRetriever):
         # Search params for binary quantization rescore (production-ready)
         search_params = SearchParams(
             quantization=QuantizationSearchParams(
-                rescore=True,
-                oversampling=2.0
+                rescore=QUANTIZATION_RESCORE,
+                oversampling=QUANTIZATION_OVERSAMPLING
             )
         )
         

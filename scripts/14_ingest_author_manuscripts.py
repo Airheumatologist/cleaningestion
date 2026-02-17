@@ -3,28 +3,18 @@
 Ingest NIH Author Manuscripts to Qdrant with Hybrid Retrieval Support.
 
 Features:
-- Dense vectors via Qdrant Cloud Inference (mixedbread-ai/mxbai-embed-large-v1)
-- Full text storage for RAG context
-- All metadata for filtering and reranking
-- Compatible with existing SPLADE sparse vector pipeline
-
-The SPLADE sparse vectors are added in a second pass using 11_add_splade_vectors.py
-to enable hybrid retrieval with binary quantization.
-
-Collection Setup:
-- Dense: 1024-dim with Binary Quantization
-- Sparse: SPLADE vectors (added separately)
-- 4 shards for parallel processing
+- Dense vectors via DeepInfra API (Qwen/Qwen3-Embedding-0.6B-batch)
+- BM25 sparse vectors for hybrid search
+- Token-based chunking (2048 tokens)
+- Full metadata for filtering and reranking
 
 Usage:
     # Set environment variables
-    export QDRANT_API_KEY="your_api_key"
+    export DEEPINFRA_API_KEY="your_key"
+    export QDRANT_API_KEY="your_key"
     
     # Run ingestion
     python 14_ingest_author_manuscripts.py --xml-dir /data/author_manuscripts/xml/
-    
-    # After ingestion, add SPLADE vectors:
-    python 11_add_splade_vectors.py
 
 Expected Duration: 2-4 hours for ~900K manuscripts
 """
@@ -39,11 +29,35 @@ import argparse
 import threading
 import re
 import gzip
+import hashlib
+import importlib.util
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
+
+# Add project root to path for shared config
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+
+from config_ingestion import IngestionConfig, ensure_data_dirs
+from ingestion_utils import Chunker as BaseChunker, EmbeddingProvider, upsert_with_retry, generate_section_id, get_section_weight
+
+# Import enhanced utilities for semantic chunking and validation
+try:
+    from ingestion_utils_enhanced import SemanticChunker, QualityValidator, ContentDeduplicator
+    ENHANCED_UTILS_AVAILABLE = True
+except ImportError:
+    ENHANCED_UTILS_AVAILABLE = False
+
+# Import BM25SparseEncoder
+spec = importlib.util.find_spec("src.bm25_sparse")
+if spec is not None:
+    from src.bm25_sparse import BM25SparseEncoder
+else:
+    BM25SparseEncoder = None  # type: ignore
 
 try:
     from tqdm import tqdm
@@ -53,11 +67,11 @@ except ImportError:
 
 try:
     from qdrant_client import QdrantClient
-    from qdrant_client.models import PointStruct, Document
+    from qdrant_client.models import PointStruct
 except ImportError:
     os.system("pip3 install qdrant-client --quiet")
     from qdrant_client import QdrantClient
-    from qdrant_client.models import PointStruct, Document
+    from qdrant_client.models import PointStruct
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,19 +84,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# CONFIGURATION - Matches existing PMC ingestion setup
+# CONFIGURATION - Uses centralized IngestionConfig
 # ============================================================================
-QDRANT_URL = os.getenv("QDRANT_URL", "https://cf6c28ca-8a2a-43fa-9424-1f2af9e9a5f3.us-east-1-1.aws.cloud.qdrant.io:6333")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
-COLLECTION_NAME = "pmc_medical_rag_fulltext"
-EMBEDDING_MODEL = "mixedbread-ai/mxbai-embed-large-v1"
+QDRANT_URL = IngestionConfig.QDRANT_URL
+QDRANT_API_KEY = IngestionConfig.QDRANT_API_KEY or os.getenv("QDRANT_API_KEY", "")
+COLLECTION_NAME = IngestionConfig.COLLECTION_NAME
 
-# Cloud Inference optimal settings
-BATCH_SIZE = 50  # Cloud Inference limit per request
-PARALLEL_WORKERS = 4  # Match shard count
-MAX_TEXT_LENGTH = 2000  # Cloud Inference embedding text limit
-MAX_RETRIES = 3
-CHECKPOINT_FILE = Path("/data/author_manuscript_checkpoint.txt")
+# Use centralized settings with fallback defaults
+BATCH_SIZE = IngestionConfig.BATCH_SIZE
+PARALLEL_WORKERS = IngestionConfig.MAX_WORKERS  # Standardized to use config value
+MAX_RETRIES = IngestionConfig.MAX_RETRIES
+CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "author_manuscript_ingested_ids.txt"
 PROGRESS_LOG_INTERVAL = 100
 
 # Evidence classification for reranking
@@ -427,77 +439,203 @@ def parse_author_manuscript_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def create_embedding_text(article: Dict[str, Any]) -> str:
-    """
-    Create text for dense embedding (max 2000 chars for Cloud Inference).
-    
-    Combines title + abstract + beginning of full text.
-    """
-    title = article.get("title", "") or ""
-    abstract = article.get("abstract", "") or ""
-    full_text = article.get("full_text", "") or ""
-    
-    # Start with title and abstract
-    combined = f"{title}. {abstract}"
-    
-    # Add as much full text as fits
-    if full_text and len(combined) < MAX_TEXT_LENGTH - 100:
-        remaining = MAX_TEXT_LENGTH - len(combined) - 10
-        combined = f"{combined}\n\n{full_text[:remaining]}"
-    
-    return combined[:MAX_TEXT_LENGTH]
+# generate_section_id and get_section_weight are imported from ingestion_utils
 
 
-def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
+def create_chunks_from_article(article: Dict[str, Any], chunker: Any, validate_chunks: bool = True) -> List[Dict[str, Any]]:
     """
-    Create payload with all metadata for filtering and reranking.
+    Create chunks from article with token-aware chunking.
+    Returns list of chunk dicts with metadata.
     
-    Matches existing PMC payload schema for consistency.
+    Args:
+        article: The parsed article dictionary
+        chunker: The chunker instance (BaseChunker or SemanticChunker)
+        validate_chunks: Whether to validate chunk quality before returning
     """
-    return {
-        # Identifiers
-        "pmcid": article.get("pmcid"),
-        "pmid": article.get("pmid"),
-        "doi": article.get("doi"),
-        
-        # Content (truncated for payload size limits)
-        "title": article.get("title", "")[:300],
-        "abstract": article.get("abstract", "")[:2000],
-        "full_text": article.get("full_text", "")[:15000],  # Store for RAG context
-        
-        # Publication info
-        "year": article.get("year"),
+    chunks = []
+    
+    pmcid = article.get("pmcid", "")
+    pmid = article.get("pmid")
+    title = article.get("title", "")
+    abstract = article.get("abstract", "")
+    full_text = article.get("full_text", "")
+    
+    # Base metadata for all chunks
+    base_metadata = {
+        "title": title,
+        "abstract": abstract,
         "journal": article.get("journal", ""),
-        "article_type": article.get("article_type", "research_article"),
-        "publication_type": article.get("publication_type", [])[:5],
-        
-        # Evidence signals for reranking
-        "evidence_grade": article.get("evidence_grade"),
-        "evidence_level": article.get("evidence_level"),
+        "year": article.get("year"),
+        "pmcid": pmcid,
+        "pmid": pmid,
         "country": article.get("country"),
-        "institutions": article.get("institutions", [])[:5],
-        
-        # Subject classification
-        "keywords": article.get("keywords", [])[:10],
-        "mesh_terms": article.get("mesh_terms", [])[:15],
-        
-        # Authors
-        "authors": article.get("authors", [])[:5],
+        "keywords": article.get("keywords", []),
+        "mesh_terms": article.get("mesh_terms", []),
+        "authors": article.get("authors", []),
         "first_author": article.get("first_author"),
         "author_count": article.get("author_count", 0),
-        
-        # Structure signals
-        "source": "pmc_author_manuscript",
-        "content_type": "author_manuscript",
-        "has_full_text": article.get("has_full_text", True),
-        "has_methods": article.get("has_methods", False),
-        "has_results": article.get("has_results", False),
-        "table_count": article.get("table_count", 0),
-        "figure_count": article.get("figure_count", 0),
     }
+    
+    # 1. Abstract chunk (most important)
+    if abstract and len(abstract) > 50:
+        abstract_full_text = f"Title: {title}\n\nAbstract: {abstract}"
+        section_id = generate_section_id(pmcid, "Abstract")
+        
+        # Chunk the abstract if needed
+        abstract_chunks = chunker.chunk_text(abstract_full_text)
+        
+        for j, chunk_data in enumerate(abstract_chunks):
+            chunk_id = f"{pmcid}_abstract_part{j}" if len(abstract_chunks) > 1 else f"{pmcid}_abstract"
+            chunks.append({
+                "chunk_id": chunk_id,
+                "doc_id": pmcid,
+                "text": chunk_data["text"],
+                "section_type": "abstract",
+                "section_title": "Abstract",
+                "full_section_text": abstract_full_text,
+                "section_id": section_id,
+                "section_weight": get_section_weight("abstract"),
+                **base_metadata,
+            })
+    
+    # 2. Full text chunks if available
+    if full_text and len(full_text) > 100:
+        full_text_with_title = f"Title: {title}\n\n{full_text}"
+        section_id = generate_section_id(pmcid, "Full Text")
+        
+        text_chunks = chunker.chunk_text(full_text_with_title)
+        
+        for j, chunk_data in enumerate(text_chunks):
+            chunk_id = f"{pmcid}_text_part{j}" if len(text_chunks) > 1 else f"{pmcid}_text"
+            chunks.append({
+                "chunk_id": chunk_id,
+                "doc_id": pmcid,
+                "text": chunk_data["text"],
+                "section_type": "body",
+                "section_title": "Full Text",
+                "full_section_text": full_text_with_title,
+                "section_id": section_id,
+                "section_weight": get_section_weight("body"),
+                **base_metadata,
+            })
+    
+    # 3. Validate chunks if enabled
+    if validate_chunks and ENHANCED_UTILS_AVAILABLE:
+        original_count = len(chunks)
+        valid_chunks = []
+        for chunk in chunks:
+            is_valid, issues = QualityValidator.validate_chunk(
+                chunk["text"],
+                {k: chunk.get(k) for k in ["doc_id", "chunk_id", "title", "pmid", "year"]}
+            )
+            if is_valid:
+                valid_chunks.append(chunk)
+            else:
+                logger.debug("Skipping invalid chunk %s: %s", chunk.get("chunk_id"), issues)
+        chunks = valid_chunks
+        if len(chunks) < original_count:
+            logger.debug("Validated chunks: %d valid out of %d total", len(chunks), original_count)
+    
+    return chunks
 
 
-def get_checkpoint() -> set:
+def build_points(
+    articles: List[Dict[str, Any]], 
+    embedding_provider: EmbeddingProvider,
+    chunker: Chunker,
+    sparse_encoder: Optional[BM25SparseEncoder]
+) -> Tuple[List[PointStruct], List[str]]:
+    """
+    Build Qdrant points from articles with chunking and embeddings.
+    """
+    points: List[PointStruct] = []
+    doc_ids: List[str] = []
+    
+    # Collect all chunks for batch embedding
+    all_chunks: List[Dict[str, Any]] = []
+    
+    for article in articles:
+        chunks = create_chunks_from_article(article, chunker)
+        all_chunks.extend(chunks)
+    
+    if not all_chunks:
+        return [], []
+    
+    # Extract texts for embedding
+    texts = [chunk["text"] for chunk in all_chunks]
+    
+    # Generate embeddings
+    try:
+        vectors = embedding_provider.embed_batch(texts)
+    except Exception as e:
+        logger.error("Embedding failed: %s", e)
+        return [], []
+    
+    # Create points
+    for chunk, vector in zip(all_chunks, vectors):
+        chunk_id = chunk["chunk_id"]
+        doc_id = chunk["doc_id"]
+        
+        if doc_id not in doc_ids:
+            doc_ids.append(doc_id)
+        
+        # Create payload
+        payload = {
+            # Core identifiers
+            "doc_id": doc_id,
+            "chunk_id": chunk_id,
+            "pmcid": chunk.get("pmcid"),
+            "pmid": chunk.get("pmid"),
+            "doi": chunk.get("doi"),
+            
+            # CRITICAL: Full text for retriever
+            "page_content": chunk["text"],
+            
+            # Article metadata
+            "title": chunk.get("title", ""),
+            "abstract": chunk.get("abstract", ""),
+            "journal": chunk.get("journal", ""),
+            "year": chunk.get("year"),
+            "country": chunk.get("country", ""),
+            "keywords": chunk.get("keywords", []),
+            "mesh_terms": chunk.get("mesh_terms", []),
+            "authors": chunk.get("authors", []),
+            "first_author": chunk.get("first_author"),
+            "author_count": chunk.get("author_count", 0),
+            
+            # Section information
+            "section_type": chunk["section_type"],
+            "section_title": chunk["section_title"],
+            
+            # Parent-child indexing fields
+            "full_section_text": chunk.get("full_section_text", chunk["text"]),
+            "section_id": chunk.get("section_id", ""),
+            "section_weight": chunk.get("section_weight", 0.5),
+            
+            # Source and type
+            "source": "pmc_author_manuscript",
+            "article_type": chunk.get("section_type", "other"),
+            "has_full_text": chunk.get("has_full_text", True),
+            
+            # Preview for dashboard
+            "text_preview": chunk["text"][:500],
+        }
+        
+        # Create vector data
+        vector_data: Any = {"dense": vector}
+        if sparse_encoder is not None:
+            sparse_vector = sparse_encoder.encode_document(chunk["text"])
+            vector_data["sparse"] = sparse_vector
+        
+        # Create deterministic point ID
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"author_ms:{chunk_id}"))
+        
+        points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
+    
+    return points, doc_ids
+
+
+def load_checkpoint() -> set[str]:
     """Load checkpoint of ingested PMCIDs."""
     if CHECKPOINT_FILE.exists():
         try:
@@ -507,9 +645,9 @@ def get_checkpoint() -> set:
     return set()
 
 
-def save_checkpoint(ids: List[str]):
+def append_checkpoint(ids: List[str]) -> None:
     """Append IDs to checkpoint."""
-    with open(CHECKPOINT_FILE, 'a') as f:
+    with open(CHECKPOINT_FILE, 'a', encoding='utf-8') as f:
         for id_val in ids:
             f.write(f"{id_val}\n")
 
@@ -521,26 +659,15 @@ def upsert_batch(
     counters: Counters
 ) -> bool:
     """Upsert batch with retry logic."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            client.upsert(
-                collection_name=COLLECTION_NAME,
-                points=points,
-                wait=False  # Async for throughput
-            )
-            save_checkpoint(ids)
-            counters.increment('success', len(points))
-            return True
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                wait_time = 2 ** attempt
-                logger.warning(f"Retry {attempt + 1}/{MAX_RETRIES}: {str(e)[:100]}")
-                time.sleep(wait_time)
-            else:
-                logger.error(f"Batch failed after {MAX_RETRIES} attempts: {str(e)[:200]}")
-                counters.increment('errors', len(points))
-                return False
-    return False
+    try:
+        upsert_with_retry(client, points)
+        append_checkpoint(ids)
+        counters.increment('success', len(points))
+        return True
+    except Exception as e:
+        logger.error(f"Batch failed: {str(e)[:200]}")
+        counters.increment('errors', len(points))
+        return False
 
 
 def process_xml_batch(xml_files: List[Path], ingested: set, counters: Counters) -> List[Dict[str, Any]]:
@@ -565,7 +692,7 @@ def process_xml_batch(xml_files: List[Path], ingested: set, counters: Counters) 
 
 
 def run_ingestion(xml_dir: Path, limit: Optional[int] = None, batch_size: int = 50, workers: int = 4):
-    """Run the ingestion process with Cloud Inference."""
+    """Run the ingestion process with DeepInfra embeddings."""
     
     # Use provided values
     global BATCH_SIZE, PARALLEL_WORKERS
@@ -574,8 +701,8 @@ def run_ingestion(xml_dir: Path, limit: Optional[int] = None, batch_size: int = 
     
     logger.info("=" * 70)
     logger.info("🚀 NIH Author Manuscript Ingestion")
-    logger.info("   Dense Vectors via Qdrant Cloud Inference")
-    logger.info("   (SPLADE sparse vectors added separately)")
+    logger.info("   Dense Vectors via DeepInfra API")
+    logger.info("   BM25 Sparse Vectors for Hybrid Search")
     logger.info("=" * 70)
     
     if not QDRANT_API_KEY:
@@ -583,17 +710,46 @@ def run_ingestion(xml_dir: Path, limit: Optional[int] = None, batch_size: int = 
         logger.info("   Set: export QDRANT_API_KEY='your_key'")
         sys.exit(1)
     
+    if not os.getenv("DEEPINFRA_API_KEY"):
+        logger.error("❌ DEEPINFRA_API_KEY not set!")
+        logger.info("   Set: export DEEPINFRA_API_KEY='your_key'")
+        sys.exit(1)
+    
     if not xml_dir.exists():
         logger.error(f"❌ XML directory not found: {xml_dir}")
         sys.exit(1)
     
-    # Connect to Qdrant with Cloud Inference enabled
-    # Enable Cloud Inference for server-side embeddings
+    # Initialize embedding provider
+    embedding_provider = EmbeddingProvider()
+    
+    # Initialize chunker (uses SemanticChunker if available)
+    ChunkerClass = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
+    chunker = ChunkerClass(
+        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+    )
+    logger.info(f"Using {ChunkerClass.__name__} for chunking")
+    
+    # Initialize sparse encoder
+    sparse_encoder = None
+    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
+        if BM25SparseEncoder is not None:
+            sparse_encoder = BM25SparseEncoder(
+                max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
+                max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
+                min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
+                remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
+            )
+            logger.info("✅ BM25 sparse encoder initialized")
+        else:
+            logger.warning("⚠️ BM25SparseEncoder not available")
+    
+    # Connect to Qdrant
     client = QdrantClient(
         url=QDRANT_URL,
         api_key=QDRANT_API_KEY,
         timeout=600,
-        cloud_inference=True  # Required for Document() vector type
+        prefer_grpc=IngestionConfig.USE_GRPC,
     )
     
     try:
@@ -607,14 +763,17 @@ def run_ingestion(xml_dir: Path, limit: Optional[int] = None, batch_size: int = 
         sys.exit(1)
     
     logger.info(f"\n📋 Configuration:")
-    logger.info(f"   Embedding model: {EMBEDDING_MODEL}")
+    logger.info(f"   Embedding provider: DeepInfra")
+    logger.info(f"   Embedding model: {IngestionConfig.EMBEDDING_MODEL}")
+    logger.info(f"   Chunk size: {IngestionConfig.CHUNK_SIZE_TOKENS} tokens")
+    logger.info(f"   Chunk overlap: {IngestionConfig.CHUNK_OVERLAP_TOKENS} tokens")
     logger.info(f"   Batch size: {BATCH_SIZE}")
     logger.info(f"   Parallel workers: {PARALLEL_WORKERS}")
-    logger.info(f"   Max text length: {MAX_TEXT_LENGTH}")
+    logger.info(f"   Data directory: {IngestionConfig.DATA_DIR}")
     
     # Get checkpoint
     counters = Counters()
-    ingested = get_checkpoint()
+    ingested = load_checkpoint()
     logger.info(f"   Already ingested: {len(ingested):,}")
     
     # Find XML files
@@ -649,7 +808,7 @@ def run_ingestion(xml_dir: Path, limit: Optional[int] = None, batch_size: int = 
     
     # Process in chunks for memory efficiency
     PARSE_BATCH_SIZE = 200
-    current_batch = []
+    current_batch: List[Dict[str, Any]] = []
     batch_num = 0
     
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
@@ -674,30 +833,8 @@ def run_ingestion(xml_dir: Path, limit: Optional[int] = None, batch_size: int = 
                     batch = current_batch[:BATCH_SIZE]
                     current_batch = current_batch[BATCH_SIZE:]
                     
-                    # Create points with Cloud Inference embedding
-                    points = []
-                    ids = []
-                    for article in batch:
-                        doc_id = article.get("pmcid") or article.get("pmid")
-                        if not doc_id:
-                            continue
-                        
-                        embedding_text = create_embedding_text(article)
-                        if len(embedding_text) < 50:
-                            continue
-                        
-                        # Generate deterministic UUID from doc_id
-                        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(doc_id)))
-                        payload = create_payload(article)
-                        
-                        # Use Document for Cloud Inference
-                        point = PointStruct(
-                            id=point_id,
-                            vector=Document(text=embedding_text, model=EMBEDDING_MODEL),
-                            payload=payload
-                        )
-                        points.append(point)
-                        ids.append(str(doc_id))
+                    # Build points with embeddings
+                    points, ids = build_points(batch, embedding_provider, chunker, sparse_encoder)
                     
                     if points:
                         future = executor.submit(upsert_batch, client, points, ids, counters)
@@ -711,35 +848,15 @@ def run_ingestion(xml_dir: Path, limit: Optional[int] = None, batch_size: int = 
                     if batch_num % PROGRESS_LOG_INTERVAL == 0:
                         rate = counters.get_rate()
                         logger.info(
-                            f"Progress: {counters.success:,} ingested, "
+                            f"Progress: {counters.success:,} points ingested, "
                             f"{counters.errors:,} errors, "
                             f"{counters.parse_errors:,} parse errors, "
-                            f"{rate:.1f}/sec"
+                            f"{rate:.1f} pts/sec"
                         )
             
             # Process remaining batch
             if current_batch:
-                points = []
-                ids = []
-                for article in current_batch:
-                    doc_id = article.get("pmcid") or article.get("pmid")
-                    if not doc_id:
-                        continue
-                    
-                    embedding_text = create_embedding_text(article)
-                    if len(embedding_text) < 50:
-                        continue
-                    
-                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, str(doc_id)))
-                    payload = create_payload(article)
-                    
-                    point = PointStruct(
-                        id=point_id,
-                        vector=Document(text=embedding_text, model=EMBEDDING_MODEL),
-                        payload=payload
-                    )
-                    points.append(point)
-                    ids.append(str(doc_id))
+                points, ids = build_points(current_batch, embedding_provider, chunker, sparse_encoder)
                 
                 if points:
                     future = executor.submit(upsert_batch, client, points, ids, counters)
@@ -766,18 +883,14 @@ def run_ingestion(xml_dir: Path, limit: Optional[int] = None, batch_size: int = 
     logger.info("✅ Author Manuscript Ingestion Complete!")
     logger.info("=" * 70)
     logger.info(f"📊 Results:")
-    logger.info(f"   Ingested: {counters.success:,}")
+    logger.info(f"   Ingested: {counters.success:,} points")
     logger.info(f"   Skipped (already done): {counters.skipped:,}")
     logger.info(f"   Parse errors: {counters.parse_errors:,}")
     logger.info(f"   Upload errors: {counters.errors:,}")
     logger.info(f"   Time: {elapsed/60:.1f} minutes")
-    logger.info(f"   Rate: {counters.get_rate():.1f} docs/sec")
+    logger.info(f"   Rate: {counters.get_rate():.1f} pts/sec")
     logger.info(f"   Collection total: {final_count:,}")
     logger.info("=" * 70)
-    
-    logger.info("\n📌 Next steps:")
-    logger.info("   1. Add SPLADE sparse vectors: python3 11_add_splade_vectors.py")
-    logger.info("   2. Verify with test query")
 
 
 def main():
@@ -812,13 +925,13 @@ Examples:
         "--batch-size",
         type=int,
         default=BATCH_SIZE,
-        help="Batch size for upserts (default: 50)"
+        help=f"Batch size for upserts (default: {BATCH_SIZE})"
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=PARALLEL_WORKERS,
-        help="Number of parallel workers (default: 4)"
+        help=f"Number of parallel workers (default: {PARALLEL_WORKERS})"
     )
     
     args = parser.parse_args()

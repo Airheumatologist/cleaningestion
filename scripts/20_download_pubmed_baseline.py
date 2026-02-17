@@ -11,6 +11,17 @@ Features:
 - Multi-threaded filtering
 - Checkpoint/resume support
 - Maps publication types to reranker-compatible article_type values
+- WHITELIST extraction: Only extracts specified PubMed XML fields
+
+Extracted Fields (Whitelist):
+- Identifiers: PMID, DOI, PMC, PII, other ArticleIds
+- Article Title (full text, no character limit)
+- Journal Info: Title, ISO Abbreviation, ISSN (with type), Volume, Issue, CitedMedium
+- Publication Date: Year, Month, Day or MedlineDate
+- Abstract: Full text (no limit) + structured sections (Label, NlmCategory)
+- MeSH Terms: DescriptorName (UI, MajorTopicYN) + QualifierName (UI, MajorTopicYN)
+- Keywords: Keyword (with MajorTopicYN, Owner)
+- Publication Types: Type (with UI)
 
 Usage:
     # Full pipeline (download + filter)
@@ -70,10 +81,19 @@ DEFAULT_MIN_YEAR = 2015
 # Target publication types (case-insensitive matching)
 # These are mapped to article_type values compatible with reranker.py tiers
 TARGET_PUBLICATION_TYPES = {
-    # TIER_1 types (1.80x boost in reranker)
+    # TIER_1 types (1.80x boost in reranker) - Highest evidence
     "practice guideline": "practice_guideline",
     "meta-analysis": "meta_analysis",
     "systematic review": "systematic_review",
+    # TIER_1 Clinical Trials (Phase 2 addition)
+    "randomized controlled trial": "randomized_controlled_trial",
+    "clinical trial": "clinical_trial",
+    "clinical trial, phase i": "clinical_trial_phase_i",
+    "clinical trial, phase ii": "clinical_trial_phase_ii",
+    "clinical trial, phase iii": "clinical_trial_phase_iii",
+    "clinical trial, phase iv": "clinical_trial_phase_iv",
+    "controlled clinical trial": "controlled_clinical_trial",
+    "multicenter study": "multicenter_study",
     # TIER_2 types (1.25x boost in reranker)
     "review": "review",
 }
@@ -196,17 +216,42 @@ def map_publication_type(pub_types: List[str]) -> str:
     1. Practice Guideline (TIER_1)
     2. Meta-Analysis (TIER_1)
     3. Systematic Review (TIER_1)
-    4. Review (TIER_2)
+    4. Randomized Controlled Trial (TIER_1)
+    5. Clinical Trial Phase III (TIER_1)
+    6. Clinical Trial Phase II (TIER_1)
+    7. Clinical Trial Phase IV (TIER_1)
+    8. Clinical Trial Phase I (TIER_1)
+    9. Controlled Clinical Trial (TIER_1)
+    10. Clinical Trial (general) (TIER_1)
+    11. Multicenter Study (TIER_1)
+    12. Review (TIER_2)
     """
     pub_types_lower = [pt.lower().strip() for pt in pub_types]
     
-    # Check in priority order
+    # Check in priority order (highest evidence first)
     if "practice guideline" in pub_types_lower:
         return "practice_guideline"
     if "meta-analysis" in pub_types_lower:
         return "meta_analysis"
     if "systematic review" in pub_types_lower:
         return "systematic_review"
+    # Phase 2 additions - Clinical Trials (TIER_1)
+    if "randomized controlled trial" in pub_types_lower:
+        return "randomized_controlled_trial"
+    if "clinical trial, phase iii" in pub_types_lower:
+        return "clinical_trial_phase_iii"
+    if "clinical trial, phase ii" in pub_types_lower:
+        return "clinical_trial_phase_ii"
+    if "clinical trial, phase iv" in pub_types_lower:
+        return "clinical_trial_phase_iv"
+    if "clinical trial, phase i" in pub_types_lower:
+        return "clinical_trial_phase_i"
+    if "controlled clinical trial" in pub_types_lower:
+        return "controlled_clinical_trial"
+    if "clinical trial" in pub_types_lower:
+        return "clinical_trial"
+    if "multicenter study" in pub_types_lower:
+        return "multicenter_study"
     if "review" in pub_types_lower:
         return "review"
     
@@ -219,130 +264,384 @@ def is_target_article(pub_types: List[str]) -> bool:
     return any(target in pub_types_lower for target in TARGET_PUBLICATION_TYPES.keys())
 
 
-def extract_article_data(article: ET.Element, min_year: int) -> Optional[Dict]:
-    """Extract article data from a PubmedArticle XML element."""
-    try:
-        # Get PMID
-        pmid_elem = article.find(".//PMID")
-        if pmid_elem is None or not pmid_elem.text:
-            return None
-        pmid = pmid_elem.text.strip()
+def parse_pubmed_date(pub_date_elem: ET.Element) -> Dict[str, Any]:
+    """
+    Parse PubDate element which can contain:
+    - Year, Month, Day elements
+    - Or MedlineDate string (e.g., "2024 Spring", "2024 Jan-Feb")
+    """
+    result = {
+        "year": None,
+        "month": None,
+        "day": None,
+        "medline_date": None,
+        "date_str": None
+    }
+    
+    if pub_date_elem is None:
+        return result
+    
+    # Try structured date first
+    year_elem = pub_date_elem.find("Year")
+    month_elem = pub_date_elem.find("Month")
+    day_elem = pub_date_elem.find("Day")
+    
+    if year_elem is not None and year_elem.text:
+        result["year"] = year_elem.text.strip()
         
-        # Get publication types
-        pub_type_elems = article.findall(".//PublicationType")
-        pub_types = [pt.text.strip() for pt in pub_type_elems if pt.text]
+    if month_elem is not None and month_elem.text:
+        result["month"] = month_elem.text.strip()
+        
+    if day_elem is not None and day_elem.text:
+        result["day"] = day_elem.text.strip()
+    
+    # If no Year, try MedlineDate
+    if result["year"] is None:
+        medline_date = pub_date_elem.find("MedlineDate")
+        if medline_date is not None and medline_date.text:
+            result["medline_date"] = medline_date.text.strip()
+            # Try to extract year from MedlineDate (usually starts with 4-digit year)
+            match = re.search(r'(\d{4})', result["medline_date"])
+            if match:
+                result["year"] = match.group(1)
+    
+    # Build date string
+    if result["year"]:
+        parts = [result["year"]]
+        if result["month"]:
+            parts.append(result["month"])
+            if result["day"]:
+                parts.append(result["day"])
+        result["date_str"] = " ".join(parts)
+    elif result["medline_date"]:
+        result["date_str"] = result["medline_date"]
+    
+    return result
+
+
+def extract_abstract(article_elem: ET.Element) -> Dict[str, Any]:
+    """
+    Extract abstract with support for structured abstracts.
+    Returns both full text and structured sections.
+    """
+    result = {
+        "abstract_text": "",
+        "abstract_structured": [],
+        "has_structured_abstract": False
+    }
+    
+    abstract_elem = article_elem.find(".//Abstract")
+    if abstract_elem is None:
+        return result
+    
+    abstract_parts = []
+    
+    for abstract_text in abstract_elem.findall("AbstractText"):
+        label = abstract_text.get("Label", "")
+        nlm_category = abstract_text.get("NlmCategory", "")
+        text = "".join(abstract_text.itertext()).strip()
+        
+        if text:
+            if label:
+                # Structured abstract section
+                result["has_structured_abstract"] = True
+                result["abstract_structured"].append({
+                    "label": label,
+                    "nlm_category": nlm_category,
+                    "text": text
+                })
+                abstract_parts.append(f"{label}: {text}")
+            else:
+                abstract_parts.append(text)
+    
+    result["abstract_text"] = " ".join(abstract_parts)
+    return result
+
+
+def extract_journal_info(article_elem: ET.Element) -> Dict[str, Any]:
+    """Extract journal information including Title, JournalIssue, ISSN."""
+    result = {
+        "title": None,
+        "iso_abbreviation": None,
+        "issn": None,
+        "issn_type": None,
+        "volume": None,
+        "issue": None,
+        "pub_date": {},
+        "cited_medium": None
+    }
+    
+    journal_elem = article_elem.find(".//Journal")
+    if journal_elem is None:
+        return result
+    
+    # ISSN
+    issn_elem = journal_elem.find("ISSN")
+    if issn_elem is not None:
+        result["issn"] = issn_elem.text.strip() if issn_elem.text else None
+        result["issn_type"] = issn_elem.get("IssnType")
+    
+    # Journal Title
+    title_elem = journal_elem.find("Title")
+    if title_elem is not None and title_elem.text:
+        result["title"] = title_elem.text.strip()
+    
+    # ISO Abbreviation
+    iso_elem = journal_elem.find("ISOAbbreviation")
+    if iso_elem is not None and iso_elem.text:
+        result["iso_abbreviation"] = iso_elem.text.strip()
+    
+    # Journal Issue
+    issue_elem = journal_elem.find("JournalIssue")
+    if issue_elem is not None:
+        result["cited_medium"] = issue_elem.get("CitedMedium")
+        
+        volume_elem = issue_elem.find("Volume")
+        if volume_elem is not None and volume_elem.text:
+            result["volume"] = volume_elem.text.strip()
+        
+        issue_num_elem = issue_elem.find("Issue")
+        if issue_num_elem is not None and issue_num_elem.text:
+            result["issue"] = issue_num_elem.text.strip()
+        
+        # Publication Date
+        pub_date_elem = issue_elem.find("PubDate")
+        result["pub_date"] = parse_pubmed_date(pub_date_elem)
+    
+    return result
+
+
+def extract_article_ids(article_elem: ET.Element) -> Dict[str, Any]:
+    """
+    Extract article identifiers from ArticleIdList.
+    Handles doi, pubmed, pmc, pii, etc.
+    """
+    result = {
+        "pmid": None,
+        "doi": None,
+        "pmc": None,
+        "pii": None,
+        "other_ids": {}
+    }
+    
+    # PMID from MedlineCitation
+    pmid_elem = article_elem.find(".//PMID")
+    if pmid_elem is not None and pmid_elem.text:
+        result["pmid"] = pmid_elem.text.strip()
+    
+    # ArticleIdList from PubmedData
+    for article_id in article_elem.findall(".//ArticleId"):
+        id_type = article_id.get("IdType", "").lower()
+        id_value = article_id.text.strip() if article_id.text else None
+        
+        if id_value:
+            if id_type == "doi":
+                result["doi"] = id_value
+            elif id_type == "pubmed":
+                result["pmid"] = id_value  # Confirm PMID
+            elif id_type == "pmc" or id_type == "pmcid":
+                result["pmc"] = id_value
+            elif id_type == "pii":
+                result["pii"] = id_value
+            else:
+                result["other_ids"][id_type] = id_value
+    
+    # Also check ELocationID in Article
+    for eloc_id in article_elem.findall(".//ELocationID"):
+        id_type = eloc_id.get("EIdType", "").lower()
+        id_value = eloc_id.text.strip() if eloc_id.text else None
+        
+        if id_value:
+            if id_type == "doi" and not result["doi"]:
+                result["doi"] = id_value
+            elif id_type == "pii" and not result["pii"]:
+                result["pii"] = id_value
+    
+    return result
+
+
+def extract_mesh_terms(article_elem: ET.Element) -> List[Dict[str, Any]]:
+    """
+    Extract MeSH headings with DescriptorName and QualifierName.
+    """
+    mesh_terms = []
+    
+    for mesh_heading in article_elem.findall(".//MeshHeading"):
+        descriptor = mesh_heading.find("DescriptorName")
+        if descriptor is not None and descriptor.text:
+            term = {
+                "descriptor": descriptor.text.strip(),
+                "descriptor_ui": descriptor.get("UI"),
+                "major_topic": descriptor.get("MajorTopicYN") == "Y",
+                "type": descriptor.get("Type"),
+                "qualifiers": []
+            }
+            
+            for qualifier in mesh_heading.findall("QualifierName"):
+                if qualifier.text:
+                    term["qualifiers"].append({
+                        "name": qualifier.text.strip(),
+                        "ui": qualifier.get("UI"),
+                        "major_topic": qualifier.get("MajorTopicYN") == "Y"
+                    })
+            
+            mesh_terms.append(term)
+    
+    return mesh_terms
+
+
+def extract_keywords(article_elem: ET.Element) -> List[Dict[str, Any]]:
+    """
+    Extract keywords from KeywordList.
+    """
+    keywords = []
+    
+    keyword_list = article_elem.find(".//KeywordList")
+    if keyword_list is not None:
+        owner = keyword_list.get("Owner", "")
+        
+        for keyword in keyword_list.findall("Keyword"):
+            if keyword.text:
+                keywords.append({
+                    "keyword": keyword.text.strip(),
+                    "major_topic": keyword.get("MajorTopicYN") == "Y",
+                    "owner": owner
+                })
+    
+    return keywords
+
+
+def extract_publication_types(article_elem: ET.Element) -> List[Dict[str, Any]]:
+    """
+    Extract publication types.
+    """
+    pub_types = []
+    
+    for pub_type in article_elem.findall(".//PublicationType"):
+        if pub_type.text:
+            pub_types.append({
+                "type": pub_type.text.strip(),
+                "ui": pub_type.get("UI")
+            })
+    
+    return pub_types
+
+
+def extract_article_title(article_elem: ET.Element) -> str:
+    """Extract article title, handling any nested elements."""
+    title_elem = article_elem.find(".//ArticleTitle")
+    if title_elem is not None:
+        return "".join(title_elem.itertext()).strip()
+    return ""
+
+
+def extract_article_data(article_elem: ET.Element, min_year: int) -> Optional[Dict]:
+    """
+    Extract article data from a PubmedArticle XML element.
+    Uses whitelist approach - only extracts specified fields.
+    
+    Whitelist:
+    - PMID
+    - Data Links (ArticleIdList: doi, pubmed, pmc)
+    - Article Title
+    - Journal Info (Title, JournalIssue, ISSN)
+    - Publication Date (PubDate)
+    - Abstract (with structured abstract support)
+    - Keywords (KeywordList)
+    - MeSH Terms (DescriptorName, QualifierName)
+    - Publication Types
+    """
+    try:
+        # Get ArticleIdList data (PMID, DOI, PMC, etc.)
+        article_ids = extract_article_ids(article_elem)
+        if not article_ids["pmid"]:
+            return None
+        
+        # Get publication types (needed for filtering)
+        pub_types_data = extract_publication_types(article_elem)
+        pub_types = [pt["type"] for pt in pub_types_data]
         
         # Check if target article type
         if not is_target_article(pub_types):
             return None
         
-        # Get year
-        year = None
-        pub_date = article.find(".//PubDate")
-        if pub_date is not None:
-            year_elem = pub_date.find("Year")
-            if year_elem is not None and year_elem.text:
-                try:
-                    year = int(year_elem.text)
-                except ValueError:
-                    pass
-            if year is None:
-                medline_date = pub_date.find("MedlineDate")
-                if medline_date is not None and medline_date.text:
-                    match = re.search(r'(\d{4})', medline_date.text)
-                    if match:
-                        year = int(match.group(1))
+        # Get Journal Info (includes publication date)
+        journal_info = extract_journal_info(article_elem)
+        
+        # Get year for filtering
+        year_str = journal_info["pub_date"].get("year")
+        try:
+            year = int(year_str) if year_str else None
+        except ValueError:
+            year = None
         
         # Filter by year
         if year is None or year < min_year:
             return None
         
-        # Get abstract
-        abstract_parts = article.findall(".//Abstract/AbstractText")
-        if not abstract_parts:
-            return None
+        # Get Abstract
+        abstract_data = extract_abstract(article_elem)
         
-        if len(abstract_parts) > 1:
-            # Structured abstract
-            abstract_sections = []
-            for part in abstract_parts:
-                label = part.get("Label", "")
-                text = "".join(part.itertext()).strip()
-                if text:
-                    if label:
-                        abstract_sections.append(f"{label}: {text}")
-                    else:
-                        abstract_sections.append(text)
-            abstract_text = " ".join(abstract_sections)
-        else:
-            abstract_text = "".join(abstract_parts[0].itertext()).strip()
-        
+        # Filter out articles without abstracts or with very short abstracts
+        abstract_text = abstract_data["abstract_text"]
         if not abstract_text or len(abstract_text) < 50:
             return None
         
-        # Get title
-        title_elem = article.find(".//ArticleTitle")
-        title = "".join(title_elem.itertext()).strip() if title_elem is not None else ""
+        # Get Article Title
+        article_title = extract_article_title(article_elem)
         
-        # Get journal
-        journal = ""
-        journal_elem = article.find(".//Journal/Title")
-        if journal_elem is not None and journal_elem.text:
-            journal = journal_elem.text.strip()
-        else:
-            iso_elem = article.find(".//Journal/ISOAbbreviation")
-            if iso_elem is not None and iso_elem.text:
-                journal = iso_elem.text.strip()
+        # Get MeSH Terms
+        mesh_terms = extract_mesh_terms(article_elem)
         
-        # Get authors (limit to first 10)
-        authors = []
-        for author in article.findall(".//Author")[:10]:
-            lastname = author.find("LastName")
-            forename = author.find("ForeName")
-            if lastname is not None and lastname.text:
-                name = lastname.text
-                if forename is not None and forename.text:
-                    name = f"{forename.text} {name}"
-                authors.append(name)
-        
-        # Get affiliations (limit to first 5)
-        affiliations = []
-        seen_affs = set()
-        for aff in article.findall(".//Affiliation")[:10]:
-            if aff.text and aff.text not in seen_affs:
-                affiliations.append(aff.text.strip())
-                seen_affs.add(aff.text)
-                if len(affiliations) >= 5:
-                    break
-        
-        # Get DOI
-        doi = None
-        for article_id in article.findall(".//ArticleId"):
-            if article_id.get("IdType") == "doi":
-                doi = article_id.text
-                break
-        
-        # Get MeSH terms
-        mesh_terms = []
-        for mesh in article.findall(".//MeshHeading/DescriptorName")[:20]:
-            if mesh.text:
-                mesh_terms.append(mesh.text)
+        # Get Keywords
+        keywords = extract_keywords(article_elem)
         
         # Map to article_type for reranker
         article_type = map_publication_type(pub_types)
         
+        # Build result - NO CHARACTER LIMITS on any field
         return {
-            "pmid": pmid,
-            "title": title,
+            # Identifiers (from ArticleIdList)
+            "pmid": article_ids["pmid"],
+            "doi": article_ids["doi"],
+            "pmc": article_ids["pmc"],
+            "pii": article_ids["pii"],
+            "other_ids": article_ids["other_ids"],
+            
+            # Article Title
+            "title": article_title,
+            
+            # Abstract
             "abstract": abstract_text,
+            "abstract_structured": abstract_data["abstract_structured"],
+            "has_structured_abstract": abstract_data["has_structured_abstract"],
+            
+            # Journal Info
+            "journal": journal_info["title"] or journal_info["iso_abbreviation"] or "",
+            "journal_full": {
+                "title": journal_info["title"],
+                "iso_abbreviation": journal_info["iso_abbreviation"],
+                "issn": journal_info["issn"],
+                "issn_type": journal_info["issn_type"],
+                "volume": journal_info["volume"],
+                "issue": journal_info["issue"],
+                "cited_medium": journal_info["cited_medium"],
+            },
+            
+            # Publication Date
             "year": year,
-            "journal": journal,
-            "authors": authors,
-            "affiliations": affiliations,
-            "doi": doi,
-            "mesh_terms": mesh_terms,
-            "publication_types": pub_types,
+            "publication_date": journal_info["pub_date"],
+            
+            # Classification
+            "mesh_terms": mesh_terms,  # Full MeSH structure with qualifiers
+            "mesh_terms_flat": [m["descriptor"] for m in mesh_terms],  # Simple list for compatibility
+            "keywords": keywords,  # Full keyword structure
+            "keywords_flat": [k["keyword"] for k in keywords],  # Simple list for compatibility
+            "publication_types": pub_types_data,
+            "publication_types_flat": pub_types,  # Simple list for compatibility
             "article_type": article_type,
+            
+            # Source info
             "source": "pubmed_abstract",
             "content_type": "abstract",
             "has_full_text": False,

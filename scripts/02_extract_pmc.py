@@ -52,36 +52,46 @@ MAX_ABSTRACT_CHARS = 2000
 
 def process_file_wrapper(xml_path: Path) -> Optional[Dict[str, Any]]:
     """Wrapper around parse_pmc_xml to add dataset-specific metadata."""
-    article = parse_pmc_xml(xml_path)
+    # Parse with PRD-compliant extraction
+    # Note: require_open_access=False here since we filter by license in caller if needed
+    article = parse_pmc_xml(xml_path, require_pmid=True, require_open_access=True)
     if not article:
         return None
 
-    year = article.get("year")
+    # Extract year from PRD-compliant structure
+    metadata = article.get("metadata", {})
+    publication = metadata.get("publication", {}) if metadata else {}
+    year = publication.get("year") if publication else article.get("year")
+    
     if year is None or year < MIN_YEAR or year > MAX_YEAR:
         return None
 
     # Calculate derived fields
-    authors = article.get("authors", [])
-    article["first_author"] = authors[0] if authors else None
-    article["author_count"] = len(authors)
-    
     section_titles = article.get("section_titles", [])
     has_methods = any('method' in t.lower() for t in section_titles)
     has_results = any('result' in t.lower() for t in section_titles)
     has_discussion = any('discuss' in t.lower() or 'conclu' in t.lower() for t in section_titles)
     
+    # Get table count from PRD structure
+    content = article.get("content", {})
+    tables = content.get("tables", []) if content else article.get("tables", [])
+    
+    # Get content flags
+    content_flags = metadata.get("content_flags", {}) if metadata else {}
+    is_open_access = content_flags.get("is_open_access", True) if content_flags else article.get("is_open_access", True)
+    has_full_text = content_flags.get("has_full_text", False) if content_flags else article.get("has_full_text", False)
+    
     article.update({
         "has_methods": has_methods,
         "has_results": has_results,
         "has_discussion": has_discussion,
-        "table_count": len(article.get("tables", [])),
-        "figure_count": 0, 
-        "is_open_access": True,
-        "has_full_text": bool(article.get("full_text")),
+        "table_count": len(tables),
+        "figure_count": 0,
+        "is_open_access": is_open_access,
+        "has_full_text": has_full_text,
         "source": "pmc",
         "source_file": str(xml_path),
         "extracted_at": datetime.utcnow().isoformat(),
-        "institutions": article.get("affiliations", [])[:5]
     })
     
     return article

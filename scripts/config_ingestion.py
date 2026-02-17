@@ -24,7 +24,8 @@ class IngestionConfig:
     QDRANT_GRPC_URL = os.getenv("QDRANT_GRPC_URL", "localhost:6334")
     COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", os.getenv("COLLECTION_NAME", "medical_rag"))
 
-    # Embedding options: "deepinfra" (default) or "local"
+    # Embedding provider: "deepinfra" (default) or "local"
+    # Note: Qdrant Cloud Inference has been removed - DeepInfra is the only API provider
     EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra")
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B-batch")
     QDRANT_INFERENCE_URL = os.getenv("QDRANT_INFERENCE_URL", "")
@@ -50,9 +51,11 @@ class IngestionConfig:
     EMBED_FILTER_ENABLED = _as_bool(os.getenv("EMBED_FILTER_ENABLED"), default=True)
     EMBED_FILTER_MODE = os.getenv("EMBED_FILTER_MODE", "conservative")
     EMBED_FILTER_PROFILE = os.getenv("EMBED_FILTER_PROFILE", "clinical_backmatter")
-    # Increased chunk size for Qwen context (32k supported, using 512 for granularity)
-    CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "512"))
-    CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "128"))
+    # Optimized chunk size: 2048 tokens for Qwen3-Embedding-0.6B (32k context window)
+    # Research shows 1024-2048 is optimal for medical QA with 10-15% overlap
+    # 2048 tokens provides rich context while fitting comfortably in 32k window
+    CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "2048"))
+    CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "256"))
 
     # Sparse indexing (BM25-style lexical sparse vectors)
     SPARSE_ENABLED = _as_bool(os.getenv("SPARSE_ENABLED"), default=True)
@@ -62,11 +65,16 @@ class IngestionConfig:
     SPARSE_MIN_TOKEN_LEN = int(os.getenv("SPARSE_MIN_TOKEN_LEN", "2"))
     SPARSE_REMOVE_STOPWORDS = _as_bool(os.getenv("SPARSE_REMOVE_STOPWORDS"), default=True)
 
+    # Quantization configuration
+    # Options: "scalar" (int8, recommended), "binary" (faster, less accurate), "none"
+    QUANTIZATION_TYPE = os.getenv("QUANTIZATION_TYPE", "scalar").strip().lower()
+    SCALAR_QUANTILE = float(os.getenv("SCALAR_QUANTILE", "0.99"))  # Clip outliers at 1st/99th percentile
+    QUANTIZATION_ALWAYS_RAM = _as_bool(os.getenv("QUANTIZATION_ALWAYS_RAM"), default=True)
+
     # Vector dimensions for different embedding providers
     # This ensures collection is created with the correct vector size
     EMBEDDING_DIMENSIONS = {
         "local": 1024,   # mixedbread-ai/mxbai-embed-large-v1
-        "qdrant_cloud_inference": 1024,  # Default for cloud inference
         "deepinfra": 1024,  # Qwen/Qwen3-Embedding-0.6B-batch
     }
 

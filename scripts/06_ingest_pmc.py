@@ -16,12 +16,27 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Document, PointStruct
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
-from ingestion_utils import Chunker, SectionFilter, EmbeddingProvider, upsert_with_retry
+from ingestion_utils import SectionFilter, EmbeddingProvider, upsert_with_retry
+from ingestion_utils import Chunker as BaseChunker  # Fallback
+
+# Import enhanced utilities if available
+try:
+    from ingestion_utils_enhanced import (
+        SemanticChunker, QualityValidator, 
+        ContentDeduplicator, enhance_pmc_parsing
+    )
+    ENHANCED_UTILS_AVAILABLE = True
+    Chunker = SemanticChunker  # Use semantic chunking by default
+    logger.info("Using SemanticChunker for improved chunking")
+except ImportError:
+    ENHANCED_UTILS_AVAILABLE = False
+    Chunker = BaseChunker  # Fallback to base chunker
+    logger.warning("Enhanced ingestion utils not available, using base Chunker")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_ingested_improved_ids.txt"
+CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_ingested_ids.txt"
 
 
 
@@ -44,26 +59,44 @@ else:
 
 def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
     """Create base payload for a PMC article."""
-    pmcid = str(article.get("pmcid") or "")
-    pmid = str(article.get("pmid") or "")
+    # Handle PRD-compliant structure
+    metadata = article.get("metadata", {})
+    content = article.get("content", {})
+    identifiers = metadata.get("identifiers", {}) if metadata else {}
+    publication = metadata.get("publication", {}) if metadata else {}
+    content_flags = metadata.get("content_flags", {}) if metadata else {}
+    classification = metadata.get("classification", {}) if metadata else {}
+    
+    pmcid = str(identifiers.get("pmcid") or article.get("pmcid") or "")
+    pmid = str(identifiers.get("pmid") or article.get("pmid") or "")
+    doi = identifiers.get("doi") or article.get("doi", "")
+    title = content.get("title", "") if content else article.get("title", "")
+    journal_info = publication.get("journal", {}) if publication else {}
+    journal = journal_info.get("title", "") if journal_info else article.get("journal", "")
+    year = publication.get("year") if publication else article.get("year")
+    country = publication.get("country", "") if publication else article.get("country", "")
+    
+    # Get tables for count
+    tables = content.get("tables", []) if content else article.get("tables", [])
     
     return {
         "doc_id": pmcid or pmid,
         "pmcid": pmcid,
         "pmid": pmid,
-        "doi": article.get("doi", ""),
-        "title": (article.get("title") or "")[:300],
-        "journal": article.get("journal", "")[:100],
-        "year": article.get("year"),
-        "authors": article.get("authors", [])[:20],
-        "keywords": article.get("keywords", [])[:20],
-        "mesh_terms": article.get("mesh_terms", [])[:30],
-        "article_type": article.get("article_type", "")[:50],
+        "doi": doi,
+        "title": title[:300],
+        "journal": journal[:100],
+        "year": year,
+
+        "keywords": classification.get("keywords", []) if classification else article.get("keywords", [])[:20],
+        "mesh_terms": classification.get("mesh_terms", []) if classification else article.get("mesh_terms", [])[:30],
+        "article_type": metadata.get("article_type", "") if metadata else article.get("article_type", "")[:50],
         "evidence_grade": article.get("evidence_grade", ""),
         "evidence_level": article.get("evidence_level"),
-        "country": article.get("country", ""),
-        "affiliations": article.get("affiliations", [])[:10],
-        "table_count": article.get("table_count", 0),
+        "country": country,
+        "table_count": len(tables),
+        "has_full_text": content_flags.get("has_full_text") if content_flags else article.get("has_full_text", False),
+        "is_open_access": content_flags.get("is_open_access") if content_flags else article.get("is_open_access", False),
         "source": "pmc",
     }
 
@@ -87,87 +120,180 @@ def append_checkpoint(ids: Iterable[str]) -> None:
                 f.write(f"{value}\n")
 
 
-def create_chunks_from_article(article: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Create multiple chunks from an article: sections + tables."""
-    chunks = []
-    doc_id = str(article.get("pmcid") or article.get("pmid") or "")
-    title = article.get("title", "")
+def create_chunks_from_article(article: Dict[str, Any], chunker: Chunker) -> List[Dict[str, Any]]:
+    """
+    Create multiple chunks from an article: sections + tables with token-aware chunking.
+    Updated for PRD v1.0 compliant article structure.
+    Includes full metadata propagation and parent-child ready fields.
+    """
+    from ingestion_utils import generate_section_id, get_section_weight
     
-    # 1. Abstract chunk (most important)
-    abstract = article.get("abstract", "")
-    if abstract and len(abstract) > 50:
+    chunks = []
+    
+    # Handle both PRD-compliant structure and legacy structure
+    metadata = article.get("metadata", {})
+    content = article.get("content", {})
+    
+    # Extract identifiers
+    identifiers = metadata.get("identifiers", {}) if metadata else {}
+    doc_id = str(identifiers.get("pmcid") or identifiers.get("pmid") or article.get("pmcid") or article.get("pmid") or "")
+    pmid = identifiers.get("pmid") or article.get("pmid", "")
+    
+    # Extract content
+    title = content.get("title", "") if content else article.get("title", "")
+    abstract_text = article.get("abstract", "")
+    
+    # Extract publication info
+    publication = metadata.get("publication", {}) if metadata else {}
+    journal = publication.get("journal", {}).get("title", "") if publication else article.get("journal", "")
+    year = publication.get("year") if publication else article.get("year")
+    country = publication.get("country", "") if publication else article.get("country", "")
+    
+    # Extract classification
+    classification = metadata.get("classification", {}) if metadata else {}
+    keywords = classification.get("keywords", []) if classification else article.get("keywords", [])
+    mesh_terms = classification.get("mesh_terms", []) if classification else article.get("mesh_terms", [])
+    
+    # Common metadata for all chunks (full metadata propagation)
+    # Note: Author information excluded per requirements
+    base_metadata = {
+        "title": title,
+        "abstract": abstract_text,
+        "journal": journal,
+        "year": year,
+        "pmcid": identifiers.get("pmcid") if identifiers else article.get("pmcid"),
+        "pmid": pmid,
+        "country": country,
+        "keywords": keywords,
+        "mesh_terms": mesh_terms,
+    }
+    
+    # 1. Abstract chunk (most important) - usually fits in single chunk
+    if abstract_text and len(abstract_text) > 50:
+        abstract_full_text = f"Title: {title}\n\nAbstract: {abstract_text}"
+        section_id = generate_section_id(doc_id, "Abstract")
+        
         chunks.append({
             "chunk_id": f"{doc_id}_abstract",
             "doc_id": doc_id,
-            "text": f"Title: {title}\n\nAbstract: {abstract}",
+            "text": abstract_full_text,
             "section_type": "abstract",
             "section_title": "Abstract",
             "is_table": False,
+            # Parent-child ready fields
+            "full_section_text": abstract_full_text,
+            "section_id": section_id,
+            "section_weight": get_section_weight("abstract"),
+            **base_metadata,
         })
     
-    # 2. Section chunks
-    sections = article.get("structured_sections", [])
+    # 2. Section chunks with token-aware splitting
+    # Use PRD-compliant sections structure
+    sections = content.get("sections", []) if content else article.get("structured_sections", [])
     for i, section in enumerate(sections):
-        sec_text = section.get("text", "")
-        if len(sec_text) < 50:
+        # Skip excluded sections (references, acknowledgments, etc.)
+        if SectionFilter.should_exclude(section):
             continue
             
-        # Section context with title
-        section_context = f"Title: {title}\n\nSection: {section.get('title', 'Body')}\n\n{sec_text}"
+        # PRD structure uses "content" field, legacy uses "text"
+        sec_text = section.get("content", "") or section.get("text", "")
+        if len(sec_text) < 50:
+            continue
         
-        # Split long sections into smaller chunks (5000 chars each)
-        max_chunk_size = 5000
-        if len(section_context) > max_chunk_size:
-            for j in range(0, len(section_context), max_chunk_size):
-                chunk_text = section_context[j:j+max_chunk_size]
-                chunks.append({
-                    "chunk_id": f"{doc_id}_sec{i}_part{j//max_chunk_size}",
-                    "doc_id": doc_id,
-                    "text": chunk_text,
-                    "section_type": section.get("type", "body"),
-                    "section_title": section.get("title", "Body"),
-                    "is_table": False,
-                })
-        else:
+        sec_title = section.get("title", "Body")
+        sec_type = section.get("type", "other")
+        
+        # Generate section ID for parent-child indexing
+        section_id = generate_section_id(doc_id, sec_title)
+        
+        # Create context-rich prefix
+        prefix = f"Title: {title}\n\nSection: {sec_title}\n\n"
+        full_section_text = prefix + sec_text
+        
+        # Use Chunker for token-aware chunking
+        section_chunks = chunker.chunk_text(full_section_text)
+        
+        for j, chunk_data in enumerate(section_chunks):
+            chunk_id = f"{doc_id}_sec{i}_part{j}" if len(section_chunks) > 1 else f"{doc_id}_sec{i}"
             chunks.append({
-                "chunk_id": f"{doc_id}_sec{i}",
+                "chunk_id": chunk_id,
                 "doc_id": doc_id,
-                "text": section_context,
-                "section_type": section.get("type", "body"),
-                "section_title": section.get("title", "Body"),
+                "text": chunk_data["text"],
+                "section_type": sec_type,
+                "section_title": sec_title,
                 "is_table": False,
+                # Parent-child ready fields
+                "full_section_text": full_section_text,
+                "section_id": section_id,
+                "section_weight": get_section_weight(sec_type),
+                **base_metadata,
             })
     
-    # 3. Table chunks (NEW - embed each table separately)
-    tables = article.get("tables", [])
+    # 3. Table chunks with token-aware chunking for large tables
+    tables = content.get("tables", []) if content else article.get("tables", [])
     for i, table in enumerate(tables):
-        # Use row-by-row format for better semantic search
-        table_text = table.get("row_by_row", "")
-        caption = table.get("caption", "")
+        # PRD-compliant table structure
+        if isinstance(table, dict):
+            if "content" in table:  # PRD structure
+                table_text = table.get("content", "")
+                caption = table.get("caption_title", "")
+                table_label = table.get("label", "")
+                table_id = table.get("id", f"table-{i}")
+                full_caption = f"{table_label}: {caption}".strip(": ")
+            else:  # Legacy structure
+                table_text = table.get("row_by_row", "") or table.get("markdown", "")
+                full_caption = table.get("caption", "")
+                table_id = table.get("id", f"table-{i}")
+        else:
+            continue
         
-        if not table_text and table.get("markdown"):
-            # Fallback to markdown if row_by_row not available
-            table_text = table.get("markdown", "")
+        if not table_text or len(table_text) < 20:
+            continue
         
-        if table_text and len(table_text) > 20:
-            # Create context-rich table text
-            table_context = f"Title: {title}\n\nTable: {caption}\n\n{table_text}"
-            
+        # Generate section ID for table
+        section_title = f"Table: {full_caption[:100]}" if full_caption else f"Table {i}"
+        section_id = generate_section_id(doc_id, section_title)
+        
+        # Create context-rich table text
+        table_context = f"Title: {title}\n\n{section_title}\n\n{table_text}"
+        
+        # Use Chunker for token-aware chunking of large tables
+        table_chunks = chunker.chunk_text(table_context)
+        
+        for j, chunk_data in enumerate(table_chunks):
+            chunk_id = f"{doc_id}_table{i}_part{j}" if len(table_chunks) > 1 else f"{doc_id}_table{i}"
             chunks.append({
-                "chunk_id": f"{doc_id}_table{i}",
+                "chunk_id": chunk_id,
                 "doc_id": doc_id,
-                "text": table_context[:8000],  # Tables can be long
+                "text": chunk_data["text"],
                 "section_type": "table",
-                "section_title": f"Table: {caption[:100]}",
+                "section_title": section_title,
                 "is_table": True,
-                "table_caption": caption,
-                "table_id": table.get("id", f"table-{i}"),
+                "table_caption": full_caption,
+                "table_id": table_id,
+                # Parent-child ready fields
+                "full_section_text": table_context,
+                "section_id": section_id,
+                "section_weight": get_section_weight("table"),
+                **base_metadata,
             })
     
     return chunks
 
 
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder=None) -> tuple[List[PointStruct], List[str]]:
+def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder=None, 
+                validate_chunks: bool = True, dedup_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
+    """
+    Build Qdrant points from article batch.
+    
+    Args:
+        batch: List of parsed articles
+        embedding_provider: Provider for generating embeddings
+        sparse_encoder: Optional sparse encoder for hybrid search
+        validate_chunks: Whether to validate chunk quality before ingestion
+        dedup_chunks: Whether to deduplicate chunks within batch
+    """
+    # Use SemanticChunker if available, otherwise fallback to base Chunker
     chunker = Chunker(
         chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
         overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
@@ -176,17 +302,52 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     points: List[PointStruct] = []
     all_chunk_ids: List[str] = []
     
+    # Initialize deduplicator if enabled
+    dedup = None
+    if dedup_chunks and ENHANCED_UTILS_AVAILABLE:
+        dedup = ContentDeduplicator()
+    
     # Collect all chunks for batch embedding
     all_chunks: List[Dict[str, Any]] = []
     all_texts: List[str] = []
     
     for article in batch:
-        chunks = create_chunks_from_article(article)
+        chunks = create_chunks_from_article(article, chunker)
+        
+        # Validate chunks if enabled
+        if validate_chunks and ENHANCED_UTILS_AVAILABLE:
+            valid_chunks = []
+            for chunk in chunks:
+                is_valid, issues = QualityValidator.validate_chunk(
+                    chunk["text"],
+                    {k: chunk.get(k) for k in ["doc_id", "chunk_id", "title", "authors", "year"]}
+                )
+                if is_valid:
+                    valid_chunks.append(chunk)
+                else:
+                    logger.debug("Skipping invalid chunk %s: %s", chunk.get("chunk_id"), issues)
+            chunks = valid_chunks
+        
+        # Deduplicate chunks if enabled
+        if dedup:
+            unique_chunks = []
+            for chunk in chunks:
+                metadata = {
+                    "doc_id": chunk.get("doc_id", ""),
+                    "chunk_id": chunk.get("chunk_id", "")
+                }
+                if not dedup.is_duplicate(chunk["text"], metadata):
+                    unique_chunks.append(chunk)
+            chunks = unique_chunks
+        
         all_chunks.extend(chunks)
         all_texts.extend([c["text"] for c in chunks])
     
     if not all_texts:
         return [], []
+    
+    logger.info("Embedding %s chunks (validated: %s, deduped: %s)", 
+                len(all_texts), validate_chunks, dedup_chunks)
     
     # Embed all texts in batch
     try:
@@ -206,16 +367,43 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             sparse_vector = sparse_encoder.encode_document(chunk["text"])
             vector_data["sparse"] = sparse_vector
         
-        # Create payload
+        # Create payload with FULL metadata (CRITICAL: page_content for retriever)
         payload = {
+            # Core identifiers
             "doc_id": chunk["doc_id"],
             "chunk_id": chunk_id,
+            "pmcid": chunk.get("pmcid", ""),
+            "pmid": chunk.get("pmid", ""),
+            
+            # CRITICAL: Full text for retriever (was missing!)
+            "page_content": chunk["text"],
+            
+            # Article metadata for citations and filtering
+            "title": chunk.get("title", ""),
+            "abstract": chunk.get("abstract", ""),
+            "journal": chunk.get("journal", ""),
+            "year": chunk.get("year"),
+            "country": chunk.get("country", ""),
+            "keywords": chunk.get("keywords", []),
+            "mesh_terms": chunk.get("mesh_terms", []),
+            
+            # Section information (PRD-compliant types)
             "section_type": chunk["section_type"],
             "section_title": chunk["section_title"],
             "is_table": chunk.get("is_table", False),
             "table_caption": chunk.get("table_caption", ""),
+            
+            # Parent-child indexing fields
+            "full_section_text": chunk.get("full_section_text", chunk["text"]),
+            "section_id": chunk.get("section_id", ""),
+            "section_weight": chunk.get("section_weight", 0.5),
+            
+            # Source and type
             "source": "pmc",
-            "article_type": "research_article",
+            "article_type": chunk.get("section_type", "other"),
+            "has_full_text": True,
+            
+            # Preview for dashboard browsing (keep for UI)
             "text_preview": chunk["text"][:500],
         }
         
@@ -345,7 +533,7 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
 
     # Calculate batches
     THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE # e.g. 25
-    MAX_WORKERS = 32  # Use more of the 200 concurrent request rate limit
+    MAX_WORKERS = IngestionConfig.MAX_WORKERS  # Respect configuration from .env
     
     # Create batches generator/list
     file_batches = [all_xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(all_xml_files), THREAD_BATCH_SIZE)]

@@ -104,7 +104,13 @@ TIER_1_TYPES = {
 }
 TIER_2_TYPES = {
     "clinical_trial", "clinical trial",
-    "randomized_controlled_trial", "rct",
+    "clinical_trial_phase_i", "clinical trial, phase i",
+    "clinical_trial_phase_ii", "clinical trial, phase ii", 
+    "clinical_trial_phase_iii", "clinical trial, phase iii",
+    "clinical_trial_phase_iv", "clinical trial, phase iv",
+    "controlled_clinical_trial", "controlled clinical trial",
+    "multicenter_study", "multicenter study",
+    "randomized_controlled_trial", "rct", "randomized controlled trial",
     "review_article", "review article", "review",
     "drug_label", "drug label"
 }
@@ -938,9 +944,6 @@ ArticleReranker = PaperFinderWithReranker
 if __name__ == "__main__":
     print("🧪 Testing ScholarQA-style Reranker")
     print("=" * 60)
-    
-    # Test reranker
-    reranker = CohereReranker()
     
     sample_passages = [
         {"pmcid": "PMC001", "title": "COPD Treatment", "text": "COPD management...", "year": 2023, "journal": "Lancet", "authors": [{"name": "Smith J"}]},

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Document, PointStruct
+from qdrant_client.models import PointStruct
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
 from src.bm25_sparse import BM25SparseEncoder
@@ -32,25 +32,64 @@ UPDATE_DOWNLOAD_DIR = IngestionConfig.DATA_DIR / "pubmed_updatefiles"
 
 
 class EmbeddingProvider:
+    """Embedding provider using DeepInfra API or local models."""
+    
     def __init__(self) -> None:
         self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
         self.model = IngestionConfig.EMBEDDING_MODEL
         self.local_encoder = None
+        self.openai_client = None
 
-        if self.provider == "local":
+        if self.provider == "deepinfra":
+            from openai import OpenAI
+            api_key = os.getenv("DEEPINFRA_API_KEY")
+            if not api_key:
+                raise ValueError("DEEPINFRA_API_KEY not set - required for deepinfra embedding provider")
+            self.openai_client = OpenAI(
+                api_key=api_key,
+                base_url="https://api.deepinfra.com/v1/openai"
+            )
+            logger.info("DeepInfra embedding provider initialized (model: %s)", self.model)
+        elif self.provider == "local":
             from sentence_transformers import SentenceTransformer
-
             logger.info("Loading local embedding model: %s", self.model)
             self.local_encoder = SentenceTransformer(self.model)
 
-    def use_cloud(self) -> bool:
-        return self.provider == "qdrant_cloud_inference"
-
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        if self.local_encoder is None:
-            raise RuntimeError("Local encoder not initialized")
-        vectors = self.local_encoder.encode(texts, normalize_embeddings=True, batch_size=IngestionConfig.EMBEDDING_BATCH_SIZE)
-        return [v.tolist() for v in vectors]
+        if self.provider == "deepinfra":
+            return self._embed_deepinfra(texts)
+        elif self.local_encoder is not None:
+            vectors = self.local_encoder.encode(texts, normalize_embeddings=True, batch_size=IngestionConfig.EMBEDDING_BATCH_SIZE)
+            return [v.tolist() for v in vectors]
+        else:
+            raise RuntimeError("No embedding provider available")
+    
+    def _embed_deepinfra(self, texts: List[str]) -> List[List[float]]:
+        """Embed using DeepInfra OpenAI-compatible API with sub-batching."""
+        batch_size = IngestionConfig.EMBEDDING_BATCH_SIZE
+        
+        if len(texts) <= batch_size:
+            return self._embed_deepinfra_single(texts)
+        
+        all_embeddings: List[List[float]] = []
+        for i in range(0, len(texts), batch_size):
+            sub_batch = texts[i:i + batch_size]
+            embeddings = self._embed_deepinfra_single(sub_batch)
+            all_embeddings.extend(embeddings)
+        return all_embeddings
+
+    def _embed_deepinfra_single(self, texts: List[str]) -> List[List[float]]:
+        """Send a single embedding request to DeepInfra."""
+        try:
+            response = self.openai_client.embeddings.create(
+                model=self.model,
+                input=texts,
+                encoding_format="float"
+            )
+            return [data.embedding for data in response.data]
+        except Exception as e:
+            logger.error("DeepInfra embedding failed: %s", e)
+            raise
 
 
 
@@ -261,34 +300,17 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     if not all_chunks_text:
         return [], pmids
 
-    # Embed all chunks
-    if embedding_provider.use_cloud():
-        for i, text in enumerate(all_chunks_text):
-            payload = chunk_metadata[i]
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chunk:{payload['chunk_id']}"))
-            sparse_vector = all_chunks_sparse[i]
-            vector_data: Any = Document(text=text, model=embedding_provider.model)
-            if sparse_vector is not None:
-                vector_data = {"": vector_data, "sparse": sparse_vector}
-            
-            points.append(
-                PointStruct(
-                    id=point_id,
-                    vector=vector_data,
-                    payload=payload,
-                )
-            )
-    else:
-        vectors = embedding_provider.embed_batch(all_chunks_text)
-        for i, vector in enumerate(vectors):
-            payload = chunk_metadata[i]
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chunk:{payload['chunk_id']}"))
-            sparse_vector = all_chunks_sparse[i]
-            vector_data: Any = vector
-            if sparse_vector is not None:
-                vector_data = {"": vector, "sparse": sparse_vector}
-            
-            points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
+    # Embed all chunks using DeepInfra or local provider
+    vectors = embedding_provider.embed_batch(all_chunks_text)
+    for i, vector in enumerate(vectors):
+        payload = chunk_metadata[i]
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chunk:{payload['chunk_id']}"))
+        sparse_vector = all_chunks_sparse[i]
+        vector_data: Any = {"dense": vector}
+        if sparse_vector is not None:
+            vector_data["sparse"] = sparse_vector
+        
+        points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
 
     return points, pmids
 
@@ -366,7 +388,6 @@ def main() -> None:
         url=IngestionConfig.QDRANT_URL,
         api_key=IngestionConfig.QDRANT_API_KEY or None,
         timeout=600,
-        cloud_inference=embedding_provider.use_cloud(),
         prefer_grpc=IngestionConfig.USE_GRPC,
     )
 

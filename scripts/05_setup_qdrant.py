@@ -9,6 +9,13 @@ import sys
 
 import requests
 from qdrant_client import QdrantClient, models
+from qdrant_client.models import (
+    BinaryQuantization,
+    BinaryQuantizationConfig,
+    ScalarQuantization,
+    ScalarQuantizationConfig,
+    ScalarType,
+)
 
 from config_ingestion import IngestionConfig
 
@@ -16,8 +23,38 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _get_quantization_config():
+    """Get quantization configuration based on settings."""
+    quant_type = IngestionConfig.QUANTIZATION_TYPE
+    
+    if quant_type == "scalar":
+        logger.info("Using Scalar Quantization (int8) - 75%% memory reduction")
+        return ScalarQuantization(
+            scalar=ScalarQuantizationConfig(
+                type=ScalarType.INT8,
+                quantile=IngestionConfig.SCALAR_QUANTILE,
+                always_ram=IngestionConfig.QUANTIZATION_ALWAYS_RAM,
+            )
+        )
+    elif quant_type == "binary":
+        logger.info("Using Binary Quantization - 87.5%% memory reduction")
+        return BinaryQuantization(
+            binary=BinaryQuantizationConfig(
+                always_ram=IngestionConfig.QUANTIZATION_ALWAYS_RAM
+            )
+        )
+    else:
+        logger.info("Quantization disabled")
+        return None
+
+
 def _patch_2bit_quantization(collection_name: str) -> None:
     """Attempt 2-bit quantization patch using REST for Qdrant >=1.15."""
+    # Only apply 2-bit patch if using binary quantization
+    if IngestionConfig.QUANTIZATION_TYPE != "binary":
+        logger.info("Skipping 2-bit patch (not using binary quantization)")
+        return
+        
     payload = {
         "quantization_config": {
             "binary": {
@@ -131,7 +168,18 @@ def main() -> None:
     parser.add_argument("--keep-existing", action="store_true")
     parser.add_argument("--shards", type=int, default=4)
     parser.add_argument("--no-2bit", action="store_true", help="Skip 2-bit patch and keep standard binary")
+    parser.add_argument(
+        "--quantization",
+        choices=["scalar", "binary", "none"],
+        default=IngestionConfig.QUANTIZATION_TYPE,
+        help="Quantization type (default: from env or scalar)",
+    )
     args = parser.parse_args()
+    
+    # Override config with CLI arg if provided
+    if args.quantization != IngestionConfig.QUANTIZATION_TYPE:
+        logger.info(f"Overriding quantization type: {IngestionConfig.QUANTIZATION_TYPE} -> {args.quantization}")
+        IngestionConfig.QUANTIZATION_TYPE = args.quantization
 
     setup_collection(
         collection_name=args.collection_name,

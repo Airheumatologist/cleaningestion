@@ -25,7 +25,6 @@ source .venv/bin/activate || source venv/bin/activate
 # Install updated dependencies
 echo ""
 echo "📦 Installing updated dependencies..."
-pip install --upgrade transformers>=4.51.0 sentence-transformers>=2.7.0
 pip install -r requirements.txt
 
 # Verify environment variables

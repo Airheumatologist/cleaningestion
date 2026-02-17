@@ -25,6 +25,18 @@ try:
     sys.path.insert(0, str(Path(__file__).parent.parent))  # Add root to path for src
     from config_ingestion import IngestionConfig, ensure_data_dirs
     from ingestion_utils import EmbeddingProvider, upsert_with_retry
+    from ingestion_utils import Chunker as BaseChunker
+    
+    # Import enhanced utilities for semantic chunking and validation
+    try:
+        from ingestion_utils_enhanced import SemanticChunker, QualityValidator, ContentDeduplicator
+        ENHANCED_UTILS_AVAILABLE = True
+        Chunker = SemanticChunker  # Use semantic chunking by default
+        logger.info("Using SemanticChunker for improved chunking")
+    except ImportError:
+        ENHANCED_UTILS_AVAILABLE = False
+        Chunker = BaseChunker
+        logger.warning("Enhanced utils not available, using base Chunker")
     
     # Import BM25SparseEncoder
     import importlib.util
@@ -42,27 +54,90 @@ except Exception as import_err:
 NS = {"hl7": "urn:hl7-org:v3"}
 
 # LOINC Codes for Common Drug Label Sections
+# Source: https://www.fda.gov/industry/structured-product-labeling-resources/section-headings-loinc
 SECTION_CODES = {
+    # --- HIGH PRIORITY SECTIONS (Included) ---
+    "34066-3": ("highlights", "Highlights of Prescribing Information"),
     "34067-9": ("indications", "Indications & Usage"),
     "34068-7": ("dosage", "Dosage & Administration"), 
-    "43683-2": ("recent_major_changes", "Recent Major Changes"),
     "34070-3": ("contraindications", "Contraindications"),
-    "34071-1": ("warnings", "Warnings & Precautions"), 
-    "34072-9": ("adverse_reactions", "Adverse Reactions"),
+    # Warnings can be coded as 34071-1 (Warnings) or 43685-7 (Warnings and Precautions)
+    "34071-1": ("warnings", "Warnings"),
+    "43685-7": ("warnings", "Warnings & Precautions"),
+    "34084-4": ("adverse_reactions", "Adverse Reactions"),  # CORRECT: was 34072-9
     "34073-7": ("interactions", "Drug Interactions"),
     "34066-1": ("boxed_warning", "Boxed Warning"),
+    # Use in Specific Populations can be 34074-5 or parent 43684-0
     "34074-5": ("use_in_specific_populations", "Use in Specific Populations"),
-    "34076-0": ("overdosage", "Overdosage"),
-    "34069-5": ("description", "Description"),
-    "34089-3": ("clinical_pharmacology", "Clinical Pharmacology"),
-    "34090-1": ("nonclinical_toxicology", "Nonclinical Toxicology"),
-    "34091-9": ("clinical_studies", "Clinical Studies"),
-    "34092-7": ("references", "References"),
-    "34093-5": ("supply", "How Supplied/Storage"),
-    "34075-2": ("patient_counseling", "Patient Counseling Information"),
-    "42232-9": ("precautions", "Precautions"),
-    "42229-5": ("spl_unclassified", "Unclassified Section"),
-    "51945-4": ("package_insert", "Package Insert"),
+    "43684-0": ("use_in_specific_populations", "Use in Specific Populations"),
+    "34092-7": ("clinical_studies", "Clinical Studies"),  # CORRECT: was 34091-9
+    
+    # --- EXCLUDED SECTIONS ---
+    "43678-2": ("dosage_forms", "Dosage Forms & Strengths"),  # EXCLUDED per requirements
+    "34076-0": ("overdosage", "Overdosage"),  # EXCLUDED per requirements
+    "34069-5": ("description", "Description"),  # EXCLUDED - inactive ingredients
+    "34089-3": ("clinical_pharmacology", "Clinical Pharmacology"),  # EXCLUDED
+    "34090-1": ("nonclinical_toxicology", "Nonclinical Toxicology"),  # EXCLUDED
+    "34093-5": ("references", "References"),  # EXCLUDED
+    "43683-2": ("recent_major_changes", "Recent Major Changes"),  # EXCLUDED - metadata about label updates
+    "44425-7": ("storage", "Storage and Handling"),  # EXCLUDED
+    "34075-2": ("patient_counseling", "Patient Counseling Information"),  # EXCLUDED
+    "88436-1": ("patient_counseling_new", "Patient Counseling Information (New Code)"),  # EXCLUDED
+    "42232-9": ("precautions", "Precautions"),  # EXCLUDED - covered in warnings
+    "42229-5": ("spl_unclassified", "Unclassified Section"),  # EXCLUDED
+    "51945-4": ("package_insert", "Package Insert"),  # EXCLUDED
+    "48780-1": ("spl_product_data", "SPL Product Data Elements"),  # EXCLUDED
+    # Old/incorrect codes that might appear in some documents
+    "34072-9": ("precautions_old", "General Precautions (Old)"),  # EXCLUDED - use warnings instead
+    "34091-9": ("animal_pharmacology", "Animal Pharmacology"),  # EXCLUDED
+    "34088-5": ("overdosage_alt", "Overdosage (Alternate)"),  # EXCLUDED
+    "34086-9": ("abuse", "Abuse Section"),  # EXCLUDED
+    "34087-7": ("dependence", "Dependence Section"),  # EXCLUDED
+    "34085-1": ("controlled_substance", "Controlled Substance"),  # EXCLUDED
+    "43679-0": ("mechanism_of_action", "Mechanism of Action"),  # EXCLUDED
+    "43681-6": ("pharmacodynamics", "Pharmacodynamics"),  # EXCLUDED
+    "43682-4": ("pharmacokinetics", "Pharmacokinetics"),  # EXCLUDED
+    "34083-6": ("carcinogenesis", "Carcinogenesis & Mutagenesis"),  # EXCLUDED
+    "34079-4": ("labor_delivery", "Labor & Delivery"),  # EXCLUDED
+    "34077-8": ("teratogenic_effects", "Teratogenic Effects"),  # EXCLUDED
+    "34078-6": ("nonteratogenic_effects", "Nonteratogenic Effects"),  # EXCLUDED
+    "34080-2": ("nursing_mothers", "Nursing Mothers (Old)"),  # EXCLUDED - covered in Use in Specific Populations
+    "77290-5": ("lactation", "Lactation"),  # EXCLUDED - covered in Use in Specific Populations
+    "77291-3": ("reproductive_potential", "Females & Males of Reproductive Potential"),  # EXCLUDED - covered in Use in Specific Populations
+    "34081-0": ("pediatric_use", "Pediatric Use"),  # EXCLUDED - covered in Use in Specific Populations
+    "34082-8": ("geriatric_use", "Geriatric Use"),  # EXCLUDED - covered in Use in Specific Populations
+    "88828-9": ("renal_impairment", "Renal Impairment"),  # EXCLUDED - covered in Use in Specific Populations
+    "88829-7": ("hepatic_impairment", "Hepatic Impairment"),  # EXCLUDED - covered in Use in Specific Populations
+}
+
+# Whitelist of LOINC codes to include (strict filtering)
+WHITELIST_LOINC_CODES = {
+    "34066-3",  # Highlights
+    "34067-9",  # Indications & Usage
+    "34068-7",  # Dosage & Administration
+    "34070-3",  # Contraindications
+    "34071-1",  # Warnings (older format)
+    "43685-7",  # Warnings and Precautions (PLR format)
+    "34084-4",  # Adverse Reactions (CORRECTED from 34072-9)
+    "34073-7",  # Drug Interactions
+    "34074-5",  # Use in Specific Populations
+    "43684-0",  # Use in Specific Populations (parent section)
+    "34092-7",  # Clinical Studies (CORRECTED from 34091-9)
+    "34066-1",  # Boxed Warning (if present)
+}
+
+# Section weights for retrieval priority
+SECTION_WEIGHTS = {
+    "highlights": 1.0,
+    "boxed_warning": 1.0,
+    "contraindications": 0.95,
+    "warnings": 0.9,
+    "indications": 0.85,
+    "dosage": 0.85,
+    "adverse_reactions": 0.8,
+    "interactions": 0.8,
+    "use_in_specific_populations": 0.75,
+    "clinical_studies": 0.7,
 }
 
 def get_text(element: Optional[ET.Element]) -> str:
@@ -73,60 +148,51 @@ def get_text(element: Optional[ET.Element]) -> str:
 
 
 def parse_table_to_markdown(table_elem: ET.Element) -> str:
-    """Parse an HTML table to Markdown format, handling colspans and rowspans."""
+    """
+    Parse an HTML table to Markdown format, handling colspans and rowspans.
+    Uses shared parsing logic from ingestion_utils.
+    """
     if table_elem is None:
         return ""
-
-    rows = []
-    # Find all rows (thead and tbody)
-    # Note: SPL tables often use thead/tbody, but sometimes just trs directly
-    tr_elements = table_elem.xpath(".//hl7:tr", namespaces=NS)
     
-    if not tr_elements:
+    # Import shared parsing function
+    from ingestion_utils import _parse_table_to_rows
+    
+    parsed_rows, max_cols = _parse_table_to_rows(table_elem, ns=NS)
+    
+    if not parsed_rows:
         return ""
-
-    # Calculate max columns to normalize table width
-    max_cols = 0
-    parsed_rows = []
-
-    for tr in tr_elements:
-        row_cells = []
-        cells = tr.xpath("hl7:th|hl7:td", namespaces=NS)
-        for cell in cells:
-            cell_text = get_text(cell).replace("\n", " ").strip()
-            # Handle colspan (default to 1)
-            colspan = int(cell.get("colspan", "1"))
-            # We don't perfectly handle rowspan in markdown, but we can fill empty cells or just repeat
-            # For simplicity in RAG, repeating the value or leaving blank is often okay.
-            # Here we just expand colspan.
-            row_cells.append(cell_text)
-            for _ in range(colspan - 1):
-                row_cells.append("") # Empty cell for skipped col
-        
-        parsed_rows.append(row_cells)
-        max_cols = max(max_cols, len(row_cells))
-
+    
     # Build Markdown
     md_lines = []
     
     # Header
-    if parsed_rows:
-        header_row = parsed_rows[0]
-        # Ensure header has max_cols
-        header_row.extend([""] * (max_cols - len(header_row)))
-        md_lines.append("| " + " | ".join(header_row) + " |")
-        md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
-        
-        # Body
-        for row in parsed_rows[1:]:
-            row.extend([""] * (max_cols - len(row)))
-            md_lines.append("| " + " | ".join(row) + " |")
+    header_row = parsed_rows[0]
+    header_row.extend([""] * (max_cols - len(header_row)))
+    md_lines.append("| " + " | ".join(header_row) + " |")
+    md_lines.append("| " + " | ".join(["---"] * max_cols) + " |")
+    
+    # Body
+    for row in parsed_rows[1:]:
+        row.extend([""] * (max_cols - len(row)))
+        md_lines.append("| " + " | ".join(row) + " |")
 
     return "\n".join(md_lines)
 
 
 def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
-    """Parse DailyMed SPL XML file with full section and table extraction using lxml."""
+    """Parse DailyMed SPL XML file with STRICT section filtering.
+    
+    Only includes whitelisted high-value clinical sections:
+    - Highlights, Indications, Dosage, Contraindications
+    - Warnings, Adverse Reactions, Drug Interactions
+    - Use in Specific Populations, Clinical Studies
+    
+    Excludes: Dosage Forms, Description, References, Package Insert, etc.
+    
+    Note: For parent sections (Dosage, Warnings, etc.) that contain subsections,
+    we aggregate text from all child subsections since the parent <text> is often empty.
+    """
     try:
         tree = ET.parse(str(xml_path))
         root = tree.getroot()
@@ -159,10 +225,10 @@ def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
         if org_name:
             manufacturer = get_text(org_name[0])
 
-        # Parse ALL sections
+        # Parse ONLY whitelisted sections
         sections: Dict[str, Dict[str, Any]] = {}
         
-        # Find all sections that have codes or titles
+        # First pass: collect all whitelisted sections and their content
         section_elements = root.xpath(".//hl7:section", namespaces=NS)
         
         for section in section_elements:
@@ -170,35 +236,51 @@ def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
             title_elem = section.xpath("hl7:title", namespaces=NS)
             text_elem = section.xpath("hl7:text", namespaces=NS)
             
-            # Determine section key and title
-            section_key = ""
-            section_title = ""
+            # STRICT FILTERING: Must have a whitelisted LOINC code
+            if not code_elem:
+                continue
+                
+            code = code_elem[0].get("code", "")
             
-            if code_elem:
-                code = code_elem[0].get("code", "")
-                if code in SECTION_CODES:
-                    section_key, section_title = SECTION_CODES[code]
-                else:
-                    # Non-standard section, use code as fallback key or generate one
-                    section_key = code or "unknown_section"
+            # Skip if not in whitelist
+            if code not in WHITELIST_LOINC_CODES:
+                continue
             
-            if not section_title and title_elem:
-                section_title = get_text(title_elem[0])
+            # Get section key and title from SECTION_CODES
+            section_key, section_title = SECTION_CODES[code]
             
-            if not section_key and section_title:
-                # Slugify title for key
-                section_key = section_title.lower().replace(" ", "_").replace("/", "_")[:30]
-
-            if not section_key:
-                section_key = f"section_{uuid.uuid4().hex[:8]}"
-
-            # Get section text
+            # Get section text (direct content)
             section_text = get_text(text_elem[0]) if text_elem else ""
             
-            # Parse tables within this section
+            # IMPORTANT: For parent sections (Dosage, Warnings, etc.), also aggregate
+            # text from child subsections, since parent <text> is often empty
+            child_sections = section.xpath("hl7:component/hl7:section", namespaces=NS)
+            child_texts = []
+            for child in child_sections:
+                child_text_elem = child.xpath("hl7:text", namespaces=NS)
+                if child_text_elem:
+                    child_text = get_text(child_text_elem[0])
+                    if child_text:
+                        child_title = child.xpath("hl7:title/text()", namespaces=NS)
+                        if child_title:
+                            child_texts.append(f"{child_title[0]}: {child_text}")
+                        else:
+                            child_texts.append(child_text)
+            
+            # Combine parent text with child subsection texts
+            all_text_parts = []
+            if section_text:
+                all_text_parts.append(section_text)
+            if child_texts:
+                all_text_parts.extend(child_texts)
+            
+            combined_text = "\n\n".join(all_text_parts) if all_text_parts else ""
+            
+            # Parse tables within this section and its children (only for whitelisted sections)
             tables = []
-            if text_elem:
-                table_elements = text_elem[0].xpath(".//hl7:table", namespaces=NS)
+            all_text_elements = section.xpath(".//hl7:text", namespaces=NS)  # Get all text elements in section + children
+            for te in all_text_elements:
+                table_elements = te.xpath(".//hl7:table", namespaces=NS)
                 for i, table in enumerate(table_elements):
                     table_content = parse_table_to_markdown(table)
                     if table_content:
@@ -208,21 +290,49 @@ def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
                             "type": f"table_{i}"
                         })
             
-            # Only add if interesting
-            if section_text or tables:
+            # Only add if has content
+            if combined_text or tables:
                 # If we already have this section (e.g. repeated codes), append
                 if section_key in sections:
                     existing = sections[section_key]
-                    existing["text"] += "\n\n" + section_text
+                    if combined_text:
+                        existing["text"] += "\n\n" + combined_text
                     existing["tables"].extend(tables)
                     existing["has_tables"] = existing["has_tables"] or (len(tables) > 0)
                 else:
                     sections[section_key] = {
                         "title": section_title,
-                        "text": section_text[:20000],  # Increased limit
+                        "text": combined_text[:20000],
                         "tables": tables,
                         "has_tables": len(tables) > 0
                     }
+        
+        # Extract Highlights from excerpts (special handling)
+        # Highlights are stored in <excerpt><highlight> within whitelisted sections
+        highlights_texts = []
+        for section in section_elements:
+            code_elem = section.xpath("hl7:code", namespaces=NS)
+            if not code_elem:
+                continue
+            code = code_elem[0].get("code", "")
+            if code not in WHITELIST_LOINC_CODES:
+                continue
+            
+            for excerpt in section.xpath(".//hl7:excerpt//hl7:highlight", namespaces=NS):
+                highlight_text = get_text(excerpt)
+                if highlight_text and len(highlight_text) > 50:
+                    highlights_texts.append(highlight_text)
+        
+        # Only add highlights section if we found content
+        if highlights_texts:
+            # Avoid duplicate content that's already in main sections
+            combined_highlights = "\n\n".join(highlights_texts)
+            sections["highlights"] = {
+                "title": "Highlights of Prescribing Information",
+                "text": combined_highlights[:15000],  # Limit size
+                "tables": [],
+                "has_tables": False
+            }
 
         return {
             "set_id": set_id,
@@ -239,38 +349,27 @@ def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Create multiple chunks per drug - one per section + one per table."""
+def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -> List[Dict[str, Any]]:
+    """
+    Create chunks for whitelisted sections only.
+    Uses SECTION_WEIGHTS for retrieval priority.
+    """
+    import hashlib
+    
     chunks = []
+    raw_chunks = []  # Collect chunks before validation
     set_id = drug.get("set_id", "")
     drug_name = drug.get("drug_name", "")
-    ingredients = ", ".join(drug.get("active_ingredients", []))
-    
-    # 1. Drug overview chunk (summary)
-    overview_text = f"Drug: {drug_name}. "
-    if ingredients:
-        overview_text += f"Active ingredients: {ingredients}. "
-    
-    # Add key sections to overview
+    manufacturer = drug.get("manufacturer", "")
+    active_ingredients = drug.get("active_ingredients", [])
     sections = drug.get("sections", {})
-    if "indications" in sections:
-        overview_text += f"Indications: {sections['indications']['text'][:500]}. "
-    if "dosage" in sections:
-        overview_text += f"Dosage: {sections['dosage']['text'][:300]}. "
     
-    chunks.append({
-        "chunk_id": f"{set_id}_overview",
-        "set_id": set_id,
-        "drug_name": drug_name,
-        "section_type": "overview",
-        "section_title": "Drug Overview",
-        "text": overview_text[:1500],
-        "manufacturer": drug.get("manufacturer", ""),
-        "active_ingredients": drug.get("active_ingredients", []),
-        "source": "dailymed",
-    })
+    # Helper to generate section_id
+    def generate_section_id(doc_id: str, section_title: str) -> str:
+        content = f"{doc_id}:{section_title.lower().strip()}"
+        return hashlib.sha256(content.encode()).hexdigest()[:16]
     
-    # 2. Individual section chunks (for detailed search)
+    # Process ONLY whitelisted sections
     for section_key, section_data in sections.items():
         section_text = section_data["text"]
         section_title = section_data["title"]
@@ -279,40 +378,89 @@ def create_chunks(drug: Dict[str, Any]) -> List[Dict[str, Any]]:
         if len(section_text) < 50 and not section_data.get("has_tables"):
             continue
         
+        # Get section weight (default 0.7 for tables, 0.5 otherwise)
+        section_weight = SECTION_WEIGHTS.get(section_key, 0.7 if section_data.get("has_tables") else 0.5)
+        
+        # Generate section_id
+        section_id = generate_section_id(set_id, section_title)
+        
         # Create chunk with drug context
-        # Use markdown header for section title
-        chunk_text = f"# {drug_name} - {section_title}\n\n{section_text}"
+        full_section_text = f"# {drug_name} - {section_title}\n\n{section_text}"
         
-        chunks.append({
-            "chunk_id": f"{set_id}_{section_key}",
-            "set_id": set_id,
-            "drug_name": drug_name,
-            "section_type": section_key,
-            "section_title": section_title,
-            "text": chunk_text[:3000], # Increased limit
-            "has_tables": section_data.get("has_tables", False),
-            "manufacturer": drug.get("manufacturer", ""),
-            "active_ingredients": drug.get("active_ingredients", []),
-            "source": "dailymed",
-        })
+        # Use chunker for token-aware splitting
+        section_chunks = chunker.chunk_text(full_section_text)
         
-        # 3. Table chunks (if present)
-        for table in section_data.get("tables", []):
-            table_text = f"# {drug_name} - {section_title} Table\n\n{table['content']}"
+        for j, chunk_data in enumerate(section_chunks):
+            chunk_id = f"{set_id}_{section_key}_part{j}" if len(section_chunks) > 1 else f"{set_id}_{section_key}"
+            chunk_text = chunk_data["text"]
+            
             chunks.append({
-                "chunk_id": f"{set_id}_{section_key}_table_{table['index']}",
+                "chunk_id": chunk_id,
                 "set_id": set_id,
                 "drug_name": drug_name,
-                "section_type": "table",
-                "section_title": f"{section_title} Table",
-                "table_type": section_key,
-                "text": table_text[:2500],
-                "manufacturer": drug.get("manufacturer", ""),
-                "active_ingredients": drug.get("active_ingredients", []),
+                "section_type": section_key,
+                "section_title": section_title,
+                "text": chunk_text,
+                "has_tables": section_data.get("has_tables", False),
+                "manufacturer": manufacturer,
+                "active_ingredients": active_ingredients,
                 "source": "dailymed",
+                # Parent-child ready fields
+                "full_section_text": full_section_text,
+                "section_id": section_id,
+                "section_weight": section_weight,
+                "page_content": chunk_text,
             })
+        
+        # Table chunks (only for whitelisted sections - already filtered in parse)
+        for table in section_data.get("tables", []):
+            table_full_text = f"# {drug_name} - {section_title} Table\n\n{table['content']}"
+            table_section_id = generate_section_id(set_id, f"{section_title} Table")
+            
+            # Use chunker for table chunking if large
+            table_chunks = chunker.chunk_text(table_full_text)
+            
+            for j, chunk_data in enumerate(table_chunks):
+                chunk_id = f"{set_id}_{section_key}_table_{table['index']}_part{j}" if len(table_chunks) > 1 else f"{set_id}_{section_key}_table_{table['index']}"
+                chunk_text = chunk_data["text"]
+                
+                raw_chunks.append({
+                    "chunk_id": chunk_id,
+                    "set_id": set_id,
+                    "drug_name": drug_name,
+                    "section_type": "table",
+                    "section_title": f"{section_title} Table",
+                    "table_type": section_key,
+                    "text": chunk_text,
+                    "manufacturer": manufacturer,
+                    "active_ingredients": active_ingredients,
+                    "source": "dailymed",
+                    # Parent-child ready fields
+                    "full_section_text": table_full_text,
+                    "section_id": table_section_id,
+                    "section_weight": 0.75,  # Tables get slightly higher weight
+                    "page_content": chunk_text,
+                })
     
-    return chunks
+    # Combine all chunks
+    all_chunks = chunks + raw_chunks
+    
+    # Validate chunks if enabled
+    if validate_chunks and ENHANCED_UTILS_AVAILABLE:
+        valid_chunks = []
+        for chunk in all_chunks:
+            is_valid, issues = QualityValidator.validate_chunk(
+                chunk["text"],
+                {k: chunk.get(k) for k in ["set_id", "chunk_id", "drug_name", "section_title"]}
+            )
+            if is_valid:
+                valid_chunks.append(chunk)
+            else:
+                logger.debug("Skipping invalid chunk %s: %s", chunk.get("chunk_id"), issues)
+        all_chunks = valid_chunks
+        logger.debug("Validated chunks: %d valid out of %d total", len(all_chunks), len(chunks) + len(raw_chunks))
+    
+    return all_chunks
 
 
 
@@ -396,13 +544,20 @@ def append_checkpoint(ids: Iterable[str]) -> None:
                 f.write(f"{value}\n")
 
 
-def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock) -> Tuple[int, int]:
+def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker=None) -> Tuple[int, int]:
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
     skipped = 0
     
     drugs = []
     new_ids = []
+    
+    # Create chunker if not provided (uses SemanticChunker if available)
+    if chunker is None:
+        chunker = Chunker(
+            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+        )
     
     # 1. Parse and filter
     for xml_file in batch_files:
@@ -439,7 +594,7 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
     # 2. Chunk and Embedding
     all_chunks = []
     for drug in drugs:
-        all_chunks.extend(create_chunks(drug))
+        all_chunks.extend(create_chunks(drug, chunker))
         
     if not all_chunks:
         return 0, len(batch_files)
@@ -465,12 +620,11 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
 def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     ensure_data_dirs()
     
-    # Preload tokenizer
+    # Preload tokenizer (uses SemanticChunker if available)
     logger.info("Preloading tokenizer...")
     try:
-        from ingestion_utils import Chunker
         Chunker()
-        logger.info("Tokenizer preloaded.")
+        logger.info("Tokenizer preloaded (using %s).", Chunker.__name__)
     except Exception as e:
         logger.warning("Tokenizer preload failed: %s", e)
 
@@ -512,7 +666,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     
     # Batching config
     THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE
-    MAX_WORKERS = IngestionConfig.MAX_WORKERS # Should be 64 now
+    MAX_WORKERS = IngestionConfig.MAX_WORKERS  # Standardized to use config value (default: 8)
     
     file_batches = [xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(xml_files), THREAD_BATCH_SIZE)]
     total_batches = len(file_batches)

@@ -52,6 +52,23 @@ FALLBACK_LLM_ENABLED = True
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra").strip().lower()
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B-batch")
 EMBEDDING_DIMENSION = 1024  # Qwen/Qwen3-Embedding-0.6B output dimension
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
+
+# =============================================================================
+# Chunking Configuration (CRITICAL: Must match .env values)
+# =============================================================================
+# Optimized for Qwen3-Embedding-0.6B (32k context window)
+CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "2048"))
+CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "256"))
+
+# Quantization Configuration
+# =============================================================================
+QUANTIZATION_TYPE = os.getenv("QUANTIZATION_TYPE", "scalar").strip().lower()
+SCALAR_QUANTILE = float(os.getenv("SCALAR_QUANTILE", "0.99"))
+QUANTIZATION_ALWAYS_RAM = _env_bool("QUANTIZATION_ALWAYS_RAM", default=True)
+# Search rescore improves accuracy with quantized vectors
+QUANTIZATION_RESCORE = _env_bool("QUANTIZATION_RESCORE", default=True)
+QUANTIZATION_OVERSAMPLING = float(os.getenv("QUANTIZATION_OVERSAMPLING", "1.5"))
 
 # SPLADE Sparse Vector Configuration
 SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
@@ -71,11 +88,12 @@ SCORE_THRESHOLD = 0.25  # Lowered from 0.3 to capture more relevant papers
 # Lower threshold helps retrieve more candidates before aggressive filtering
 
 # Chunk retrieval/reranking profile for chunk-level indexing
-RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "800"))
-MAX_CHUNKS_PER_ARTICLE_PRE_RERANK = int(os.getenv("MAX_CHUNKS_PER_ARTICLE_PRE_RERANK", "3"))
-RERANK_INPUT_CHUNK_LIMIT = int(os.getenv("RERANK_INPUT_CHUNK_LIMIT", "450"))
-RERANK_TOP_CHUNKS = int(os.getenv("RERANK_TOP_CHUNKS", "220"))
-FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "100"))
+# Aligned with .env values for 2048-token chunks (larger chunks = fewer needed)
+RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "400"))
+MAX_CHUNKS_PER_ARTICLE_PRE_RERANK = int(os.getenv("MAX_CHUNKS_PER_ARTICLE_PRE_RERANK", "2"))
+RERANK_INPUT_CHUNK_LIMIT = int(os.getenv("RERANK_INPUT_CHUNK_LIMIT", "200"))
+RERANK_TOP_CHUNKS = int(os.getenv("RERANK_TOP_CHUNKS", "100"))
+FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "50"))
 
 # =============================================================================
 # Reranker Configuration
@@ -88,8 +106,9 @@ RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
 # Query Preprocessing Configuration
 # =============================================================================
 QUERY_EXPANSION_COUNT = 2  # Number of expanded query variations (3 total with base query)
-BULK_RETRIEVAL_LIMIT = 600  # Increased from 300 for better coverage
-BULK_RETRIEVAL_PER_QUERY = 150  # Increased from 75 - more candidates before reranking
+# Bulk retrieval limits (adjusted for larger 2048-token chunks)
+BULK_RETRIEVAL_LIMIT = 300  # Reduced from 600 - larger chunks need fewer candidates
+BULK_RETRIEVAL_PER_QUERY = 100  # Reduced from 150 - more efficient with larger chunks
 RERANK_TOP_K = FINAL_TOP_ARTICLES  # Final articles after paper-level aggregation
 MAX_ABSTRACTS = FINAL_TOP_ARTICLES  # Context article cap
 MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ingest PubMed Abstracts to Qdrant with Hybrid Vectors.
+Ingest PubMed Abstracts to Qdrant with Hybrid Vectors and Token-Based Chunking.
 
 Ingests high-value PubMed abstracts (Reviews, Meta-Analyses, Practice Guidelines)
 matching the shared architecture of PMC/DailyMed ingestion.
@@ -8,20 +8,34 @@ matching the shared architecture of PMC/DailyMed ingestion.
 Features:
 - Embedding: Uses centralized EmbeddingProvider (Cohere/Local)
 - Sparse: BM25 (if enabled in config)
-- Chunking: Title + Abstract
+- Chunking: Token-based chunking (splits when content exceeds CHUNK_SIZE_TOKENS)
 - Deduplication: PMID-based UUIDs
 - Consistency: Shares config with other ingestion scripts
+- Supports full structured data from whitelist extraction (MeSH with qualifiers,
+  structured abstracts, detailed journal info)
+
+Payload Structure:
+- Identifiers: pmid, doi, pmc, pii, other_ids
+- Content: title, abstract (no limits), abstract_structured, page_content
+- Journal: journal, journal_full (ISSN, volume, issue, etc.)
+- Dates: year, publication_date
+- Classification: mesh_terms, mesh_terms_full, keywords, keywords_full, publication_types
+- Evidence: article_type, evidence_grade, evidence_level
+- Chunking: chunk_index, total_chunks, parent_section_id
 
 Usage:
     python 21_ingest_pubmed_abstracts.py --input /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 """
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import logging
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -34,7 +48,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
-from ingestion_utils import EmbeddingProvider, upsert_with_retry
+from ingestion_utils import Chunker as BaseChunker, EmbeddingProvider, upsert_with_retry
+
+# Import enhanced utilities for semantic chunking and validation
+try:
+    from ingestion_utils_enhanced import SemanticChunker, QualityValidator, ContentDeduplicator
+    ENHANCED_UTILS_AVAILABLE = True
+    logger.info("Using SemanticChunker for improved chunking")
+except ImportError:
+    ENHANCED_UTILS_AVAILABLE = False
+    logger.warning("Enhanced utils not available")
 
 # Import BM25SparseEncoder
 spec = importlib.util.find_spec("src.bm25_sparse")
@@ -48,20 +71,78 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
 
-# Evidence grades mapping based on article_type
+# Evidence grades mapping based on article_type (aligned with ingestion_utils.EVIDENCE_HIERARCHY)
 EVIDENCE_GRADES = {
-    "practice_guideline": "A",
+    # Tier 1: Highest evidence (A)
+    "meta-analysis": "A",
     "meta_analysis": "A",
+    "systematic-review": "A",
     "systematic_review": "A",
+    "practice-guideline": "A",
+    "practice_guideline": "A",
+    "guideline": "A",
+    # Phase 2 additions - Clinical Trials (all Tier 1)
+    "randomized-controlled-trial": "A",
+    "randomized_controlled_trial": "A",
+    "clinical-trial": "A",
+    "clinical_trial": "A",
+    "clinical-trial-phase-i": "A",
+    "clinical_trial_phase_i": "A",
+    "clinical-trial-phase-ii": "A",
+    "clinical_trial_phase_ii": "A",
+    "clinical-trial-phase-iii": "A",
+    "clinical_trial_phase_iii": "A",
+    "clinical-trial-phase-iv": "A",
+    "clinical_trial_phase_iv": "A",
+    "controlled-clinical-trial": "A",
+    "controlled_clinical_trial": "A",
+    "multicenter-study": "A",
+    "multicenter_study": "A",
+    # Tier 2: Moderate evidence (B)
     "review": "B",
+    "review-article": "B",
+    "review_article": "B",
+    "cohort-study": "B",
+    "cohort_study": "B",
+    # Tier 3: Lower evidence (C)
+    "case-report": "C",
+    "case_report": "C",
 }
 
+# Note: Tokenizer is handled by the shared Chunker class from ingestion_utils
+# We use Chunker's token counting for consistency across all ingestion scripts
 
 
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+def count_tokens(text: str) -> int:
+    """Count tokens using the shared Chunker's tokenizer."""
+    chunker = _get_chunker()
+    if chunker and hasattr(chunker, 'tokenizer') and chunker.tokenizer is not None:
+        try:
+            tokens = chunker.tokenizer.encode(text, add_special_tokens=False)
+            return len(tokens)
+        except Exception:
+            pass
+    # Fallback: approximate with word count (1 token ≈ 0.75 words)
+    return int(len(text.split()) / 0.75)
 
-checkpoint_lock = threading.Lock()
+
+# Initialize shared Chunker instance (uses SemanticChunker if available)
+_chunker_instance: Optional[Any] = None
+_checkpoint_lock = threading.Lock()
+
+
+def _get_chunker():
+    """Get or initialize the shared Chunker instance."""
+    global _chunker_instance
+    if _chunker_instance is None:
+        # Use SemanticChunker if available, otherwise fallback to base Chunker
+        ChunkerClass = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
+        _chunker_instance = ChunkerClass(
+            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+        )
+    return _chunker_instance
+
 
 def load_checkpoint() -> set[str]:
     if CHECKPOINT_FILE.exists():
@@ -70,61 +151,246 @@ def load_checkpoint() -> set[str]:
 
 
 def append_checkpoint(ids: List[str]) -> None:
-    with checkpoint_lock:
+    with _checkpoint_lock:
         with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
             for value in ids:
                 f.write(f"{value}\n")
 
 
-def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
-    """Create payload matching existing schema."""
+def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Create one or more payloads with token-based chunking.
+    
+    If the content exceeds CHUNK_SIZE_TOKENS, it will be split into multiple
+    chunks with overlap. Each chunk becomes a separate point in Qdrant.
+    
+    Returns:
+        List of payload dictionaries (one per chunk)
+    """
     article_type = article.get("article_type", "review")
     evidence_grade = EVIDENCE_GRADES.get(article_type, "C")
     
-    return {
-        # Identifiers
-        "doc_id": article.get("pmid"),
-        "pmcid": None,
-        "pmid": article.get("pmid"),
-        "doi": article.get("doi"),
+    pmid = article.get("pmid")
+    title = article.get("title", "")
+    abstract = article.get("abstract", "")
+    
+    # Create full content text
+    full_text = f"Title: {title}\n\nAbstract: {abstract}" if title or abstract else ""
+    
+    # Get chunking config
+    chunk_size = IngestionConfig.CHUNK_SIZE_TOKENS
+    chunk_overlap = IngestionConfig.CHUNK_OVERLAP_TOKENS
+    
+    # Count total tokens
+    total_tokens = count_tokens(full_text)
+    
+    # Get structured abstract sections if available
+    abstract_structured = article.get("abstract_structured", [])
+    has_structured = article.get("has_structured_abstract", False)
+    
+    # Get journal info
+    journal_full = article.get("journal_full", {})
+    pub_date = article.get("publication_date", {})
+    
+    # Build mesh_terms
+    mesh_terms = article.get("mesh_terms", [])
+    if mesh_terms and isinstance(mesh_terms[0], dict):
+        mesh_flat = [m["descriptor"] for m in mesh_terms]
+    else:
+        mesh_flat = mesh_terms if mesh_terms else []
+        mesh_terms = []
+    
+    # Build keywords
+    keywords = article.get("keywords", [])
+    if keywords and isinstance(keywords[0], dict):
+        keywords_flat = [k["keyword"] for k in keywords]
+    else:
+        keywords_flat = keywords if keywords else []
+        keywords = []
+    
+    # Get publication types
+    pub_types_data = article.get("publication_types", [])
+    if pub_types_data and isinstance(pub_types_data[0], dict):
+        pub_types_flat = [p["type"] for p in pub_types_data]
+    else:
+        pub_types_flat = pub_types_data if pub_types_data else []
+    
+    # Base section ID (for single chunk or parent reference)
+    base_section_id = hashlib.sha256(f"{pmid}:Abstract".encode()).hexdigest()[:16]
+    
+    payloads = []
+    
+    # Use shared Chunker for consistent chunking across all ingestion scripts
+    chunker = _get_chunker()
+    
+    # Determine if chunking is needed
+    if total_tokens <= chunk_size:
+        # Single chunk - no splitting needed
+        payload = {
+            # Identifiers
+            "doc_id": pmid,
+            "chunk_id": f"{pmid}_abstract",
+            "pmcid": article.get("pmc"),
+            "pmid": pmid,
+            "doi": article.get("doi"),
+            "pii": article.get("pii"),
+            "other_ids": article.get("other_ids", {}),
+            
+            # Content
+            "page_content": full_text,
+            "title": title,
+            "abstract": abstract,
+            
+            # Chunking metadata
+            "chunk_index": 0,
+            "total_chunks": 1,
+            "token_count": total_tokens,
+            
+            # Abstract structure
+            "abstract_structured": abstract_structured,
+            "has_structured_abstract": has_structured,
+            "full_text": "",
+            
+            # Publication info
+            "year": article.get("year"),
+            "journal": article.get("journal", ""),
+            "journal_full": journal_full,
+            "publication_date": pub_date,
+            "article_type": article_type,
+            "publication_type": pub_types_flat,
+            "publication_types_full": pub_types_data,
+            
+            # Evidence
+            "evidence_grade": evidence_grade,
+            "evidence_level": {"A": 1, "B": 2, "C": 3, "D": 4}.get(evidence_grade, 3),
+            
+            # Classification
+            "mesh_terms": mesh_flat,
+            "mesh_terms_full": mesh_terms,
+            "keywords": keywords_flat,
+            "keywords_full": keywords,
+            
+            # Parent-child fields
+            "full_section_text": full_text,
+            "section_id": base_section_id,
+            "section_weight": 1.0,
+            "section_type": "abstract",
+            "section_title": "Abstract",
+            
+            # Metadata
+            "source": "pubmed_abstract",
+            "content_type": "abstract",
+            "has_full_text": False,
+            "table_count": 0,
+            "text_preview": full_text[:500],
+        }
+        payloads.append(payload)
+    else:
+        # Multi-chunk: split content using shared Chunker
+        chunk_results = chunker.chunk_text(full_text)
         
-        # Content
-        "title": (article.get("title") or "")[:300],
-        "abstract": (article.get("abstract") or "")[:2000],
-        "full_text": "", 
-        
-        # Publication info
-        "year": article.get("year"),
-        "journal": (article.get("journal") or "")[:200],
-        "article_type": article_type,
-        "publication_type": article.get("publication_types", [])[:5],
-        
-        # Evidence
-        "evidence_grade": evidence_grade,
-        "evidence_level": {"A": 1, "B": 2, "C": 3, "D": 4}.get(evidence_grade, 3),
-        "country": None,
-        "affiliations": article.get("affiliations", [])[:3],
-        
-        # Classification
-        "keywords": [],
-        "mesh_terms": article.get("mesh_terms", [])[:15],
-        
-        # Authors
-        "authors": article.get("authors", [])[:5],
-        
-        # Metadata
-        "source": "pubmed_abstract",
-        "content_type": "abstract",
-        "has_full_text": False,
-        "table_count": 0,
-    }
+        for i, chunk_data in enumerate(chunk_results):
+            # Create sub-section ID for this chunk
+            chunk_section_id = hashlib.sha256(f"{pmid}:Abstract:{i}".encode()).hexdigest()[:16]
+            
+            # Determine chunk title
+            if i == 0:
+                chunk_title = title
+            else:
+                chunk_title = f"{title} (cont.)" if title else f"Abstract (Part {i+1})"
+            
+            # Extract chunk abstract (remove title prefix if present)
+            chunk_text = chunk_data['text']
+            chunk_abstract = chunk_text
+            if chunk_text.startswith(f"Title: {title}\n\nAbstract: "):
+                chunk_abstract = chunk_text[len(f"Title: {title}\n\nAbstract: "):]
+            elif chunk_text.startswith("Title: "):
+                # Fallback for continuation chunks
+                chunk_abstract = chunk_text[chunk_text.find("\n\nAbstract: ") + 12:]
+            
+            payload = {
+                # Identifiers
+                "doc_id": pmid,
+                "chunk_id": f"{pmid}_abstract_chunk_{i}",
+                "pmcid": article.get("pmc"),
+                "pmid": pmid,
+                "doi": article.get("doi"),
+                "pii": article.get("pii"),
+                "other_ids": article.get("other_ids", {}),
+                
+                # Content
+                "page_content": chunk_text,
+                "title": chunk_title,
+                "abstract": chunk_abstract,
+                
+                # Chunking metadata
+                "chunk_index": i,
+                "total_chunks": len(chunk_results),
+                "token_count": chunk_data['token_count'],
+                
+                # Abstract structure (only in first chunk)
+                "abstract_structured": abstract_structured if i == 0 else [],
+                "has_structured_abstract": has_structured if i == 0 else False,
+                "full_text": "",
+                
+                # Publication info
+                "year": article.get("year"),
+                "journal": article.get("journal", ""),
+                "journal_full": journal_full,
+                "publication_date": pub_date,
+                "article_type": article_type,
+                "publication_type": pub_types_flat,
+                "publication_types_full": pub_types_data if i == 0 else [],
+                
+                # Evidence
+                "evidence_grade": evidence_grade,
+                "evidence_level": {"A": 1, "B": 2, "C": 3, "D": 4}.get(evidence_grade, 3),
+                
+                # Classification (only in first chunk to save space)
+                "mesh_terms": mesh_flat if i == 0 else [],
+                "mesh_terms_full": mesh_terms if i == 0 else [],
+                "keywords": keywords_flat if i == 0 else [],
+                "keywords_full": keywords if i == 0 else [],
+                
+                # Parent-child fields
+                "full_section_text": chunk_text,
+                "section_id": chunk_section_id,
+                "parent_section_id": base_section_id,
+                "section_weight": 1.0 - (i * 0.05),  # Slight decay for later chunks
+                "section_type": "abstract",
+                "section_title": f"Abstract (Part {i+1}/{len(chunk_results)})",
+                
+                # Metadata
+                "source": "pubmed_abstract",
+                "content_type": "abstract",
+                "has_full_text": False,
+                "table_count": 0,
+                "text_preview": chunk_text[:500],
+            }
+            payloads.append(payload)
+    
+    return payloads
 
 
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[Any]) -> tuple[List[PointStruct], List[str]]:
+def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[Any], 
+                 validate_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
+    """
+    Build Qdrant points from article batch with token-based chunking.
+    
+    Each article may generate 1 or multiple points depending on token count.
+    
+    Args:
+        batch: List of articles to process
+        embedding_provider: Provider for generating embeddings
+        sparse_encoder: Optional sparse encoder for hybrid search
+        validate_chunks: Whether to validate chunk quality before ingestion
+    """
     points: List[PointStruct] = []
     processed_pmids: List[str] = []
     texts_to_embed: List[str] = []
     text_metas: List[Dict[str, Any]] = []
+    total_validated = 0
+    total_rejected = 0
 
     for article in batch:
         pmid = article.get("pmid")
@@ -136,17 +402,38 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         
         if not title and not abstract:
             continue
-            
-        # Create text for embedding
-        text = f"{title}. {abstract}"[:2000] 
-        texts_to_embed.append(text)
         
-        # Metadata for point creation
-        text_metas.append({
-            "pmid": pmid,
-            "payload": create_payload(article),
-            "text": text
-        })
+        # Create payloads with chunking
+        payloads = create_payloads_with_chunking(article)
+        
+        # Validate chunks if enabled
+        if validate_chunks and ENHANCED_UTILS_AVAILABLE:
+            valid_payloads = []
+            for payload in payloads:
+                is_valid, issues = QualityValidator.validate_chunk(
+                    payload["page_content"],
+                    {k: payload.get(k) for k in ["doc_id", "chunk_id", "title", "pmid", "year"]}
+                )
+                if is_valid:
+                    valid_payloads.append(payload)
+                    total_validated += 1
+                else:
+                    logger.debug("Skipping invalid chunk %s: %s", payload.get("chunk_id"), issues)
+                    total_rejected += 1
+            payloads = valid_payloads
+        
+        for payload in payloads:
+            text = payload["page_content"]
+            texts_to_embed.append(text)
+            
+            text_metas.append({
+                "pmid": pmid,
+                "payload": payload,
+                "text": text
+            })
+    
+    if validate_chunks and ENHANCED_UTILS_AVAILABLE:
+        logger.debug("Chunk validation: %d valid, %d rejected", total_validated, total_rejected)
 
     if not texts_to_embed:
         return [], []
@@ -168,22 +455,27 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             sparse_vector = sparse_encoder.encode_document(meta["text"])
             vector_data["sparse"] = sparse_vector
             
-        # Point ID (deterministic from PMID)
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pmid:{pmid}"))
+        # Point ID (deterministic from chunk_id for uniqueness)
+        chunk_id = meta["payload"].get("chunk_id", f"{pmid}_abstract")
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pubmed:{chunk_id}"))
         
         points.append(PointStruct(id=point_id, vector=vector_data, payload=meta["payload"]))
-        processed_pmids.append(str(pmid))
+        
+        # Track unique PMIDs for checkpoint
+        if str(pmid) not in processed_pmids:
+            processed_pmids.append(str(pmid))
 
     return points, processed_pmids
 
 
-def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[Any]) -> int:
+def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, 
+                  sparse_encoder: Optional[Any], validate_chunks: bool = True) -> int:
     """Process a single batch in a worker thread."""
     if not batch:
         return 0
     
     try:
-        points, ids = build_points(batch, embedding_provider, sparse_encoder)
+        points, ids = build_points(batch, embedding_provider, sparse_encoder, validate_chunks=validate_chunks)
         if points:
             upsert_with_retry(client, points)
             append_checkpoint(ids)
@@ -200,6 +492,14 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
         return
 
     ensure_data_dirs()
+    
+    # Preload tokenizer (handled by shared Chunker)
+    logger.info("Preloading tokenizer...")
+    try:
+        _get_chunker()
+        logger.info("Tokenizer preloaded successfully.")
+    except Exception as e:
+        logger.warning(f"Tokenizer preload warning: {e}")
     
     client = QdrantClient(
         url=IngestionConfig.QDRANT_URL,
@@ -222,17 +522,27 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
         logger.info("Initializing BM25 sparse encoder...")
         sparse_encoder = BM25SparseEncoder(
             max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
+            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
+            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
             remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
         )
 
     processed_ids = load_checkpoint()
     logger.info("Loaded checkpoint with %d IDs", len(processed_ids))
+    chunker_class = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
+    logger.info("Chunking config: size=%d, overlap=%d, chunker=%s, validation=%s", 
+                IngestionConfig.CHUNK_SIZE_TOKENS, 
+                IngestionConfig.CHUNK_OVERLAP_TOKENS,
+                chunker_class.__name__,
+                ENHANCED_UTILS_AVAILABLE)
 
     current_batch: List[Dict[str, Any]] = []
     total_processed = 0
+    total_chunks = 0
+    articles_chunked = 0
     start_time = time.time()
     
-    MAX_WORKERS = IngestionConfig.MAX_WORKERS # Should be 64
+    MAX_WORKERS = IngestionConfig.MAX_WORKERS
     BATCH_SIZE = IngestionConfig.BATCH_SIZE
     
     futures = []
@@ -262,16 +572,24 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                 
                 # Check if batch full
                 if len(current_batch) >= BATCH_SIZE:
+                    # Count chunks in this batch for stats
+                    for art in current_batch:
+                        text = f"Title: {art.get('title', '')}\n\nAbstract: {art.get('abstract', '')}"
+                        tokens = count_tokens(text)
+                        if tokens > IngestionConfig.CHUNK_SIZE_TOKENS:
+                            chunks_needed = (tokens - IngestionConfig.CHUNK_OVERLAP_TOKENS) // (IngestionConfig.CHUNK_SIZE_TOKENS - IngestionConfig.CHUNK_OVERLAP_TOKENS) + 1
+                            total_chunks += chunks_needed
+                            articles_chunked += 1
+                        else:
+                            total_chunks += 1
+                    
                     # Submit job
                     future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder)
                     futures.append(future)
                     current_batch.clear()
                     
-                    # Periodic maintenance of futures
-                    # If we have too many pending futures, wait?
-                    # Or just collect done ones for stats
+                    # Periodic maintenance
                     if len(futures) >= MAX_WORKERS * 2:
-                        # Clean up done futures
                         pending = []
                         for fut in futures:
                             if fut.done():
@@ -287,7 +605,8 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                         elapsed = time.time() - start_time
                         if elapsed > 0 and total_processed > 0:
                              rate = total_processed / elapsed
-                             logger.info("Ingested: %d (%.1f docs/sec)", total_processed, rate)
+                             logger.info("Ingested: %d chunks (%.1f chunks/sec, %d articles chunked)", 
+                                       total_processed, rate, articles_chunked)
 
         # Submit remaining
         if current_batch:
@@ -301,12 +620,12 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
             except Exception as e:
                 logger.error("Future failed: %s", e)
 
-    logger.info("Start-to-finish ingestion complete. Total: %d", total_processed)
+    logger.info("Ingestion complete. Total points: %d (from %d articles)", total_processed, len(processed_ids))
 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest PubMed Abstracts")
+    parser = argparse.ArgumentParser(description="Ingest PubMed Abstracts with token-based chunking")
     parser.add_argument("--input", type=Path, required=True, help="Path to pubmed_abstracts.jsonl")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of docs")
     
