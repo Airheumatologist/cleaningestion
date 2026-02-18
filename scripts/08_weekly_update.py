@@ -888,11 +888,47 @@ def run_dailymed_refresh(weeks_back: int = DEFAULT_DAILYMED_WEEKS_BACK) -> None:
     ], check=True, cwd=PROJECT_ROOT)
 
 
+def run_pmc_refresh() -> None:
+    """Run PMC OA + Author Manuscript incremental update.
+
+    Uses the S3 inventory last-modified cutoff stored in
+    ``.pmc_s3_inventory_state.json`` inside PMC_XML_DIR to download only
+    articles that are new or updated since the previous run.  On the very
+    first call there is no cutoff, so the full inventory is scanned —
+    identical to a baseline download, which is expected behaviour.
+
+    Step 1 — download: 01_download_pmc_unified.py --release-mode incremental
+        Fetches new/updated XML files for both pmc_oa and author_manuscript
+        and advances the state file so the next weekly run starts from here.
+
+    Step 2 — ingest: 06_ingest_pmc.py --xml-dir ... --delete-source
+        Processes only files not already in pmc_ingested_ids.txt and removes
+        each XML immediately after successful ingestion to keep disk usage
+        bounded (full-text XMLs can be large).
+    """
+    logger.info("Starting PMC incremental refresh (pmc_oa + author_manuscript)")
+    scripts_dir = PROJECT_ROOT / "scripts"
+    # Step 1: download new/updated articles from PMC Cloud Service (AWS S3)
+    subprocess.run([
+        sys.executable, str(scripts_dir / "01_download_pmc_unified.py"),
+        "--output-dir", str(IngestionConfig.PMC_XML_DIR),
+        "--datasets", "pmc_oa,author_manuscript",
+        "--release-mode", "incremental",
+    ], check=True, cwd=PROJECT_ROOT)
+    # Step 2: ingest — checkpoint skips already-ingested IDs; delete after
+    subprocess.run([
+        sys.executable, str(scripts_dir / "06_ingest_pmc.py"),
+        "--xml-dir", str(IngestionConfig.PMC_XML_DIR),
+        "--delete-source",
+    ], check=True, cwd=PROJECT_ROOT)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weekly incremental update for self-hosted Medical RAG")
     parser.add_argument("--max-files", type=int, default=None, help="Process at most N newest PubMed update files")
     parser.add_argument("--skip-pubmed", action="store_true")
     parser.add_argument("--skip-dailymed", action="store_true")
+    parser.add_argument("--skip-pmc", action="store_true")
     parser.add_argument(
         "--min-year",
         type=int,
@@ -941,6 +977,9 @@ def main() -> None:
 
     if not args.skip_dailymed:
         run_dailymed_refresh(weeks_back=args.dailymed_weeks_back)
+
+    if not args.skip_pmc:
+        run_pmc_refresh()
 
     info = client.get_collection(IngestionConfig.COLLECTION_NAME)
     logger.info(
