@@ -198,6 +198,7 @@ def create_payload(article: Dict[str, Any], source_type: str) -> Dict[str, Any]:
     title = content.get("title", "") if content else article.get("title", "")
     journal_info = publication.get("journal", {}) if publication else {}
     journal = journal_info.get("title", "") if journal_info else article.get("journal", "")
+    nlm_unique_id = journal_info.get("nlm_unique_id") if journal_info else None
     year = publication.get("year") if publication else article.get("year")
     country = publication.get("country", "") if publication else article.get("country", "")
     
@@ -216,6 +217,7 @@ def create_payload(article: Dict[str, Any], source_type: str) -> Dict[str, Any]:
         "doi": doi,
         "title": title[:300],
         "journal": journal[:100],
+        "nlm_unique_id": nlm_unique_id,
         "year": year,
 
         "keywords": classification.get("keywords", []) if classification else article.get("keywords", [])[:20],
@@ -276,6 +278,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
     # Extract publication info
     publication = metadata.get("publication", {}) if metadata else {}
     journal = publication.get("journal", {}).get("title", "") if publication else article.get("journal", "")
+    nlm_unique_id = publication.get("journal", {}).get("nlm_unique_id") if publication else None
     year = publication.get("year") if publication else article.get("year")
     country = publication.get("country", "") if publication else article.get("country", "")
     
@@ -290,6 +293,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
         "title": title,
         "abstract": abstract_text,
         "journal": journal,
+        "nlm_unique_id": nlm_unique_id,
         "year": year,
         "pmcid": identifiers.get("pmcid") if identifiers else article.get("pmcid"),
         "pmid": pmid,
@@ -536,6 +540,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             "title": chunk.get("title", ""),
             "abstract": chunk.get("abstract", ""),
             "journal": chunk.get("journal", ""),
+            "nlm_unique_id": chunk.get("nlm_unique_id"),
             "year": chunk.get("year"),
             "country": chunk.get("country", ""),
             "keywords": chunk.get("keywords", []),

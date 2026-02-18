@@ -637,6 +637,7 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
                         "abbreviation": journal_info["abbreviation"],
                         "publisher": journal_info["publisher"],
                         "issn": journal_info["issn_electronic"],
+                        "nlm_unique_id": journal_info["nlm_unique_id"],
                     },
                     "country": country_code,
                     "country_name": country_name,
@@ -979,6 +980,7 @@ def _extract_journal_info(root: ET.Element) -> Dict[str, str]:
         "abbreviation": "",
         "publisher": "",
         "issn_electronic": "",
+        "nlm_unique_id": "",
     }
     
     if journal_meta is None:
@@ -991,11 +993,12 @@ def _extract_journal_info(root: ET.Element) -> Dict[str, str]:
         if title_elem is not None and title_elem.text:
             info["title"] = title_elem.text
     
-    # NLM abbreviation
+    # NLM abbreviation and NLM Unique ID
     for jid in journal_meta.findall("journal-id"):
         if jid.get("journal-id-type") == "nlm-ta":
             info["abbreviation"] = (jid.text or "").strip()
-            break
+        if jid.get("journal-id-type") == "nlm-id":
+            info["nlm_unique_id"] = (jid.text or "").strip()
     
     # Publisher
     publisher = journal_meta.find(".//publisher/publisher-name")

@@ -8,6 +8,7 @@ Implements ai2-scholarqa-lib's exact reranking methodology:
 """
 
 import logging
+import re
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from anyascii import anyascii
@@ -18,6 +19,7 @@ from .config import (
     DEEPINFRA_RETRY_COUNT, DEEPINFRA_RETRY_DELAY
 )
 from .retry_utils import retry_with_exponential_backoff
+from .specialty_journals import detect_guideline_society_signal
 
 # Try to import medical entity expander for entity matching
 try:
@@ -125,15 +127,13 @@ GUIDELINE_TITLE_KEYWORDS = [
     "consensus", "consensus statement",
     "recommendation", "recommendations",
     "position statement",
+    "scientific statement",
     "clinical practice",
     # Evidence-based patterns
     "evidence-based", "evidence based",
     "management guidelines", "treatment guidelines",
     "international consensus",
-    # Major medical organizations
-    "eular", "acr", "kdigo", "easl", "aga", "aasld",
-    "aha", "acc", "escmid", "idsa", "nice", "who",
-    "esmo", "asco", "bsr", "oarsi",
+    "standards of care",
     # Specific patterns
     "acr/vasculitis", "aha/acc",
 ]
@@ -172,39 +172,108 @@ HIGH_IMPACT_JOURNALS = {
 }
 
 
-def get_evidence_multiplier(article_type: str, title: str, publication_types: list = None) -> float:
+def _normalize_match_text(value: Any) -> str:
+    """Normalize free text for token-boundary matching."""
+    return re.sub(r"[^a-z0-9]+", " ", anyascii(str(value or "")).lower()).strip()
+
+
+def _contains_normalized_phrase(text: str, phrase: str) -> bool:
+    if not text or not phrase:
+        return False
+    text_tokens = text.split()
+    phrase_tokens = phrase.split()
+    if len(phrase_tokens) > len(text_tokens):
+        return False
+    for idx in range(len(text_tokens) - len(phrase_tokens) + 1):
+        if text_tokens[idx:idx + len(phrase_tokens)] == phrase_tokens:
+            return True
+    return False
+
+
+def _normalize_publication_types(publication_types: Any) -> list[str]:
+    if publication_types is None:
+        return []
+    if isinstance(publication_types, str):
+        normalized = _normalize_match_text(publication_types)
+        return [normalized] if normalized else []
+    if isinstance(publication_types, dict):
+        candidate = (
+            publication_types.get("type")
+            or publication_types.get("name")
+            or publication_types.get("value")
+        )
+        normalized = _normalize_match_text(candidate)
+        return [normalized] if normalized else []
+    if isinstance(publication_types, (list, tuple, set)):
+        normalized_values = []
+        seen = set()
+        for item in publication_types:
+            if isinstance(item, dict):
+                candidate = item.get("type") or item.get("name") or item.get("value")
+            else:
+                candidate = item
+            normalized = _normalize_match_text(candidate)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                normalized_values.append(normalized)
+        return normalized_values
+    normalized = _normalize_match_text(publication_types)
+    return [normalized] if normalized else []
+
+
+def get_evidence_multiplier(
+    article_type: str,
+    title: str,
+    publication_types: list = None,
+    journal: Optional[str] = None,
+    evidence_term: Optional[str] = None,
+    evidence_source: Optional[str] = None,
+) -> float:
     """
     Get evidence tier multiplier based on article type, title, and publication types.
     
     Priority:
-    1. Title keywords (catches misclassified guidelines)
-    2. Publication types list (from PubMed metadata - most reliable)
-    3. Article type field
+    1. Publication types list (highest confidence)
+    2. Society-guideline detection (context gated)
+    3. Title keywords (catches misclassified guidelines)
+    4. Article type field
     """
     article_type_lower = (article_type or "").lower().replace("-", "_").replace(" ", "_")
-    title_lower = (title or "").lower()
-    pub_types_lower = [(pt or "").lower() for pt in (publication_types or [])]
-    
-    # 1. Title-based detection first (catches misclassified guidelines)
-    if any(kw in title_lower for kw in GUIDELINE_TITLE_KEYWORDS):
-        return TIER_1_BOOST
-    
-    # 2. Publication types list (from PubMed - more reliable than article_type)
-    TIER1_PUBTYPE_PATTERNS = ["systematic review", "meta-analysis", "guideline", "practice guideline", "consensus"]
+    title_normalized = _normalize_match_text(title)
+    pub_types_lower = _normalize_publication_types(publication_types)
+
+    # 1. Publication types list (from PubMed - most reliable)
+    TIER1_PUBTYPE_PATTERNS = ["systematic review", "meta analysis", "guideline", "practice guideline", "consensus"]
     TIER2_PUBTYPE_PATTERNS = ["randomized controlled trial", "clinical trial", "review"]
     TIER4_PUBTYPE_PATTERNS = ["case report", "letter", "editorial", "comment", "news"]
-    
+
     for pt in pub_types_lower:
-        if any(p in pt for p in TIER1_PUBTYPE_PATTERNS):
+        if any(_contains_normalized_phrase(pt, p) for p in TIER1_PUBTYPE_PATTERNS):
             return TIER_1_BOOST
+
+    # 2. Society signal with guideline context (precision-first)
+    society_signal = detect_guideline_society_signal(
+        title=title,
+        journal=journal,
+        evidence_term=evidence_term,
+        evidence_source=evidence_source,
+        publication_types=pub_types_lower,
+    )
+    if society_signal["is_match"]:
+        return TIER_1_BOOST
+
+    # 3. Title-based detection (generic terms only)
+    if any(_contains_normalized_phrase(title_normalized, _normalize_match_text(kw)) for kw in GUIDELINE_TITLE_KEYWORDS):
+        return TIER_1_BOOST
+
     for pt in pub_types_lower:
-        if any(p in pt for p in TIER4_PUBTYPE_PATTERNS):
+        if any(_contains_normalized_phrase(pt, p) for p in TIER4_PUBTYPE_PATTERNS):
             return TIER_4_PENALTY
     for pt in pub_types_lower:
-        if any(p in pt for p in TIER2_PUBTYPE_PATTERNS):
+        if any(_contains_normalized_phrase(pt, p) for p in TIER2_PUBTYPE_PATTERNS):
             return TIER_2_BOOST
-    
-    # 3. Article type-based tier assignment
+
+    # 4. Article type-based tier assignment
     if article_type_lower in TIER_1_TYPES or any(t in article_type_lower for t in ["guideline", "systematic", "meta"]):
         return TIER_1_BOOST
     
@@ -241,7 +310,18 @@ def apply_evidence_boosts(
         tier_mult = get_evidence_multiplier(
             doc.get("article_type", ""),
             doc.get("title", ""),
-            doc.get("publication_type", [])  # From payload
+            doc.get("publication_type", []),  # From payload
+            journal=doc.get("journal") or doc.get("venue"),
+            evidence_term=doc.get("evidence_term"),
+            evidence_source=doc.get("evidence_source"),
+        )
+
+        society_signal = detect_guideline_society_signal(
+            title=doc.get("title"),
+            journal=doc.get("journal") or doc.get("venue"),
+            evidence_term=doc.get("evidence_term"),
+            evidence_source=doc.get("evidence_source"),
+            publication_types=doc.get("publication_type", []),
         )
         
         # 2. Smart recency boost: ONLY apply to non-case-reports
@@ -269,6 +349,8 @@ def apply_evidence_boosts(
         doc["evidence_tier"] = tier_mult
         doc["boost_multiplier"] = tier_mult * recency_mult * journal_mult
         doc["is_case_report"] = is_case_report  # Track for debugging
+        doc["guideline_society_match"] = society_signal["is_match"]
+        doc["matched_guideline_societies"] = society_signal["matched_societies"]
     
     return documents
 

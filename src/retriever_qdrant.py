@@ -177,6 +177,35 @@ class QdrantRetriever(AbstractRetriever):
             "evidence_source": payload.get("evidence_source"),
         }
 
+    def _normalize_publication_type_list(self, value: Any) -> List[str]:
+        """Normalize publication types from mixed payload formats."""
+        if value is None:
+            return []
+
+        def _normalize_item(item: Any) -> str:
+            if isinstance(item, dict):
+                item = item.get("type") or item.get("name") or item.get("value")
+            if item is None:
+                return ""
+            return str(item).strip()
+
+        if isinstance(value, str):
+            cleaned = _normalize_item(value)
+            return [cleaned] if cleaned else []
+
+        if isinstance(value, (list, tuple, set)):
+            normalized: List[str] = []
+            seen = set()
+            for item in value:
+                cleaned = _normalize_item(item)
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    normalized.append(cleaned)
+            return normalized
+
+        cleaned = _normalize_item(value)
+        return [cleaned] if cleaned else []
+
     def _embed_query(self, query: str, use_instruction: bool = True):
         """
         Embed a single query using the configured embedding provider.
@@ -420,9 +449,13 @@ class QdrantRetriever(AbstractRetriever):
                     "chunk_index": point.payload.get("chunk_index"),
                     "journal": point.payload.get("journal", ""),
                     "venue": point.payload.get("journal", ""),
+                    "nlm_unique_id": point.payload.get("nlm_unique_id"),
                     "year": point.payload.get("year"),
                     "authors": self._parse_authors(point.payload.get("authors")),
                     "article_type": point.payload.get("article_type", ""),
+                    "publication_type": self._normalize_publication_type_list(
+                        point.payload.get("publication_type")
+                    ),
                     "score": point.score,
                     "stype": "vector_search",
                     **self._extract_evidence_metadata(point.payload),
@@ -587,9 +620,13 @@ class QdrantRetriever(AbstractRetriever):
                     "chunk_index": point.payload.get("chunk_index"),
                     "journal": point.payload.get("journal", ""),
                     "venue": point.payload.get("journal", ""),
+                    "nlm_unique_id": point.payload.get("nlm_unique_id"),
                     "year": point.payload.get("year"),
                     "authors": self._parse_authors(point.payload.get("authors")),
                     "article_type": point.payload.get("article_type", ""),
+                    "publication_type": self._normalize_publication_type_list(
+                        point.payload.get("publication_type")
+                    ),
                     "score": combined_scores[key],
                     "dense_score": dense_scores.get(key, 0),
                     "sparse_score": sparse_scores.get(key, 0),
@@ -777,9 +814,13 @@ class QdrantRetriever(AbstractRetriever):
                     "chunk_index": point.payload.get("chunk_index"),
                     "journal": point.payload.get("journal", ""),
                     "venue": point.payload.get("journal", ""),
+                    "nlm_unique_id": point.payload.get("nlm_unique_id"),
                     "year": point.payload.get("year"),
                     "authors": self._parse_authors(point.payload.get("authors")),
                     "article_type": point.payload.get("article_type", ""),
+                    "publication_type": self._normalize_publication_type_list(
+                        point.payload.get("publication_type")
+                    ),
                     "score": combined_scores[key],
                     "stype": "batch_hybrid_search",
                     **self._extract_evidence_metadata(point.payload),
@@ -849,9 +890,13 @@ class QdrantRetriever(AbstractRetriever):
                         "chunk_index": point.payload.get("chunk_index"),
                         "journal": point.payload.get("journal", ""),
                         "venue": point.payload.get("journal", ""),
+                        "nlm_unique_id": point.payload.get("nlm_unique_id"),
                         "year": point.payload.get("year"),
                         "authors": self._parse_authors(point.payload.get("authors")),
                         "article_type": point.payload.get("article_type", ""),
+                        "publication_type": self._normalize_publication_type_list(
+                            point.payload.get("publication_type")
+                        ),
                         "score": point.score,
                         "stype": "keyword_search",
                         **self._extract_evidence_metadata(point.payload),
@@ -1517,6 +1562,7 @@ class QdrantRetriever(AbstractRetriever):
             "year": datetime.now().year,
             "authors": [{"name": manufacturer}] if manufacturer else [],
             "article_type": "drug_label",
+            "publication_type": self._normalize_publication_type_list(payload.get("publication_type")),
             "score": score,
             "stype": "vector_search",
             "evidence_grade": payload.get("evidence_grade"),

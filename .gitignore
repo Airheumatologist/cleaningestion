@@ -27,6 +27,10 @@ verify_*.py
 fix_*.py
 *_dump.txt
 
+# Keep real unit tests under /tests tracked
+!tests/
+!tests/test_*.py
+
 # Node modules (frontend has its own .gitignore)
 node_modules/
 .claude/

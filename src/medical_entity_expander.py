@@ -382,8 +382,7 @@ class MedicalEntityExpander:
             raise
     
     def _normalize_term(self, term: str) -> str:
-        """Normalize medical term for comparison."""
-        # Remove extra whitespace, convert to title case
+        """Normalize medical term by collapsing whitespace."""
         return ' '.join(term.strip().split())
     
     # Organization acronyms that should NOT be treated as disease entities
@@ -556,28 +555,27 @@ class MedicalEntityExpander:
     def extract_medical_entities(self, text: str) -> List[Tuple[str, str]]:
         """
         Extract medical entities (acronyms and full terms) from text.
-        
+
         Args:
             text: Input text
-            
+
         Returns:
             List of (entity, type) tuples where type is 'acronym' or 'full_term'
         """
         entities = []
-        words = text.split()
-        
-        for word in words:
+        text_lower = text.lower()
+
+        # Check each word for known acronyms (O(words) with O(1) dict lookup)
+        for word in text.split():
             clean_word = re.sub(r'[^\w]', '', word)
-            
-            # Check if it's a known acronym
             if clean_word in self.acronym_dict:
                 entities.append((clean_word, 'acronym'))
-            
-            # Check if it's a known full term (case-insensitive)
-            for term in self.synonym_dict.keys():
-                if term.lower() in text.lower():
-                    entities.append((term, 'full_term'))
-        
+
+        # Scan full terms once against the text (O(MeSH_vocab), not O(words × MeSH_vocab))
+        for term in self.synonym_dict.keys():
+            if term.lower() in text_lower:
+                entities.append((term, 'full_term'))
+
         return entities
 
 

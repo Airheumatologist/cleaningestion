@@ -266,6 +266,7 @@ def extract_journal_info(article_elem: ET.Element) -> Dict[str, Any]:
         "issue": None,
         "pub_date": {},
         "cited_medium": None,
+        "nlm_unique_id": None,
     }
 
     journal_elem = article_elem.find(".//Journal")
@@ -276,6 +277,11 @@ def extract_journal_info(article_elem: ET.Element) -> Dict[str, Any]:
     if issn_elem is not None:
         result["issn"] = issn_elem.text.strip() if issn_elem.text else None
         result["issn_type"] = issn_elem.get("IssnType")
+
+    # NLM Unique ID (from MedlineJournalInfo)
+    nlm_id_elem = article_elem.find(".//MedlineJournalInfo/NlmUniqueID")
+    if nlm_id_elem is not None and nlm_id_elem.text:
+        result["nlm_unique_id"] = nlm_id_elem.text.strip()
 
     title_elem = journal_elem.find("Title")
     if title_elem is not None and title_elem.text:
@@ -312,11 +318,13 @@ def extract_article_ids(article_elem: ET.Element) -> Dict[str, Any]:
         "other_ids": {},
     }
 
-    pmid_elem = article_elem.find(".//PMID")
+    # Only use the article's canonical PMID, not PMIDs from references.
+    pmid_elem = article_elem.find("./MedlineCitation/PMID")
     if pmid_elem is not None and pmid_elem.text:
         result["pmid"] = pmid_elem.text.strip()
 
-    for article_id in article_elem.findall(".//ArticleId"):
+    # Only use IDs from PubmedData/ArticleIdList for the current article.
+    for article_id in article_elem.findall("./PubmedData/ArticleIdList/ArticleId"):
         id_type = article_id.get("IdType", "").lower()
         id_value = article_id.text.strip() if article_id.text else None
         if not id_value:
@@ -333,7 +341,8 @@ def extract_article_ids(article_elem: ET.Element) -> Dict[str, Any]:
         else:
             result["other_ids"][id_type] = id_value
 
-    for eloc_id in article_elem.findall(".//ELocationID"):
+    # ELocationID belongs to MedlineCitation/Article for the current article.
+    for eloc_id in article_elem.findall("./MedlineCitation/Article/ELocationID"):
         id_type = eloc_id.get("EIdType", "").lower()
         id_value = eloc_id.text.strip() if eloc_id.text else None
         if not id_value:
@@ -506,6 +515,7 @@ def parse_pubmed_update_xml(
                     "volume": journal_info.get("volume"),
                     "issue": journal_info.get("issue"),
                     "cited_medium": journal_info.get("cited_medium"),
+                    "nlm_unique_id": journal_info.get("nlm_unique_id"),
                 },
                 "publication_date": pub_date,
                 "mesh_terms": mesh_terms,
@@ -576,6 +586,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         abstract_structured = article.get("abstract_structured", [])
         has_structured_abstract = bool(article.get("has_structured_abstract", False))
         journal_full = article.get("journal_full", {})
+        nlm_unique_id = journal_full.get("nlm_unique_id") if journal_full else None
         publication_date = article.get("publication_date", {})
 
         mesh_terms_data = article.get("mesh_terms", [])
@@ -678,6 +689,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 "year": article.get("year"),
                 "journal": article.get("journal", ""),
                 "journal_full": journal_full,
+                "nlm_unique_id": nlm_unique_id,
                 "publication_date": publication_date,
                 "article_type": article.get("article_type", "research_article"),
                 "publication_type": publication_types_flat,

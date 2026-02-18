@@ -36,7 +36,6 @@ from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
 from .reranker import PaperFinderWithReranker
 from .prompts import ELIXIR_SYSTEM_PROMPT
-from .medical_entity_expander import MedicalEntityExpander
 try:
     from scripts.ingestion_utils import get_evidence_hierarchy_levels
 except Exception:
@@ -95,14 +94,9 @@ class MedicalRAGPipeline:
         # Components
         self.preprocessor = QueryPreprocessor(model=model)
         self.retriever = QdrantRetriever(n_retrieval=n_retrieval)
-        
-        # Initialize medical entity expander for post-retrieval filtering
-        try:
-            self.entity_expander = MedicalEntityExpander()
-            logger.info("✅ Medical entity expander initialized for filtering")
-        except Exception as e:
-            logger.warning(f"Medical entity expander not available for filtering: {e}")
-            self.entity_expander = None
+
+        # Reuse the entity expander already initialized inside QueryPreprocessor
+        self.entity_expander = self.preprocessor._entity_expander
 
         # Initialize reranker (DeepInfra Qwen only)
         self.paper_finder = PaperFinderWithReranker(
@@ -576,10 +570,6 @@ class MedicalRAGPipeline:
             logger.info(f"   Using regex-extracted entities: {raw_entities}")
         
         if not raw_entities:
-            logger.info("   No entity extraction available, skipping filter")
-            return papers_df
-        
-        if not raw_entities:
             logger.info("   No medical entities found in query, skipping filter")
             return papers_df
         
@@ -660,7 +650,6 @@ class MedicalRAGPipeline:
         words = query.split()
         for word in words:
             # Remove punctuation
-            import re
             clean_word = re.sub(r'[^\w]', '', word)
             
             # Check if it's a known acronym
@@ -679,7 +668,6 @@ class MedicalRAGPipeline:
             r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\s+Disorder\b',
         ]
         
-        import re
         for pattern in medical_patterns:
             matches = re.findall(pattern, query)
             entities.extend(matches)
@@ -705,7 +693,7 @@ class MedicalRAGPipeline:
         For DailyMed articles, intelligently selects sections:
         - Always: highlights + clinical_studies
         """
-        from .specialty_journals import PRIORITY_JOURNALS
+        from .specialty_journals import PRIORITY_JOURNALS, PRIORITY_JOURNALS_NLM
         HIGH_VALUE_TYPES = {'review_article', 'clinical_trial', 'systematic_review', 'meta_analysis', 'guideline'}
         
         priority_journal_papers = []
@@ -714,11 +702,15 @@ class MedicalRAGPipeline:
         for idx, row in papers_df.head(MAX_ABSTRACTS).iterrows():
             journal = row.get('journal', '') or row.get('venue', '')
             corpus_id = str(row.get('corpus_id', '')).strip()
+            nlm_unique_id = str(row.get('nlm_unique_id', '')).strip() if row.get('nlm_unique_id') else ''
             normalized_journal = re.sub(r'[^a-z0-9]+', ' ', str(journal).lower()).strip()
+            
+            # Priority check: NLM Unique ID (most reliable), then corpus_id, then journal name
             is_priority_journal = (
-                journal in PRIORITY_JOURNALS
-                or normalized_journal in PRIORITY_JOURNALS
+                nlm_unique_id in PRIORITY_JOURNALS_NLM
                 or corpus_id in PRIORITY_JOURNALS
+                or journal in PRIORITY_JOURNALS
+                or normalized_journal in PRIORITY_JOURNALS
             )
             article_type = row.get('article_type', 'other')
             is_high_value = article_type in HIGH_VALUE_TYPES
@@ -1342,11 +1334,9 @@ Please provide a comprehensive clinical response based on your medical knowledge
         # [NEW] Reorder papers so reference ranking matches final citation order from the start
         # This prevents the UI from "jumping" and ensures references are correctly numbered
         _, used_papers = self._get_papers_for_context(papers_df, query)
-        
+
         # Prepare initial sources (no PDF URLs yet)
-        initial_sources = []
-        for p in used_papers:
-            initial_sources.append(self._map_paper_to_source(p))
+        initial_sources = [self._map_paper_to_source(p) for p in used_papers]
 
         yield {
             "step": "reranking",
@@ -1355,7 +1345,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "sources": initial_sources,  # Send sources early and in corrected order!
             "evidence_hierarchy": self.evidence_hierarchy,
         }
-        
+
         if papers_df.empty:
             # No papers after filtering - use fallback LLM generation with streaming
             logger.info("📭 No papers after filtering, using fallback streaming generation")
@@ -1378,8 +1368,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
             }
             return
 
-        # Prepare context for generation
-        _, used_papers = self._get_papers_for_context(papers_df, query)
+        # used_papers already computed above; reuse for generation
 
         # START PARALLEL TASKS: Generation + PDF Check
         yield {"step": "pdf_check", "status": "running", "message": "Checking PDF availability..."}

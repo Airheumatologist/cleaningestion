@@ -108,7 +108,7 @@ RAG-pipeline/
 │   ├── 05_setup_qdrant.py                  # Initialize Qdrant collection
 │   ├── 06_ingest_pmc.py                    # Ingest unified PMC XML sources to Qdrant
 │   ├── 07_ingest_dailymed.py               # Ingest DailyMed XML to Qdrant
-│   ├── 08_monthly_update.py                # Incremental updates
+│   ├── 08_weekly_update.py                 # Weekly incremental updates (PubMed, DailyMed, PMC)
 │   ├── 20_download_pubmed_baseline.py      # Download PubMed abstracts (includes gov affiliation)
 │   ├── 21_ingest_pubmed_abstracts.py       # Ingest PubMed to Qdrant
 │   ├── config_ingestion.py                 # Ingestion config

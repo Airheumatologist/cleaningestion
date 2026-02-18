@@ -172,6 +172,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
     # Get journal info
     journal_full = article.get("journal_full", {})
     pub_date = article.get("publication_date", {})
+    nlm_unique_id = journal_full.get("nlm_unique_id") if journal_full else None
     
     # Build mesh_terms
     mesh_terms = article.get("mesh_terms", [])
@@ -250,6 +251,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
             "year": article.get("year"),
             "journal": article.get("journal", ""),
             "journal_full": journal_full,
+            "nlm_unique_id": nlm_unique_id,
             "publication_date": pub_date,
             "article_type": article_type,
             "publication_type": pub_types_flat,
@@ -338,6 +340,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
                 "year": article.get("year"),
                 "journal": article.get("journal", ""),
                 "journal_full": journal_full,
+                "nlm_unique_id": nlm_unique_id,
                 "publication_date": pub_date,
                 "article_type": article_type,
                 "publication_type": pub_types_flat,

@@ -323,7 +323,7 @@ def extract_abstract(article_elem: ET.Element) -> Dict[str, Any]:
 
 
 def extract_journal_info(article_elem: ET.Element) -> Dict[str, Any]:
-    """Extract journal information including Title, JournalIssue, ISSN."""
+    """Extract journal information including Title, JournalIssue, ISSN, NLM Unique ID."""
     result = {
         "title": None,
         "iso_abbreviation": None,
@@ -332,7 +332,8 @@ def extract_journal_info(article_elem: ET.Element) -> Dict[str, Any]:
         "volume": None,
         "issue": None,
         "pub_date": {},
-        "cited_medium": None
+        "cited_medium": None,
+        "nlm_unique_id": None
     }
     
     journal_elem = article_elem.find(".//Journal")
@@ -344,6 +345,11 @@ def extract_journal_info(article_elem: ET.Element) -> Dict[str, Any]:
     if issn_elem is not None:
         result["issn"] = issn_elem.text.strip() if issn_elem.text else None
         result["issn_type"] = issn_elem.get("IssnType")
+    
+    # NLM Unique ID (from MedlineJournalInfo)
+    nlm_id_elem = article_elem.find(".//MedlineJournalInfo/NlmUniqueID")
+    if nlm_id_elem is not None and nlm_id_elem.text:
+        result["nlm_unique_id"] = nlm_id_elem.text.strip()
     
     # Journal Title
     title_elem = journal_elem.find("Title")
@@ -388,13 +394,13 @@ def extract_article_ids(article_elem: ET.Element) -> Dict[str, Any]:
         "other_ids": {}
     }
     
-    # PMID from MedlineCitation
-    pmid_elem = article_elem.find(".//PMID")
+    # PMID from MedlineCitation (top-level article only, not references)
+    pmid_elem = article_elem.find("./MedlineCitation/PMID")
     if pmid_elem is not None and pmid_elem.text:
         result["pmid"] = pmid_elem.text.strip()
     
-    # ArticleIdList from PubmedData
-    for article_id in article_elem.findall(".//ArticleId"):
+    # ArticleIdList from PubmedData (top-level article only, not references)
+    for article_id in article_elem.findall("./PubmedData/ArticleIdList/ArticleId"):
         id_type = article_id.get("IdType", "").lower()
         id_value = article_id.text.strip() if article_id.text else None
         
@@ -410,8 +416,8 @@ def extract_article_ids(article_elem: ET.Element) -> Dict[str, Any]:
             else:
                 result["other_ids"][id_type] = id_value
     
-    # Also check ELocationID in Article
-    for eloc_id in article_elem.findall(".//ELocationID"):
+    # Also check ELocationID in the top-level Article
+    for eloc_id in article_elem.findall("./MedlineCitation/Article/ELocationID"):
         id_type = eloc_id.get("EIdType", "").lower()
         id_value = eloc_id.text.strip() if eloc_id.text else None
         
@@ -594,6 +600,7 @@ def extract_article_data(article_elem: ET.Element, min_year: int) -> Optional[Di
                 "volume": journal_info["volume"],
                 "issue": journal_info["issue"],
                 "cited_medium": journal_info["cited_medium"],
+                "nlm_unique_id": journal_info["nlm_unique_id"],
             },
             
             # Publication Date
