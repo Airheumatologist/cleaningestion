@@ -3,11 +3,11 @@ Elixir Medical RAG Pipeline.
 
 Optimized pipeline for fast, comprehensive medical responses:
 1. Query preprocessing with decomposition
-2. Qdrant retrieval
-3. Cohere reranking with paper aggregation
-4. Direct LLM synthesis with ELIXIR system prompt
+2. Qdrant hybrid retrieval (dense + BM25 sparse)
+3. DeepInfra Qwen3-Reranker with paper aggregation and evidence hierarchy
+4. Direct LLM synthesis with ELIXIR system prompt (DeepInfra GPT-OSS-20B)
 
-Designed for speed and quality clinical education responses.
+Designed for speed and quality clinical decision support.
 """
 
 import logging
@@ -19,20 +19,17 @@ from openai import OpenAI
 from .config import (
     DEEPINFRA_API_KEY,
     DEEPINFRA_BASE_URL,
-    DEEPINFRA_MODEL,
+    LLM_MODEL,
     LLM_TEMPERATURE,
     LLM_TOP_P,
     BULK_RETRIEVAL_LIMIT,
     MAX_ABSTRACTS,
     MAX_DAILYMED_PER_DRUG,
-    FALLBACK_LLM_MODEL,
-    FALLBACK_LLM_ENABLED,
     RETRIEVAL_CHUNK_LIMIT,
     MAX_CHUNKS_PER_ARTICLE_PRE_RERANK,
     RERANK_INPUT_CHUNK_LIMIT,
     RERANK_TOP_CHUNKS,
     FINAL_TOP_ARTICLES,
-    RERANKER_PROVIDER,
 )
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
@@ -50,20 +47,20 @@ class MedicalRAGPipeline:
     Optimized flow:
     1. Preprocess query (decompose, extract filters)
     2. Retrieve passages from Qdrant
-    3. Rerank passages with cross-encoder or Cohere
+    3. Rerank passages with DeepInfra Qwen3-Reranker
     4. Aggregate to paper level
     5. Direct LLM synthesis with ELIXIR prompt
     """
     
     def __init__(
         self,
-        model: str = DEEPINFRA_MODEL,
+        model: str = LLM_MODEL,
         n_retrieval: int = RETRIEVAL_CHUNK_LIMIT,
         n_rerank: int = RERANK_TOP_CHUNKS,
         context_threshold: float = 0.3  # Post-aggregation threshold on boosted_score
-        # Note: This is the FINAL threshold after Cohere reranking + entity matching + evidence boosts
-        # With evidence tier multipliers (1.0-1.8x), 0.3 ensures good recall while filtering noise
-        # Cohere-specific filtering (0.1 minimum) is done earlier in PaperFinderWithReranker.rerank()
+        # Note: This is the FINAL threshold after Qwen3 reranking + entity matching + evidence boosts
+        # With evidence tier multipliers (0.2x-3.0x), 0.3 ensures good recall while filtering noise
+        # Reranker relevance filtering (0.1 minimum) is done earlier in PaperFinderWithReranker.rerank()
     ):
 
         """Initialize pipeline components."""
@@ -94,18 +91,12 @@ class MedicalRAGPipeline:
             logger.warning(f"Medical entity expander not available for filtering: {e}")
             self.entity_expander = None
 
-        # Initialize reranker based on configured provider
-        try:
-            self.paper_finder = PaperFinderWithReranker(
-                n_rerank=n_rerank,
-                context_threshold=context_threshold
-            )
-            logger.info(f"✅ Reranker initialized (provider: {RERANKER_PROVIDER})")
-        except ValueError as e:
-            logger.warning(f"⚠️ Reranker not available: {e}")
-            logger.warning("⚠️ Falling back to basic retrieval without reranking")
-            # Create a basic paper finder without reranking
-            self.paper_finder = None
+        # Initialize reranker (DeepInfra Qwen only)
+        self.paper_finder = PaperFinderWithReranker(
+            n_rerank=n_rerank,
+            context_threshold=context_threshold
+        )
+        logger.info("✅ Reranker initialized (DeepInfra Qwen3-Reranker-0.6B)")
         
         logger.info("✅ Pipeline initialized (Elixir direct synthesis)")
     
@@ -326,7 +317,7 @@ class MedicalRAGPipeline:
 
         if self.paper_finder is None:
             # Skip reranking and create basic aggregation
-            logger.info("   Skipping reranking (Cohere not available)")
+            logger.info("   Skipping reranking (reranker not available)")
             reranked = self._select_chunks_for_rerank(passages)
 
             # Create a basic DataFrame-like structure (abstracts only - no full text)
@@ -904,10 +895,7 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
     
     def _run_fallback_generation(self, query: str, stream: bool = False):
         """
-        Generate response from LLM internal knowledge when no sources are found.
-        
-        Uses DeepSeek V3.2 (larger model) for better knowledge coverage.
-        Response includes a disclaimer about no citations.
+        Generate response when no sources are found using the same LLM model.
         
         Args:
             query: Original user query
@@ -917,17 +905,7 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
             If stream=False: tuple of (answer, [])
             If stream=True: Generator yielding response events
         """
-        if not FALLBACK_LLM_ENABLED:
-            return ("No relevant evidence found for your query.", [])
-        
-        logger.info("📭 No sources found, using fallback LLM generation with DeepSeek V3.2")
-        
-        # Create fallback client (uses same DeepInfra provider, different model)
-        fallback_client = OpenAI(
-            api_key=DEEPINFRA_API_KEY,
-            base_url=DEEPINFRA_BASE_URL,
-            timeout=300.0
-        )
+        logger.info(f"📭 No sources found, using {LLM_MODEL} for response")
         
         fallback_system_prompt = """You are a medical AI assistant providing information based on your training knowledge.
 
@@ -950,10 +928,10 @@ Please provide a comprehensive clinical response based on your medical knowledge
 
         try:
             if stream:
-                return self._stream_fallback_generation(fallback_client, fallback_system_prompt, user_prompt)
+                return self._stream_fallback_generation(fallback_system_prompt, user_prompt)
             
-            response = fallback_client.chat.completions.create(
-                model=FALLBACK_LLM_MODEL,
+            response = self.openai_client.chat.completions.create(
+                model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": fallback_system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -970,11 +948,11 @@ Please provide a comprehensive clinical response based on your medical knowledge
             logger.error(f"Fallback generation failed: {e}")
             return (f"Unable to generate response: {str(e)}", [])
     
-    def _stream_fallback_generation(self, client, system_prompt: str, user_prompt: str) -> Generator[Dict[str, Any], None, None]:
+    def _stream_fallback_generation(self, system_prompt: str, user_prompt: str) -> Generator[Dict[str, Any], None, None]:
         """Stream fallback generation tokens."""
         try:
-            response = client.chat.completions.create(
-                model=FALLBACK_LLM_MODEL,
+            response = self.openai_client.chat.completions.create(
+                model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}

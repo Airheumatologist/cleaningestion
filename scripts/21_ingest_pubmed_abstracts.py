@@ -32,7 +32,6 @@ import hashlib
 import importlib.util
 import json
 import logging
-import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,7 +47,19 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
-from ingestion_utils import Chunker as BaseChunker, EmbeddingProvider, upsert_with_retry, EVIDENCE_HIERARCHY
+from ingestion_utils import (
+    Chunker as BaseChunker,
+    EmbeddingProvider,
+    upsert_with_retry,
+    detect_evidence_grade,
+    get_evidence_level,
+    get_chunker as get_shared_chunker,
+    load_checkpoint as load_checkpoint_file,
+    append_checkpoint as append_checkpoint_file,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
 # Import enhanced utilities for semantic chunking and validation
 try:
@@ -56,9 +67,13 @@ try:
     ENHANCED_UTILS_AVAILABLE = True
     logger.info("Using SemanticChunker for improved chunking")
 except ImportError:
+    SemanticChunker = None  # type: ignore
+    QualityValidator = None  # type: ignore
     ContentDeduplicator = None  # type: ignore
     ENHANCED_UTILS_AVAILABLE = False
     logger.warning("Enhanced utils not available")
+
+CHUNKER_CLASS = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
 
 # Import BM25SparseEncoder
 spec = importlib.util.find_spec("src.bm25_sparse")
@@ -67,19 +82,7 @@ if spec is not None:
 else:
     BM25SparseEncoder = None  # type: ignore
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
-
-# Evidence grades mapping derived from shared EVIDENCE_HIERARCHY
-def _get_evidence_grade(article_type: str) -> str:
-    """Get evidence grade from shared EVIDENCE_HIERARCHY."""
-    article_type_lower = article_type.lower().replace("_", "-")
-    for pattern, (grade, _) in EVIDENCE_HIERARCHY.items():
-        if pattern in article_type_lower:
-            return grade
-    return "C"  # Default grade
 
 # Note: Tokenizer is handled by the shared Chunker class from ingestion_utils
 # We use Chunker's token counting for consistency across all ingestion scripts
@@ -87,39 +90,12 @@ def _get_evidence_grade(article_type: str) -> str:
 
 def count_tokens(text: str) -> int:
     """Count tokens using the shared Chunker's tokenizer."""
-    chunker = _get_chunker()
+    chunker = get_shared_chunker(
+        chunker_class=CHUNKER_CLASS,
+        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
+    )
     return chunker.count_tokens(text)
-
-
-# Initialize shared Chunker instance (uses SemanticChunker if available)
-_chunker_instance: Optional[Any] = None
-_checkpoint_lock = threading.Lock()
-
-
-def _get_chunker():
-    """Get or initialize the shared Chunker instance."""
-    global _chunker_instance
-    if _chunker_instance is None:
-        # Use SemanticChunker if available, otherwise fallback to base Chunker
-        ChunkerClass = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
-        _chunker_instance = ChunkerClass(
-            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
-        )
-    return _chunker_instance
-
-
-def load_checkpoint() -> set[str]:
-    if CHECKPOINT_FILE.exists():
-        return {line.strip() for line in CHECKPOINT_FILE.read_text().splitlines() if line.strip()}
-    return set()
-
-
-def append_checkpoint(ids: List[str]) -> None:
-    with _checkpoint_lock:
-        with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
-            for value in ids:
-                f.write(f"{value}\n")
 
 
 def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -129,15 +105,21 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
     If the content exceeds CHUNK_SIZE_TOKENS, it will be split into multiple
     chunks with overlap. Each chunk becomes a separate point in Qdrant.
     
+    Merged PubMed pipeline: includes both high-value article types AND
+    government affiliation detection (from former gov pipeline).
+    
     Returns:
         List of payload dictionaries (one per chunk)
     """
     article_type = article.get("article_type", "review")
-    evidence_grade = _get_evidence_grade(article_type)
     
     pmid = article.get("pmid")
     title = article.get("title", "")
     abstract = article.get("abstract", "")
+    
+    # Government affiliation fields (merged from gov pipeline)
+    is_gov_affiliated = article.get("is_gov_affiliated", False)
+    gov_agencies = article.get("gov_agencies", [])
     
     # Create full content text
     full_text = f"Title: {title}\n\nAbstract: {abstract}" if title or abstract else ""
@@ -179,6 +161,13 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
         pub_types_flat = [p["type"] for p in pub_types_data]
     else:
         pub_types_flat = pub_types_data if pub_types_data else []
+
+    evidence_grade = detect_evidence_grade(
+        article_type=article_type,
+        pub_types=pub_types_flat,
+        abstract=abstract,
+    )
+    evidence_level = get_evidence_level(evidence_grade)
     
     # Base section ID (for single chunk or parent reference)
     base_section_id = hashlib.sha256(f"{pmid}:Abstract".encode()).hexdigest()[:16]
@@ -186,7 +175,11 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
     payloads = []
     
     # Use shared Chunker for consistent chunking across all ingestion scripts
-    chunker = _get_chunker()
+    chunker = get_shared_chunker(
+        chunker_class=CHUNKER_CLASS,
+        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
+    )
     
     # Determine if chunking is needed
     if total_tokens <= chunk_size:
@@ -227,7 +220,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
             
             # Evidence
             "evidence_grade": evidence_grade,
-            "evidence_level": {"A": 1, "B": 2, "C": 3, "D": 4}.get(evidence_grade, 3),
+            "evidence_level": evidence_level,
             
             # Classification
             "mesh_terms": mesh_flat,
@@ -248,6 +241,10 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
             "has_full_text": False,
             "table_count": 0,
             "text_preview": full_text[:500],
+            
+            # Government affiliation (merged from gov pipeline)
+            "is_gov_affiliated": is_gov_affiliated,
+            "gov_agencies": gov_agencies,
         }
         payloads.append(payload)
     else:
@@ -309,7 +306,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
                 
                 # Evidence
                 "evidence_grade": evidence_grade,
-                "evidence_level": {"A": 1, "B": 2, "C": 3, "D": 4}.get(evidence_grade, 3),
+                "evidence_level": evidence_level,
                 
                 # Classification (only in first chunk to save space)
                 "mesh_terms": mesh_flat if i == 0 else [],
@@ -331,6 +328,10 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
                 "has_full_text": False,
                 "table_count": 0,
                 "text_preview": chunk_text[:500],
+                
+                # Government affiliation (merged from gov pipeline)
+                "is_gov_affiliated": is_gov_affiliated,
+                "gov_agencies": gov_agencies if i == 0 else [],
             }
             payloads.append(payload)
     
@@ -462,7 +463,7 @@ def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_p
                                    validate_chunks=validate_chunks, dedup_chunks=dedup_chunks)
         if points:
             upsert_with_retry(client, points)
-            append_checkpoint(ids)
+            append_checkpoint_file(CHECKPOINT_FILE, ids)
             return len(points)
     except Exception as e:
         logger.error("Batch processing failed: %s", e)
@@ -480,7 +481,11 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
     # Preload tokenizer (handled by shared Chunker)
     logger.info("Preloading tokenizer...")
     try:
-        _get_chunker()
+        get_shared_chunker(
+            chunker_class=CHUNKER_CLASS,
+            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
+        )
         logger.info("Tokenizer preloaded successfully.")
     except Exception as e:
         logger.warning(f"Tokenizer preload warning: {e}")
@@ -511,13 +516,12 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
             remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
         )
 
-    processed_ids = load_checkpoint()
+    processed_ids = load_checkpoint_file(CHECKPOINT_FILE)
     logger.info("Loaded checkpoint with %d IDs", len(processed_ids))
-    chunker_class = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
     logger.info("Chunking config: size=%d, overlap=%d, chunker=%s, validation=%s, dedup=%s", 
                 IngestionConfig.CHUNK_SIZE_TOKENS, 
                 IngestionConfig.CHUNK_OVERLAP_TOKENS,
-                chunker_class.__name__,
+                CHUNKER_CLASS.__name__,
                 ENHANCED_UTILS_AVAILABLE,
                 ContentDeduplicator is not None)
 
@@ -562,14 +566,19 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                         text = f"Title: {art.get('title', '')}\n\nAbstract: {art.get('abstract', '')}"
                         tokens = count_tokens(text)
                         if tokens > IngestionConfig.CHUNK_SIZE_TOKENS:
-                            chunks_needed = (tokens - IngestionConfig.CHUNK_OVERLAP_TOKENS) // (IngestionConfig.CHUNK_SIZE_TOKENS - IngestionConfig.CHUNK_OVERLAP_TOKENS) + 1
+                            # Improved chunk count calculation: ceil((tokens - overlap) / (chunk_size - overlap))
+                            effective_size = IngestionConfig.CHUNK_SIZE_TOKENS - IngestionConfig.CHUNK_OVERLAP_TOKENS
+                            remaining_tokens = tokens - IngestionConfig.CHUNK_OVERLAP_TOKENS
+                            chunks_needed = (remaining_tokens + effective_size - 1) // effective_size  # Ceiling division
+                            chunks_needed = max(1, chunks_needed)  # Ensure at least 1
                             total_chunks += chunks_needed
                             articles_chunked += 1
                         else:
                             total_chunks += 1
                     
                     # Submit job
-                    future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder)
+                    future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder,
+                                            validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
                     futures.append(future)
                     current_batch.clear()
                     
@@ -595,7 +604,8 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
 
         # Submit remaining
         if current_batch:
-            future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder)
+            future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder,
+                                    validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
             futures.append(future)
             
         # Wait for all remaining

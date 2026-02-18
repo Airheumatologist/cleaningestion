@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 import logging
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -16,7 +17,14 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Document, PointStruct
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
-from ingestion_utils import SectionFilter, EmbeddingProvider, upsert_with_retry
+from ingestion_utils import (
+    SectionFilter,
+    EmbeddingProvider,
+    upsert_with_retry,
+    get_chunker as get_shared_chunker,
+    load_checkpoint as load_checkpoint_file,
+    append_checkpoint as append_checkpoint_file,
+)
 from ingestion_utils import Chunker as BaseChunker  # Fallback
 
 # Initialize logging FIRST before any imports that might use logger
@@ -31,34 +39,18 @@ try:
         ContentDeduplicator, enhance_pmc_parsing
     )
     ENHANCED_UTILS_AVAILABLE = True
-    Chunker = SemanticChunker  # Use semantic chunking by default
-except ImportError:
-    Chunker = BaseChunker  # Fallback to base chunker
-
-# Log chunker selection after imports are complete
-if ENHANCED_UTILS_AVAILABLE:
     logger.info("Using SemanticChunker for improved chunking")
-else:
+except ImportError:
+    SemanticChunker = None  # type: ignore
+    QualityValidator = None  # type: ignore
+    ContentDeduplicator = None  # type: ignore
+    enhance_pmc_parsing = None  # type: ignore
     logger.warning("Enhanced ingestion utils not available, using base Chunker")
 
-CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_ingested_ids.txt"
-
-# Singleton chunker instance for reuse across batches
-_chunker_instance: Optional[Chunker] = None
-
-def _get_chunker() -> Chunker:
-    """Get or initialize the shared Chunker instance."""
-    global _chunker_instance
-    if _chunker_instance is None:
-        _chunker_instance = Chunker(
-            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
-        )
-    return _chunker_instance
+CHUNKER_CLASS = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
 
 
 import sys
-from pathlib import Path
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -72,8 +64,111 @@ else:
     BM25SparseEncoder = None  # type: ignore
 
 
-def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
-    """Create base payload for a PMC article."""
+SOURCE_PMC_OA = "pmc_oa"
+SOURCE_PMC_AUTHOR = "pmc_author_manuscript"
+SOURCE_MARKER_NAME = ".source"
+CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_ingested_ids.txt"
+LEGACY_AUTHOR_CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "author_manuscript_ingested_ids.txt"
+SOURCE_ALIAS_MAP = {
+    "pmc": SOURCE_PMC_OA,
+    "pmc_oa": SOURCE_PMC_OA,
+    "author_manuscript": SOURCE_PMC_AUTHOR,
+    "pmc_author_manuscript": SOURCE_PMC_AUTHOR,
+}
+
+def _normalize_source_type(value: str | None) -> str:
+    normalized = (value or "").strip().lower()
+    return SOURCE_ALIAS_MAP.get(normalized, SOURCE_PMC_OA)
+
+
+def _checkpoint_id(source_type: str, doc_id: str) -> str:
+    return f"{_normalize_source_type(source_type)}:{doc_id.strip()}"
+
+
+def _resolve_legacy_checkpoint_line(line: str) -> str | None:
+    value = line.strip()
+    if not value:
+        return None
+
+    if ":" in value:
+        prefix, doc_id = value.split(":", 1)
+        if not doc_id.strip():
+            return None
+        return _checkpoint_id(prefix, doc_id)
+
+    # Legacy format from historical pmc_ingested_ids.txt
+    return _checkpoint_id(SOURCE_PMC_OA, value)
+
+
+def _load_checkpoint_file(path: Path) -> set[str]:
+    return {
+        resolved
+        for line in load_checkpoint_file(path)
+        if (resolved := _resolve_legacy_checkpoint_line(line)) is not None
+    }
+
+
+def load_checkpoint() -> set[str]:
+    ids = _load_checkpoint_file(CHECKPOINT_FILE)
+
+    if LEGACY_AUTHOR_CHECKPOINT_FILE.exists():
+        legacy_author_ids = {
+            resolved
+            for line in load_checkpoint_file(LEGACY_AUTHOR_CHECKPOINT_FILE)
+            if (
+                resolved := _resolve_legacy_checkpoint_line(
+                    line if ":" in line else f"{SOURCE_PMC_AUTHOR}:{line}"
+                )
+            )
+            is not None
+        }
+        if legacy_author_ids:
+            logger.info(
+                "Loaded %s legacy author manuscript checkpoint IDs from %s",
+                len(legacy_author_ids),
+                LEGACY_AUTHOR_CHECKPOINT_FILE,
+            )
+            ids.update(legacy_author_ids)
+
+    return ids
+
+
+def append_checkpoint(ids: Iterable[str]) -> None:
+    append_checkpoint_file(CHECKPOINT_FILE, ids)
+
+
+def _extract_stem_id(xml_path: Path) -> str:
+    stem_id = xml_path.stem
+    if xml_path.name.endswith(".xml.gz"):
+        stem_id = stem_id.replace(".xml", "")
+    return stem_id.strip()
+
+
+def _detect_source_type(xml_path: Path, xml_root: Path) -> str:
+    current = xml_path.parent.resolve()
+    root = xml_root.resolve()
+
+    while True:
+        marker_path = current / SOURCE_MARKER_NAME
+        if marker_path.exists():
+            try:
+                marker_value = marker_path.read_text(encoding="utf-8").strip()
+                return _normalize_source_type(marker_value)
+            except Exception:
+                logger.debug("Unable to parse source marker at %s", marker_path)
+
+        if current == root or current.parent == current:
+            break
+        current = current.parent
+
+    lowered_parts = {part.lower() for part in xml_path.parts}
+    if "author_manuscript" in lowered_parts or "manuscript" in lowered_parts:
+        return SOURCE_PMC_AUTHOR
+    return SOURCE_PMC_OA
+
+
+def create_payload(article: Dict[str, Any], source_type: str) -> Dict[str, Any]:
+    """Create base payload for a PMC article with source differentiation."""
     # Handle PRD-compliant structure
     metadata = article.get("metadata", {})
     content = article.get("content", {})
@@ -94,7 +189,12 @@ def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
     # Get tables for count
     tables = content.get("tables", []) if content else article.get("tables", [])
     
-    return {
+    normalized_source = _normalize_source_type(source_type)
+    identifiers_nihms_id = identifiers.get("nihms_id")
+    article_nihms_id = article.get("nihms_id")
+    nihms_id = identifiers_nihms_id or article_nihms_id
+
+    payload = {
         "doc_id": pmcid or pmid,
         "pmcid": pmcid,
         "pmid": pmid,
@@ -112,30 +212,25 @@ def create_payload(article: Dict[str, Any]) -> Dict[str, Any]:
         "table_count": len(tables),
         "has_full_text": content_flags.get("has_full_text") if content_flags else article.get("has_full_text", False),
         "is_open_access": content_flags.get("is_open_access") if content_flags else article.get("is_open_access", False),
-        "source": "pmc",
+        "source": normalized_source,
+        "source_family": "pmc",
+        "content_type": "full_text" if normalized_source == SOURCE_PMC_OA else "author_manuscript",
     }
 
+    if normalized_source == SOURCE_PMC_AUTHOR:
+        payload["is_author_manuscript"] = True
+        if nihms_id:
+            payload["nihms_id"] = nihms_id
+    else:
+        payload["is_author_manuscript"] = False
 
-import threading
+    return payload
+
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Lock for file operations (checkpointing)
-checkpoint_lock = threading.Lock()
 
-def load_checkpoint() -> set[str]:
-    if CHECKPOINT_FILE.exists():
-        return {line.strip() for line in CHECKPOINT_FILE.read_text().splitlines() if line.strip()}
-    return set()
-
-
-def append_checkpoint(ids: Iterable[str]) -> None:
-    with checkpoint_lock:
-        with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
-            for value in ids:
-                f.write(f"{value}\n")
-
-
-def create_chunks_from_article(article: Dict[str, Any], chunker: Chunker) -> List[Dict[str, Any]]:
+def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Dict[str, Any]]:
     """
     Create multiple chunks from an article: sections + tables with token-aware chunking.
     Updated for PRD v1.0 compliant article structure.
@@ -149,6 +244,9 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Chunker) -> Lis
     metadata = article.get("metadata", {})
     content = article.get("content", {})
     
+    source_type = _normalize_source_type(article.get("_source_type"))
+    article_payload = create_payload(article, source_type)
+
     # Extract identifiers
     identifiers = metadata.get("identifiers", {}) if metadata else {}
     doc_id = str(identifiers.get("pmcid") or identifiers.get("pmid") or article.get("pmcid") or article.get("pmid") or "")
@@ -181,6 +279,13 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Chunker) -> Lis
         "country": country,
         "keywords": keywords,
         "mesh_terms": mesh_terms,
+        "source": article_payload["source"],
+        "source_family": article_payload["source_family"],
+        "content_type": article_payload["content_type"],
+        "is_author_manuscript": article_payload["is_author_manuscript"],
+        "nihms_id": article_payload.get("nihms_id"),
+        "has_full_text": article_payload["has_full_text"],
+        "is_open_access": article_payload["is_open_access"],
     }
     
     # 1. Abstract chunk (most important) - usually fits in single chunk
@@ -309,7 +414,11 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         dedup_chunks: Whether to deduplicate chunks within batch
     """
     # Use shared chunker instance for efficiency
-    chunker = _get_chunker()
+    chunker = get_shared_chunker(
+        chunker_class=CHUNKER_CLASS,
+        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
+    )
     
     points: List[PointStruct] = []
     all_chunk_ids: List[str] = []
@@ -372,6 +481,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     for chunk, vector in zip(all_chunks, vectors):
         chunk_id = chunk["chunk_id"]
         all_chunk_ids.append(chunk_id)
+        source_type = _normalize_source_type(chunk.get("source"))
         
         # Create sparse vector if enabled
         vector_data: Any = {"dense": vector}
@@ -411,16 +521,24 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             "section_weight": chunk.get("section_weight", 0.5),
             
             # Source and type
-            "source": "pmc",
+            "source": source_type,
+            "source_family": chunk.get("source_family", "pmc"),
+            "content_type": chunk.get(
+                "content_type",
+                "author_manuscript" if source_type == SOURCE_PMC_AUTHOR else "full_text",
+            ),
+            "is_author_manuscript": bool(chunk.get("is_author_manuscript", False)),
+            "nihms_id": chunk.get("nihms_id"),
             "article_type": chunk.get("section_type", "other"),
-            "has_full_text": True,
+            "has_full_text": chunk.get("has_full_text", True),
+            "is_open_access": chunk.get("is_open_access"),
             
             # Preview for dashboard browsing (keep for UI)
             "text_preview": chunk["text"][:500],
         }
         
         # Create deterministic point ID
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pmc:{chunk_id}"))
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{source_type}:{chunk_id}"))
         
         points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
     
@@ -438,44 +556,57 @@ def _create_sparse_encoder():
         )
     return None
 
-def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, processed_ids: set[str], processed_lock: threading.Lock, sparse_encoder=None) -> tuple[int, int]:
+def process_batch(
+    client: QdrantClient,
+    batch_files: List[Path],
+    embedding_provider: EmbeddingProvider,
+    processed_ids: set[str],
+    processed_lock: threading.Lock,
+    xml_root: Path,
+    sparse_encoder=None,
+) -> tuple[int, int]:
     """Process a batch of XML files in a single thread."""
     from scripts.ingestion_utils import parse_pmc_xml
     
-    articles = []
-    new_ids = []
+    articles: List[Dict[str, Any]] = []
+    new_ids: List[str] = []
     
     # 1. Parse all files in this batch
     for xml_path in batch_files:
         try:
-            # Optimization: Fast skip based on filename
-            # PMC files are usually named PMCxxxxxx.xml
-            stem_id = xml_path.stem
-            if xml_path.name.endswith(".xml.gz"):
-                stem_id = stem_id.replace(".xml", "")
-                
-            # Check against checkpoint relative to lock - but `processed_ids` is a set, so generic read is thread-safe enough for hit check
-            # We strictly only need lock for updates, or if we want perfect consistency. 
-            # Given the speed requirement, direct read is better. "set" lookup is atomic in Python CPython.
-            if stem_id in processed_ids:
+            source_type = _detect_source_type(xml_path, xml_root)
+            stem_id = _extract_stem_id(xml_path)
+            candidate_ids = set()
+            if stem_id:
+                candidate_ids.add(_checkpoint_id(source_type, stem_id))
+            if stem_id and not stem_id.upper().startswith("PMC"):
+                candidate_ids.add(_checkpoint_id(source_type, f"PMC{stem_id}"))
+            if any(value in processed_ids for value in candidate_ids):
                 continue
 
-            article = parse_pmc_xml(xml_path)
+            strict_oa = source_type == SOURCE_PMC_OA
+            article = parse_pmc_xml(
+                xml_path,
+                require_pmid=strict_oa,
+                require_open_access=strict_oa,
+            )
             if not article:
                 continue
+
+            article["_source_type"] = source_type
                 
             source_id = str(article.get("pmcid") or article.get("pmid") or "").strip()
             
-            # Double check with exact ID from content
             if not source_id:
                 continue
-                
-            if source_id != stem_id and source_id in processed_ids:
-                 continue
+
+            namespaced_id = _checkpoint_id(source_type, source_id)
+            if namespaced_id in processed_ids:
+                continue
 
             # If we get here, it's a new article
             articles.append(article)
-            new_ids.append(source_id)
+            new_ids.append(namespaced_id)
         except Exception as e:
             logger.error("Failed to parse %s: %s", xml_path.name, e)
 
@@ -483,7 +614,7 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
         return 0, len(batch_files)
 
     # 2. Build points (includes embedding)
-    points, chunk_ids = build_points(articles, embedding_provider, sparse_encoder=sparse_encoder)
+    points, _chunk_ids = build_points(articles, embedding_provider, sparse_encoder=sparse_encoder)
     
     if not points:
         return 0, len(batch_files)
@@ -493,9 +624,10 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
         upsert_with_retry(client, points)
         
         # 4. Update checkpoint
-        append_checkpoint(new_ids)
+        checkpoint_ids = list(dict.fromkeys(new_ids))
+        append_checkpoint(checkpoint_ids)
         with processed_lock:
-            processed_ids.update(new_ids)
+            processed_ids.update(checkpoint_ids)
             
         return len(points), len(batch_files) - len(articles) # inserted, skipped
     except Exception as e:
@@ -509,9 +641,12 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
     # Preload tokenizer once in main thread to avoid race conditions in workers
     logger.info("Preloading tokenizer...")
     try:
-        from scripts.ingestion_utils import Chunker
-        Chunker() # This triggers _load_tokenizer with the global lock
-        logger.info("Tokenizer preloaded successfully.")
+        chunker = get_shared_chunker(
+            chunker_class=CHUNKER_CLASS,
+            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
+        )
+        logger.info("Tokenizer preloaded (using %s).", chunker.__class__.__name__)
     except Exception as e:
         logger.warning("Tokenizer preload warning: %s", e)
     
@@ -568,7 +703,16 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
             current_super_batch = file_batches[i : i + SUPER_BATCH_SIZE]
             
             future_to_batch = {
-                executor.submit(process_batch, client, batch, embedding_provider, processed_ids, processed_lock, sparse_encoder): batch 
+                executor.submit(
+                    process_batch,
+                    client,
+                    batch,
+                    embedding_provider,
+                    processed_ids,
+                    processed_lock,
+                    xml_dir,
+                    sparse_encoder,
+                ): batch
                 for batch in current_super_batch
             }
             

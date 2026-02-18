@@ -15,7 +15,7 @@ from typing import List, Dict, Any, Optional, NamedTuple, Union
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from .config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, DEEPINFRA_MODEL, LLM_TEMPERATURE, LLM_TOP_P, QUERY_EXPANSION_COUNT
+from .config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, LLM_MODEL, LLM_TEMPERATURE, LLM_TOP_P, QUERY_EXPANSION_COUNT
 from .medical_entity_expander import MedicalEntityExpander
 
 logger = logging.getLogger(__name__)
@@ -246,7 +246,7 @@ class QueryPreprocessor:
     - Fallback to basic expansion on errors
     """
     
-    def __init__(self, model: str = DEEPINFRA_MODEL, use_entity_expansion: bool = True):
+    def __init__(self, model: str = LLM_MODEL, use_entity_expansion: bool = True):
         """Initialize with DeepInfra client."""
         if not DEEPINFRA_API_KEY:
             raise ValueError("DEEPINFRA_API_KEY not set")

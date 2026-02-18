@@ -8,6 +8,7 @@ import ftplib
 import gzip
 import json
 import logging
+import os
 import subprocess
 import sys
 import time
@@ -19,8 +20,33 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
+# Add project root to path for imports
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+
 from config_ingestion import IngestionConfig, ensure_data_dirs
 from src.bm25_sparse import BM25SparseEncoder
+from ingestion_utils import (
+    Chunker as BaseChunker, 
+    EmbeddingProvider, 
+    upsert_with_retry,
+    generate_section_id,
+    get_section_weight,
+    get_chunker as get_shared_chunker,
+    detect_evidence_grade,
+)
+
+# Import enhanced utilities for semantic chunking
+try:
+    from ingestion_utils_enhanced import SemanticChunker, QualityValidator
+    ENHANCED_UTILS_AVAILABLE = True
+except ImportError:
+    SemanticChunker = None  # type: ignore
+    QualityValidator = None  # type: ignore
+    ENHANCED_UTILS_AVAILABLE = False
+
+CHUNKER_CLASS = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,69 +55,6 @@ PUBMED_FTP_HOST = "ftp.ncbi.nlm.nih.gov"
 PUBMED_UPDATE_DIR = "/pubmed/updatefiles/"
 PROCESSED_TRACKER = IngestionConfig.DATA_DIR / "processed_updates.json"
 UPDATE_DOWNLOAD_DIR = IngestionConfig.DATA_DIR / "pubmed_updatefiles"
-
-
-class EmbeddingProvider:
-    """Embedding provider using DeepInfra API or local models."""
-    
-    def __init__(self) -> None:
-        self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
-        self.model = IngestionConfig.EMBEDDING_MODEL
-        self.local_encoder = None
-        self.openai_client = None
-
-        if self.provider == "deepinfra":
-            from openai import OpenAI
-            api_key = os.getenv("DEEPINFRA_API_KEY")
-            if not api_key:
-                raise ValueError("DEEPINFRA_API_KEY not set - required for deepinfra embedding provider")
-            self.openai_client = OpenAI(
-                api_key=api_key,
-                base_url="https://api.deepinfra.com/v1/openai"
-            )
-            logger.info("DeepInfra embedding provider initialized (model: %s)", self.model)
-        elif self.provider == "local":
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading local embedding model: %s", self.model)
-            self.local_encoder = SentenceTransformer(self.model)
-
-    def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        if self.provider == "deepinfra":
-            return self._embed_deepinfra(texts)
-        elif self.local_encoder is not None:
-            vectors = self.local_encoder.encode(texts, normalize_embeddings=True, batch_size=IngestionConfig.EMBEDDING_BATCH_SIZE)
-            return [v.tolist() for v in vectors]
-        else:
-            raise RuntimeError("No embedding provider available")
-    
-    def _embed_deepinfra(self, texts: List[str]) -> List[List[float]]:
-        """Embed using DeepInfra OpenAI-compatible API with sub-batching."""
-        batch_size = IngestionConfig.EMBEDDING_BATCH_SIZE
-        
-        if len(texts) <= batch_size:
-            return self._embed_deepinfra_single(texts)
-        
-        all_embeddings: List[List[float]] = []
-        for i in range(0, len(texts), batch_size):
-            sub_batch = texts[i:i + batch_size]
-            embeddings = self._embed_deepinfra_single(sub_batch)
-            all_embeddings.extend(embeddings)
-        return all_embeddings
-
-    def _embed_deepinfra_single(self, texts: List[str]) -> List[List[float]]:
-        """Send a single embedding request to DeepInfra."""
-        try:
-            response = self.openai_client.embeddings.create(
-                model=self.model,
-                input=texts,
-                encoding_format="float"
-            )
-            return [data.embedding for data in response.data]
-        except Exception as e:
-            logger.error("DeepInfra embedding failed: %s", e)
-            raise
-
-
 
 def load_processed_files() -> Set[str]:
     if not PROCESSED_TRACKER.exists():
@@ -102,11 +65,9 @@ def load_processed_files() -> Set[str]:
         return set()
 
 
-
 def save_processed_files(processed: Set[str]) -> None:
     PROCESSED_TRACKER.parent.mkdir(parents=True, exist_ok=True)
     PROCESSED_TRACKER.write_text(json.dumps(sorted(processed), indent=2), encoding="utf-8")
-
 
 
 def list_pubmed_update_files(max_files: Optional[int]) -> List[str]:
@@ -118,7 +79,6 @@ def list_pubmed_update_files(max_files: Optional[int]) -> List[str]:
     if max_files:
         files = files[-max_files:]
     return files
-
 
 
 def download_pubmed_file(file_name: str, output_dir: Path) -> Path:
@@ -137,7 +97,6 @@ def download_pubmed_file(file_name: str, output_dir: Path) -> Path:
     return local_path
 
 
-
 def infer_article_type(pub_types: List[str]) -> str:
     lowered = [p.lower() for p in pub_types]
     if any("guideline" in p for p in lowered):
@@ -151,18 +110,6 @@ def infer_article_type(pub_types: List[str]) -> str:
     if any("case report" in p for p in lowered):
         return "case_report"
     return "research_article"
-
-
-
-def infer_evidence_grade(article_type: str) -> str:
-    if article_type in {"guideline", "systematic_review"}:
-        return "A"
-    if article_type in {"clinical_trial", "review_article"}:
-        return "B"
-    if article_type == "case_report":
-        return "D"
-    return "C"
-
 
 
 def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
@@ -204,7 +151,11 @@ def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
                     break
 
             article_type = infer_article_type(pub_types)
-            evidence_grade = infer_evidence_grade(article_type)
+            evidence_grade = detect_evidence_grade(
+                article_type=article_type,
+                pub_types=pub_types,
+                abstract=abstract,
+            )
 
             yield {
                 "pmid": pmid,
@@ -223,14 +174,15 @@ def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
             elem.clear()
 
 
-
-from ingestion_utils import Chunker
-
 def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider) -> tuple[List[PointStruct], List[str]]:
-    chunker = Chunker(
+    """Build Qdrant points from article batch with semantic chunking."""
+    # Use shared chunker instance (SemanticChunker if available)
+    chunker = get_shared_chunker(
+        chunker_class=CHUNKER_CLASS,
         chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
     )
+    
     sparse_encoder = None
     if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
         sparse_encoder = BM25SparseEncoder(
@@ -255,56 +207,89 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             
         pmids.append(pmid)
         
-        # Combine title + abstract for chunking
-        text = f"{article.get('title', '')}. {article.get('abstract', '')}"
+        title = article.get("title", "")
+        abstract = article.get("abstract", "")
+        
+        # Combine title + abstract for chunking with proper format
+        text = f"Title: {title}\n\nAbstract: {abstract}" if title or abstract else ""
         if len(text) < 50:
             continue
             
-        # Chunk the abstract (PubMed usually small enough for 1 chunk, but safe to check)
-        text_chunks = chunker.chunk_text(text)
+        # Generate section ID for abstract
+        section_id = generate_section_id(pmid, "Abstract")
         
-        base_payload = {
-            "pmcid": None,
-            "pmid": pmid,
-            "doi": article.get("doi"),
-            "title": (article.get("title") or "")[:300],
-            "abstract": (article.get("abstract") or "")[:2000],
-            "full_text": "",
-            "year": article.get("year"),
-            "journal": article.get("journal", ""),
-            "article_type": article.get("article_type", "research_article"),
-            "publication_type": article.get("publication_type", []),
-            "evidence_grade": article.get("evidence_grade", "C"),
-            "source": article.get("source", "pubmed_update"),
-            "has_full_text": False,
-        }
+        # Chunk the content using shared chunker
+        text_chunks = chunker.chunk_text(text)
         
         for i, chunk in enumerate(text_chunks):
             chunk_text = chunk["text"]
             all_chunks_text.append(chunk_text)
             all_chunks_sparse.append(sparse_encoder.encode_document(chunk_text) if sparse_encoder is not None else None)
             
-            payload = base_payload.copy()
-            payload.update({
+            # Extract chunk abstract (remove title prefix if present)
+            chunk_abstract = chunk_text
+            if chunk_text.startswith(f"Title: {title}\n\nAbstract: "):
+                chunk_abstract = chunk_text[len(f"Title: {title}\n\nAbstract: "):]
+            elif chunk_text.startswith("Title: "):
+                chunk_abstract = chunk_text[chunk_text.find("\n\nAbstract: ") + 12:]
+            
+            # Build enhanced payload consistent with other ingestion scripts
+            payload = {
+                # Core identifiers
                 "doc_id": pmid,
-                "chunk_id": f"{pmid}_{i}",
-                "chunk_index": i,
-                "chunk_token_count": chunk["token_count"],
-                "section_title": "Abstract",
-                "section_type": "abstract",
+                "chunk_id": f"{pmid}_abstract_chunk_{i}" if len(text_chunks) > 1 else f"{pmid}_abstract",
+                "pmid": pmid,
+                "pmcid": None,
+                "doi": article.get("doi"),
+                
+                # CRITICAL: Full text for retriever
                 "page_content": chunk_text,
-                "is_backmatter_excluded": False
-            })
+                
+                # Content
+                "title": title if i == 0 else f"{title} (cont.)" if title else f"Abstract (Part {i+1})",
+                "abstract": chunk_abstract,
+                
+                # Chunking metadata
+                "chunk_index": i,
+                "total_chunks": len(text_chunks),
+                "token_count": chunk.get("token_count", 0),
+                
+                # Publication info
+                "year": article.get("year"),
+                "journal": article.get("journal", ""),
+                "article_type": article.get("article_type", "research_article"),
+                "publication_type": article.get("publication_type", []),
+                
+                # Evidence
+                "evidence_grade": article.get("evidence_grade", "C"),
+                "evidence_level": {"A": 1, "B": 2, "C": 3, "D": 4}.get(article.get("evidence_grade", "C"), 3),
+                
+                # Parent-child indexing fields
+                "section_title": f"Abstract (Part {i+1}/{len(text_chunks)})" if len(text_chunks) > 1 else "Abstract",
+                "section_type": "abstract",
+                "section_id": section_id,
+                "section_weight": get_section_weight("abstract") - (i * 0.05),  # Slight decay for later chunks
+                "full_section_text": text,
+                
+                # Source and type
+                "source": article.get("source", "pubmed_update"),
+                "has_full_text": False,
+                "content_type": "abstract",
+                
+                # Preview for dashboard
+                "text_preview": chunk_text[:500],
+            }
+            
             chunk_metadata.append(payload)
 
     if not all_chunks_text:
         return [], pmids
 
-    # Embed all chunks using DeepInfra or local provider
+    # Embed all chunks using shared embedding provider
     vectors = embedding_provider.embed_batch(all_chunks_text)
     for i, vector in enumerate(vectors):
         payload = chunk_metadata[i]
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chunk:{payload['chunk_id']}"))
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pubmed_update:{payload['chunk_id']}"))
         sparse_vector = all_chunks_sparse[i]
         vector_data: Any = {"dense": vector}
         if sparse_vector is not None:
@@ -315,26 +300,23 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     return points, pmids
 
 
-
-def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
-    for attempt in range(IngestionConfig.MAX_RETRIES):
-        try:
-            client.upsert(collection_name=IngestionConfig.COLLECTION_NAME, points=points, wait=False)
-            return
-        except Exception as exc:
-            if attempt == IngestionConfig.MAX_RETRIES - 1:
-                raise
-            time.sleep(2**attempt)
-            logger.warning("Retrying pubmed upsert after error: %s", str(exc)[:200])
-
-
-
 def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingProvider, max_files: Optional[int]) -> int:
     processed = load_processed_files()
     all_files = list_pubmed_update_files(max_files=max_files)
     new_files = [f for f in all_files if f not in processed]
 
     logger.info("PubMed update files total=%s new=%s", len(all_files), len(new_files))
+    
+    # Log chunking configuration
+    chunker = get_shared_chunker(
+        chunker_class=CHUNKER_CLASS,
+        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
+    )
+    logger.info("Chunking config: size=%d, overlap=%d, chunker=%s",
+                IngestionConfig.CHUNK_SIZE_TOKENS,
+                IngestionConfig.CHUNK_OVERLAP_TOKENS,
+                chunker.__class__.__name__)
 
     inserted = 0
     for file_name in new_files:
@@ -366,12 +348,10 @@ def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingPro
     return inserted
 
 
-
 def run_dailymed_refresh() -> None:
     logger.info("Starting DailyMed refresh")
     subprocess.run([sys.executable, "scripts/03_download_dailymed.py", "--output-dir", str(IngestionConfig.DAILYMED_XML_DIR)], check=True)
     subprocess.run([sys.executable, "scripts/07_ingest_dailymed.py", "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR)], check=True)
-
 
 
 def main() -> None:
@@ -382,6 +362,15 @@ def main() -> None:
     args = parser.parse_args()
 
     ensure_data_dirs()
+
+    # Validate required API keys
+    if not os.getenv("DEEPINFRA_API_KEY"):
+        logger.error("DEEPINFRA_API_KEY not set!")
+        sys.exit(1)
+    
+    if not IngestionConfig.QDRANT_API_KEY:
+        logger.error("QDRANT_API_KEY not set!")
+        sys.exit(1)
 
     embedding_provider = EmbeddingProvider()
     client = QdrantClient(

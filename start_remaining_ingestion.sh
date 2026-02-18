@@ -1,7 +1,33 @@
 #!/bin/bash
-# Start PubMed and DailyMed ingestion while PMC continues running
+# Start PubMed and DailyMed ingestion (useful when running in parallel with PMC)
+# Usage: ./start_remaining_ingestion.sh [--fresh]
+#   --fresh: Clear checkpoints before starting
 
 set -e
+
+# Parse arguments
+FRESH_MODE=false
+for arg in "$@"; do
+    case $arg in
+        --fresh)
+            FRESH_MODE=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--fresh]"
+            echo ""
+            echo "Start PubMed and DailyMed ingestion while PMC may be running separately."
+            echo ""
+            echo "Options:"
+            echo "  --fresh    Clear checkpoints before starting"
+            echo "  --help     Show this help message"
+            echo ""
+            echo "Note: For complete fresh ingestion including collection recreation,"
+            echo "      use: ./start_ingestion.sh --fresh"
+            exit 0
+            ;;
+    esac
+done
 
 echo "=========================================="
 echo "🚀 Starting PubMed & DailyMed Ingestion"
@@ -23,18 +49,40 @@ echo ""
 
 # Check if PMC is still running
 if pgrep -f "06_ingest_pmc.py" > /dev/null; then
-    echo "✅ PMC ingestion is still running (will continue with new code)"
+    echo "✅ PMC ingestion is currently running (will continue independently)"
     echo ""
 fi
 
-# ==========================================
+# =============================================================================
+# FRESH MODE - Clear checkpoints
+# =============================================================================
+if [ "$FRESH_MODE" = true ]; then
+    echo "🧹 Clearing checkpoint files for PubMed and DailyMed..."
+    
+    CHECKPOINT_FILES=(
+        "$DATA_DIR/pubmed_ingested_ids.txt"
+        "$DATA_DIR/dailymed_ingested_ids.txt"
+    )
+    
+    for file in "${CHECKPOINT_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            echo "   Removing: $(basename "$file")"
+            rm -f "$file"
+        fi
+    done
+    
+    echo "   ✅ Checkpoints cleared"
+    echo ""
+fi
+
+# =============================================================================
 # PUBMED INGESTION
-# ==========================================
+# =============================================================================
 echo "📄 PubMed Abstracts Ingestion"
 echo "----------------------------------------"
 
 # Find PubMed file
-PUBMED_FILE="${PUBMED_FILE:-$DATA_DIR/pubmed_baseline/pubmed_abstracts.jsonl}"
+PUBMED_FILE="${PUBMED_FILE:-$DATA_DIR/pubmed_baseline/filtered/pubmed_abstracts.jsonl}"
 
 if [ ! -f "$PUBMED_FILE" ]; then
     # Try to find any pubmed jsonl file
@@ -58,6 +106,9 @@ if [ -z "$SKIP_PUBMED" ]; then
     if [ -f "$CHECKPOINT_FILE" ]; then
         INGESTED_COUNT=$(wc -l < "$CHECKPOINT_FILE")
         echo "   Checkpoint: $INGESTED_COUNT articles already ingested"
+        if [ "$FRESH_MODE" = false ]; then
+            echo "   (Use --fresh to clear checkpoint and restart from beginning)"
+        fi
     fi
     
     read -p "Start PubMed ingestion? [Y/n]: " confirm
@@ -80,9 +131,9 @@ fi
 
 echo ""
 
-# ==========================================
+# =============================================================================
 # DAILYMED INGESTION
-# ==========================================
+# =============================================================================
 echo "💊 DailyMed Drug Labels Ingestion"
 echo "----------------------------------------"
 
@@ -107,6 +158,9 @@ if [ -z "$SKIP_DAILYMED" ]; then
     if [ -f "$CHECKPOINT_FILE" ]; then
         INGESTED_COUNT=$(wc -l < "$CHECKPOINT_FILE")
         echo "   Checkpoint: $INGESTED_COUNT labels already ingested"
+        if [ "$FRESH_MODE" = false ]; then
+            echo "   (Use --fresh to clear checkpoint and restart from beginning)"
+        fi
     fi
     
     read -p "Start DailyMed ingestion? [Y/n]: " confirm
@@ -135,7 +189,7 @@ echo ""
 
 # Show all running processes
 echo "Running ingestion processes:"
-ps aux | grep "ingest_" | grep -v grep | awk '{print "  PID: " $2 " - " $11 " " $12}'
+ps aux | grep "ingest_" | grep -v grep | awk '{print "  PID: " $2 " - " $11 " " $12}' || echo "  (none)"
 
 echo ""
 echo "Monitor progress:"

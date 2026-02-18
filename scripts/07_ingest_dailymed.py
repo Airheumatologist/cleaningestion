@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,18 +25,25 @@ try:
     sys.path.insert(0, str(Path(__file__).parent))         # Add scripts/ to path
     sys.path.insert(0, str(Path(__file__).parent.parent))  # Add root to path for src
     from config_ingestion import IngestionConfig, ensure_data_dirs
-    from ingestion_utils import EmbeddingProvider, upsert_with_retry
+    from ingestion_utils import (
+        EmbeddingProvider,
+        upsert_with_retry,
+        get_chunker as get_shared_chunker,
+        load_checkpoint as load_checkpoint_file,
+        append_checkpoint as append_checkpoint_file,
+    )
     from ingestion_utils import Chunker as BaseChunker
     
     # Import enhanced utilities for semantic chunking and validation
     try:
         from ingestion_utils_enhanced import SemanticChunker, QualityValidator, ContentDeduplicator
         ENHANCED_UTILS_AVAILABLE = True
-        Chunker = SemanticChunker  # Use semantic chunking by default
         logger.info("Using SemanticChunker for improved chunking")
     except ImportError:
+        SemanticChunker = None  # type: ignore
+        QualityValidator = None  # type: ignore
+        ContentDeduplicator = None  # type: ignore
         ENHANCED_UTILS_AVAILABLE = False
-        Chunker = BaseChunker
         logger.warning("Enhanced utils not available, using base Chunker")
     
     # Import BM25SparseEncoder
@@ -49,6 +57,8 @@ except Exception as import_err:
     logger.error("Failed to import required modules: %s", import_err)
     logger.error("Please ensure all dependencies are installed: pip install -r requirements.txt")
     sys.exit(1)
+
+CHUNKER_CLASS = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
 
 # XML Namespaces for SPL (Structured Product Labeling)
 NS = {"hl7": "urn:hl7-org:v3"}
@@ -64,7 +74,7 @@ SECTION_CODES = {
     # Warnings can be coded as 34071-1 (Warnings) or 43685-7 (Warnings and Precautions)
     "34071-1": ("warnings", "Warnings"),
     "43685-7": ("warnings", "Warnings & Precautions"),
-    "34084-4": ("adverse_reactions", "Adverse Reactions"),  # CORRECT: was 34072-9
+    "34084-4": ("adverse_reactions", "Adverse Reactions"),  # CORRECT code for Adverse Reactions (34072-9 is an old code for General Precautions, see below)
     "34073-7": ("interactions", "Drug Interactions"),
     "34066-1": ("boxed_warning", "Boxed Warning"),
     # Use in Specific Populations can be 34074-5 or parent 43684-0
@@ -445,7 +455,7 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
     # Combine all chunks
     all_chunks = chunks + raw_chunks
     
-    # Validate chunks if enabled
+    # Validate chunks if enabled (note: deduplication is now done in build_points for consistency)
     if validate_chunks and ENHANCED_UTILS_AVAILABLE:
         valid_chunks = []
         for chunk in all_chunks:
@@ -465,11 +475,51 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
 
 
 
-def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder]) -> Tuple[List[PointStruct], List[str]]:
-    """Convert chunks into Qdrant PointStructs with embeddings."""
+def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder],
+                 validate_chunks: bool = True, dedup_chunks: bool = True) -> Tuple[List[PointStruct], List[str]]:
+    """Convert chunks into Qdrant PointStructs with embeddings.
+    
+    Args:
+        chunks: List of chunk dictionaries
+        embedding_provider: Provider for generating embeddings
+        sparse_encoder: Optional sparse encoder for hybrid search
+        validate_chunks: Whether to validate chunk quality before ingestion
+        dedup_chunks: Whether to deduplicate chunks within batch
+    """
     if not chunks:
         return [], []
+    
+    # Initialize deduplicator if enabled
+    dedup = None
+    if dedup_chunks and ContentDeduplicator is not None:
+        dedup = ContentDeduplicator()
+    
+    # Validate and deduplicate chunks
+    filtered_chunks = []
+    for chunk in chunks:
+        # Validate chunk if enabled
+        if validate_chunks and ENHANCED_UTILS_AVAILABLE:
+            is_valid, issues = QualityValidator.validate_chunk(
+                chunk["text"],
+                {k: chunk.get(k) for k in ["set_id", "chunk_id", "drug_name", "section_title"]}
+            )
+            if not is_valid:
+                logger.debug("Skipping invalid chunk %s: %s", chunk.get("chunk_id"), issues)
+                continue
         
+        # Deduplicate if enabled
+        if dedup:
+            metadata = {
+                "doc_id": chunk.get("set_id", ""),
+                "chunk_id": chunk.get("chunk_id", "")
+            }
+            if dedup.is_duplicate(chunk["text"], metadata):
+                logger.debug("Skipping duplicate chunk %s", chunk.get("chunk_id"))
+                continue
+        
+        filtered_chunks.append(chunk)
+    
+    chunks = filtered_chunks
     texts = [chunk["text"] for chunk in chunks]
     
     # 1. Generate Dense Embeddings
@@ -523,27 +573,7 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
 # Checkpoint file for DailyMed ingestion
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "dailymed_ingested_ids.txt"
 
-# Checkpoint file for DailyMed ingestion
-
-import threading
-
-# Lock for file operations (checkpointing)
-checkpoint_lock = threading.Lock()
-
-def load_checkpoint() -> set[str]:
-    if CHECKPOINT_FILE.exists():
-        return {line.strip() for line in CHECKPOINT_FILE.read_text().splitlines() if line.strip()}
-    return set()
-
-
-def append_checkpoint(ids: Iterable[str]) -> None:
-    with checkpoint_lock:
-        with CHECKPOINT_FILE.open("a", encoding="utf-8") as f:
-            for value in ids:
-                f.write(f"{value}\n")
-
-
-def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker: Chunker) -> Tuple[int, int]:
+def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker: Any) -> Tuple[int, int]:
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
     skipped = 0
@@ -586,19 +616,20 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
     # 2. Chunk and Embedding
     all_chunks = []
     for drug in drugs:
-        all_chunks.extend(create_chunks(drug, chunker))
+        all_chunks.extend(create_chunks(drug, chunker, validate_chunks=ENHANCED_UTILS_AVAILABLE))
         
     if not all_chunks:
         return 0, len(batch_files)
 
     try:
-        points, chunk_ids = build_points(all_chunks, embedding_provider, sparse_encoder)
+        points, chunk_ids = build_points(all_chunks, embedding_provider, sparse_encoder,
+                                        validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
         
         if points:
             upsert_with_retry(client, points)
             
             # Update checkpoints
-            append_checkpoint(new_ids)
+            append_checkpoint_file(CHECKPOINT_FILE, new_ids)
             with processed_lock:
                 processed_ids.update(new_ids)
                 
@@ -615,8 +646,12 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     # Preload tokenizer (uses SemanticChunker if available)
     logger.info("Preloading tokenizer...")
     try:
-        Chunker()
-        logger.info("Tokenizer preloaded (using %s).", Chunker.__name__)
+        chunker = get_shared_chunker(
+            chunker_class=CHUNKER_CLASS,
+            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
+        )
+        logger.info("Tokenizer preloaded (using %s).", chunker.__class__.__name__)
     except Exception as e:
         logger.warning("Tokenizer preload failed: %s", e)
 
@@ -641,12 +676,12 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
          logger.error("Failed to connect to collection: %s", e)
          return
 
-    processed_ids = load_checkpoint()
+    processed_ids = load_checkpoint_file(CHECKPOINT_FILE)
     processed_lock = threading.Lock()
     logger.info("DailyMed checkpoint size=%s", len(processed_ids))
 
     sparse_encoder = None
-    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
+    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25" and BM25SparseEncoder is not None:
         sparse_encoder = BM25SparseEncoder(
             max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
             max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
@@ -660,10 +695,11 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE
     MAX_WORKERS = IngestionConfig.MAX_WORKERS  # Standardized to use config value (default: 8)
     
-    # Create shared chunker instance (SemanticChunker if available)
-    chunker = Chunker(
+    # Use shared chunker instance for consistency with other ingestion scripts
+    chunker = get_shared_chunker(
+        chunker_class=CHUNKER_CLASS,
         chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
     )
     
     file_batches = [xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(xml_files), THREAD_BATCH_SIZE)]
@@ -724,4 +760,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error("Ingestion failed: %s", e)
         sys.exit(1)
-

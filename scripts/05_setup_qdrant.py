@@ -119,9 +119,7 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
                 on_disk=True,
             ),
             sparse_vectors_config=sparse_vectors_config,
-            quantization_config=models.BinaryQuantization(
-                binary=models.BinaryQuantizationConfig(always_ram=True)
-            ),
+            quantization_config=_get_quantization_config(),
             hnsw_config=models.HnswConfigDiff(
                 m=16,
                 ef_construct=128,
@@ -145,6 +143,9 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
         "doc_id": models.PayloadSchemaType.KEYWORD,
         "chunk_id": models.PayloadSchemaType.KEYWORD,
         "section_type": models.PayloadSchemaType.KEYWORD,
+        # Merged PubMed pipeline - Government affiliation fields
+        "is_gov_affiliated": models.PayloadSchemaType.KEYWORD,
+        "gov_agencies": models.PayloadSchemaType.KEYWORD,
     }
 
     for field_name, field_type in indexes.items():

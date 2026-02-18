@@ -33,7 +33,7 @@ A production-grade **Medical RAG (Retrieval-Augmented Generation) Pipeline** des
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │              QDRANT VECTOR DATABASE (Self-Hosted on Hetzner)         │    │
 │  │  ┌─────────────────────────────────────────────────────────────┐   │    │
-│  │  │                   COLLECTION: rag_pipeline                   │   │    │
+│  │  │                   COLLECTION: rag_pipeline                    │   │    │
 │  │  │  • Dense Vectors:    Qwen3-Embedding-0.6B (1024-d)          │   │    │
 │  │  │  • Sparse Vectors:   BM25 (Hybrid Search)                   │   │    │
 │  │  │  • Quantization:     Scalar (int8, 75% memory reduction)    │   │    │
@@ -99,22 +99,16 @@ RAG-pipeline/
 │   └── specialty_journals.py               # Journal priority lists
 │
 ├── scripts/                                # Data ingestion pipeline
-│   ├── 01_download_pmc.py                  # Download PMC OA articles
-│   ├── 02_extract_pmc.py                   # Extract XML content
+│   ├── 01_download_pmc_unified.py          # Download PMC OA + Author Manuscripts from NCBI FTP
+│   ├── 01_download_pmc.py                  # Compatibility wrapper (deprecated)
 │   ├── 03_download_dailymed.py             # Download FDA drug labels
-│   ├── 04_process_dailymed.py              # Process drug label XML
 │   ├── 05_setup_qdrant.py                  # Initialize Qdrant collection
-│   ├── 06_ingest_pmc.py                    # Ingest PMC to Qdrant
-│   ├── 07_ingest_dailymed.py               # Ingest DailyMed to Qdrant
+│   ├── 06_ingest_pmc.py                    # Ingest unified PMC XML sources to Qdrant
+│   ├── 07_ingest_dailymed.py               # Ingest DailyMed XML to Qdrant
 │   ├── 08_monthly_update.py                # Incremental updates
 │   ├── 09_smoke_test.py                    # Validation tests
-│   ├── 10_download_gov_abstracts.py        # Download ClinicalTrials.gov/FDA
-│   ├── 11_download_author_manuscripts.py   # Download PMC Author Manuscripts
-│   ├── 14_ingest_author_manuscripts.py     # Ingest Author Manuscripts
-│   ├── 15_ingest_gov_abstracts.py          # Ingest Gov Abstracts
-│   ├── 20_download_pubmed_baseline.py      # Download PubMed abstracts
+│   ├── 20_download_pubmed_baseline.py      # Download PubMed abstracts (includes gov affiliation)
 │   ├── 21_ingest_pubmed_abstracts.py       # Ingest PubMed to Qdrant
-│   ├── 22_add_fulltext_to_pmc.py           # Add full text to existing points
 │   ├── config_ingestion.py                 # Ingestion config
 │   ├── ingestion_utils.py                  # Core ingestion utilities
 │   └── ingestion_utils_enhanced.py         # Enhanced chunking/validation
@@ -130,6 +124,9 @@ RAG-pipeline/
 ├── deploy/                                 # Deployment configurations
 │   └── hetzner_setup.md                    # Self-hosted Qdrant guide
 │
+├── start_ingestion.sh                      # Interactive ingestion starter
+├── start_remaining_ingestion.sh            # Resume partial ingestion
+├── deploy_production.sh                    # Production deployment
 ├── requirements.txt                        # Python dependencies
 ├── .env                                    # Environment configuration
 └── README.md                               # This file
@@ -240,8 +237,8 @@ Intelligent context assembly in `_get_papers_for_context()`:
 - No general disclaimers (peer-to-peer professional communication)
 
 **Model:**
-- Uses `openai/gpt-oss-20b` via DeepInfra
-- Fallback logic disabled (Strict configuration)
+- **LLM**: `openai/gpt-oss-20b` via DeepInfra
+- **Reranker**: `Qwen/Qwen3-Reranker-0.6B` via DeepInfra
 
 ---
 
@@ -282,12 +279,13 @@ Edit `.env` with team credentials:
 QDRANT_URL=http://65.109.112.253:6333
 QDRANT_API_KEY=<ask-team-lead>
 QDRANT_COLLECTION=rag_pipeline
+COLLECTION_NAME=rag_pipeline
 
 # =============================================================================
 # DEEPINFRA API (Team Account)
 # =============================================================================
 DEEPINFRA_API_KEY=<ask-team-lead>
-DEEPINFRA_MODEL=openai/gpt-oss-20b
+LLM_MODEL=openai/gpt-oss-20b
 DEEPINFRA_BASE_URL=https://api.deepinfra.com/v1/openai
 
 # Embedding Model
@@ -312,6 +310,13 @@ SPARSE_RETRIEVAL_MODE=bm25
 RETRIEVAL_CHUNK_LIMIT=400
 RERANK_TOP_CHUNKS=100
 FINAL_TOP_ARTICLES=50
+
+# =============================================================================
+# DATA DIRECTORIES
+# =============================================================================
+DATA_DIR=/data/ingestion
+PMC_XML_DIR=/data/ingestion/pmc_xml
+DAILYMED_XML_DIR=/data/ingestion/dailymed/xml
 ```
 
 ### 3. Local Development (without full dataset)
@@ -341,42 +346,146 @@ Access at `http://localhost:3000`
 
 ### 4. Production Data Ingestion
 
-Use the provided bash scripts for a streamlined workflow:
+Use the interactive script:
 
 ```bash
-# 1. Complete Ingestion (Downloads + Ingests all datasets)
-./scripts/run_complete_ingestion.sh
+# Start ingestion interactively (resumes from checkpoints)
+./start_ingestion.sh
 
-# OR 2. Background Ingestion (Run in background with logs)
-./scripts/run_ingestion_background.sh
+# Fresh ingestion from scratch (clears checkpoints and recreates collection)
+./start_ingestion.sh --fresh
+
+# Show help
+./start_ingestion.sh --help
 ```
 
-**Manual Breakdown (if running step-by-step):**
+The script will:
+1. Auto-detect available data sources (PMC XML, PubMed JSONL, DailyMed XML)
+2. Let you choose which dataset(s) to ingest
+3. Run in sequence (recommended) or parallel
+4. Handle checkpointing for resumable ingestion
+
+**Or run manually (complete re-ingestion workflow):**
 
 ```bash
-# Setup collection
+# Setup collection (fresh start)
 python scripts/05_setup_qdrant.py --recreate
 
-# 1. PMC Articles
-python scripts/01_download_pmc.py --years 2020-2025
-python scripts/02_extract_pmc.py
-python scripts/06_ingest_pmc.py
-python scripts/22_add_fulltext_to_pmc.py
+# 1. Unified PMC pipeline (OA + Author Manuscripts)
+python scripts/01_download_pmc_unified.py --datasets pmc_oa,author_manuscript
+python scripts/06_ingest_pmc.py --xml-dir /data/ingestion/pmc_xml
 
 # 2. DailyMed Drug Labels
 python scripts/03_download_dailymed.py
-python scripts/04_process_dailymed.py
-python scripts/07_ingest_dailymed.py
+python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
 
-# 3. PubMed Abstracts
+# IMPORTANT: Generate drug lookup cache AFTER DailyMed ingestion completes
+# This enables fast O(1) drug name → set_id lookups instead of slow BM25 fallback
+python scripts/generate_drug_lookup.py
+
+# 3. PubMed Abstracts (Unified Pipeline - includes Gov Affiliation)
+# This unified pipeline downloads PubMed baseline and extracts BOTH:
+# - High-value article types (reviews, trials, guidelines)
+# - Government affiliations (NIH, CDC, FDA, VA, etc.)
 python scripts/20_download_pubmed_baseline.py
-python scripts/21_ingest_pubmed_abstracts.py
+python scripts/21_ingest_pubmed_abstracts.py --input /data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 
-# 4. Author Manuscripts & Government Abstracts
-python scripts/11_download_author_manuscripts.py
-python scripts/14_ingest_author_manuscripts.py
-python scripts/10_download_gov_abstracts.py
-python scripts/15_ingest_gov_abstracts.py
+# NOTE: Government abstracts pipeline has been MERGED into PubMed pipeline above.
+# Old scripts (10_download_gov_abstracts.py, 13_ingest_gov_abstracts.py) are deprecated.
+# Use filter: is_gov_affiliated=true in queries to get government-authored articles.
+```
+
+**Monitor Progress:**
+```bash
+# Check logs
+tail -f /data/ingestion/logs/*.log
+
+# Check PIDs
+cat /data/ingestion/logs/*.pid
+
+# View checkpoints
+ls -la /data/ingestion/*checkpoint* /data/ingestion/*_ingested_ids.txt
+```
+
+**Post-Ingestion Steps (Required for complete re-ingestion):**
+
+After DailyMed ingestion completes, generate the drug lookup cache:
+
+```bash
+# Using the interactive script
+./start_ingestion.sh
+# Select option 6: Post-ingestion: Generate drug lookup
+
+# Or run manually
+python scripts/generate_drug_lookup.py
+```
+
+This creates `src/data/drug_setid_lookup.json` which enables:
+- **Fast O(1) lookups**: Direct JSON lookup instead of BM25 vector search
+- **Better performance**: Drug name queries resolve instantly
+- **Brand/generic mapping**: Active ingredients are mapped to their drug labels
+
+---
+
+## 📊 Data Ingestion Details
+
+### Storage Requirements (Estimated)
+
+| Dataset | Compressed | Extracted XML | Qdrant Index |
+| :--- | :--- | :--- | :--- |
+| **PMC (oa_comm)** | ~98 GB | ~392 GB | ~200 GB |
+| **DailyMed** | ~8 GB | ~35 GB | ~15 GB |
+| **PubMed (Unified)** | ~10 GB | ~40 GB | ~20 GB |
+| **Total** | **~120 GB** | **~470 GB** | **~250 GB** |
+
+**Note:** The PubMed Unified pipeline includes government-affiliated articles (NIH, CDC, FDA, VA, etc.) 
+that were previously in a separate pipeline. Use `is_gov_affiliated=true` filter to retrieve 
+government-authored articles.
+
+**Total Disk Required:** ~850 GB (Safe margin: 1 TB)
+
+### Chunking Strategy
+
+**PMC Articles:**
+- Abstract chunk (title + abstract)
+- Section chunks with context: "Title: X\n\nSection: Y\n\nContent"
+- Table chunks with full content (caption + row-by-row data)
+- Token-aware chunking: 2048 tokens with 256 token overlap (configurable via CHUNK_SIZE_TOKENS)
+
+**PubMed Abstracts (Unified Pipeline):**
+- Single source: `pubmed_abstract` (replaces separate `pubmed_gov`)
+- Content type: `abstract`
+- New fields: `is_gov_affiliated` (bool), `gov_agencies` (list)
+- Same chunking strategy as PMC articles
+- Filter examples:
+  - `is_gov_affiliated=true` - Only government-authored articles
+  - `gov_agencies=["NIH","CDC"]` - Specific agencies
+
+**DailyMed Drug Labels:**
+- Overview chunk (name + ingredients + key sections)
+- Section chunks: Indications, Dosage, Adverse Reactions, Drug Interactions, Warnings
+- Table chunks parsed and embedded separately
+
+### Post-Ingestion: Scalar Quantization
+
+After all ingestion completes, enable scalar quantization for 75% memory reduction:
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import ScalarQuantization, ScalarQuantizationConfig, ScalarType
+
+client = QdrantClient(url="http://your-server:6333", api_key="...")
+
+client.update_collection(
+    collection_name="rag_pipeline",
+    quantization_config=ScalarQuantization(
+        scalar=ScalarQuantizationConfig(
+            type=ScalarType.INT8,
+            quantile=0.99,
+            always_ram=True,
+        ),
+    ),
+)
 ```
 
 ---
@@ -426,19 +535,19 @@ curl -X POST http://localhost:8000/api/query/decompose \
 
 | Model | Dimension | Context | Use Case |
 |-------|-----------|---------|----------|
-| Qwen/Qwen3-Embedding-0.6B-batch | 1024 | 32K | **Strict Default** |
+| Qwen/Qwen3-Embedding-0.6B-batch | 1024 | 32K | **Default** |
 
 ### Reranker Models (via DeepInfra)
 
 | Model | Max Tokens | Notes |
 |-------|------------|-------|
-| Qwen/Qwen3-Reranker-0.6B | 32K | **Strict Default** |
+| Qwen/Qwen3-Reranker-0.6B | 32K | **Default** |
 
 ### LLM Models (via DeepInfra)
 
 | Model | Use Case |
 |-------|----------|
-| openai/gpt-oss-20b | **Primary generation** (No fallback) |
+| openai/gpt-oss-20b | **Primary generation** |
 
 ---
 
@@ -534,7 +643,7 @@ npm start  # Production mode
 ## 🐛 Common Issues
 
 ### Qdrant Connection Timeout
-```
+```python
 # Increase timeout in src/config.py
 QDRANT_TIMEOUT = 180  # seconds
 ```
@@ -552,17 +661,8 @@ QDRANT_TIMEOUT = 180  # seconds
 ## 📞 Team Contacts
 
 - **Infrastructure/Deployment**: See team wiki
-- **Data Ingestion Issues**: Check `CHANGES_SUMMARY.md` for recent fixes
+- **Data Ingestion Issues**: Check script logs in `/data/ingestion/logs/`
 - **API Issues**: Review `src/api_server.py` logs
-
----
-
-## 📝 Recent Changes
-
-See `CHANGES_SUMMARY.md` for:
-- Token range fixes in QualityValidator
-- Author manuscripts logic bug fixes
-- SemanticChunker tokenizer integration
 
 ---
 

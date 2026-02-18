@@ -659,6 +659,7 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
                     "doi": identifiers.get("doi"),
                     "pmcid": identifiers.get("pmcid"),
                     "publisher_id": identifiers.get("publisher_id"),
+                    "nihms_id": identifiers.get("nihms_id"),
                 },
                 "publication": {
                     "date": pub_date,
@@ -697,6 +698,7 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
             "pmcid": identifiers.get("pmcid"),
             "pmid": identifiers.get("pmid"),
             "doi": identifiers.get("doi"),
+            "nihms_id": identifiers.get("nihms_id"),
             "title": article_title,
             "abstract": _extract_abstract(article_meta),
             "full_text": body_text if has_full_text else "",
@@ -845,10 +847,11 @@ def _extract_identifiers(article_meta: ET.Element) -> Dict[str, Optional[str]]:
         "doi": None,
         "pmcid": None,
         "publisher_id": None,
+        "nihms_id": None,
     }
     
     for aid in article_meta.xpath(".//article-id"):
-        id_type = aid.get("pub-id-type")
+        id_type = (aid.get("pub-id-type") or "").strip().lower().replace("_", "-")
         text = (aid.text or "").strip()
         if not text:
             continue
@@ -860,6 +863,10 @@ def _extract_identifiers(article_meta: ET.Element) -> Dict[str, Optional[str]]:
             identifiers["pmcid"] = text
         elif id_type == "publisher-id":
             identifiers["publisher_id"] = text
+        elif id_type in {"nihms", "nihms-id", "nihmsid", "manuscript-id", "manuscript"}:
+            identifiers["nihms_id"] = text
+        elif identifiers.get("nihms_id") is None and text.upper().startswith("NIHMS"):
+            identifiers["nihms_id"] = text
     
     return identifiers
 
@@ -1372,3 +1379,201 @@ def _extract_abstract(article_meta: ET.Element) -> str:
     
     return "\n\n".join(abstract_parts)
 
+
+# ============================================================================
+# Shared Ingestion Utilities - Consolidated from duplicate implementations
+# across ingestion scripts (06, 07, 21, 08_monthly_update, 12, etc.)
+# ============================================================================
+
+import threading
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+# Global singleton for chunker instance
+_CHUNKER_INSTANCE: Optional[Any] = None
+_CHUNKER_LOCK = threading.Lock()
+
+
+def get_chunker(chunker_class: Optional[type] = None, chunk_size: Optional[int] = None, 
+                overlap: Optional[int] = None) -> Any:
+    """
+    Get or initialize the shared Chunker instance (singleton pattern).
+    
+    This function provides a centralized way to get a chunker instance across
+    all ingestion scripts, eliminating duplicate _get_chunker() implementations.
+    
+    Args:
+        chunker_class: Optional chunker class to use (defaults to Chunker or SemanticChunker)
+        chunk_size: Optional chunk size override (defaults to IngestionConfig.CHUNK_SIZE_TOKENS)
+        overlap: Optional overlap override (defaults to IngestionConfig.CHUNK_OVERLAP_TOKENS)
+        
+    Returns:
+        Chunker instance (singleton)
+    """
+    global _CHUNKER_INSTANCE
+    
+    if _CHUNKER_INSTANCE is not None:
+        return _CHUNKER_INSTANCE
+    
+    with _CHUNKER_LOCK:
+        if _CHUNKER_INSTANCE is not None:
+            return _CHUNKER_INSTANCE
+        
+        # Determine which chunker class to use
+        if chunker_class is None:
+            # Try to use SemanticChunker if available, fallback to base Chunker
+            try:
+                from ingestion_utils_enhanced import SemanticChunker
+                chunker_class = SemanticChunker
+                logger.info("Using SemanticChunker for improved chunking")
+            except ImportError:
+                chunker_class = Chunker
+                logger.info("Using base Chunker for chunking")
+        
+        # Get config values if not provided
+        if chunk_size is None or overlap is None:
+            try:
+                from config_ingestion import IngestionConfig
+                chunk_size = chunk_size or IngestionConfig.CHUNK_SIZE_TOKENS
+                overlap = overlap or IngestionConfig.CHUNK_OVERLAP_TOKENS
+            except ImportError:
+                chunk_size = chunk_size or 2048
+                overlap = overlap or 256
+        
+        _CHUNKER_INSTANCE = chunker_class(chunk_size=chunk_size, overlap=overlap)
+        return _CHUNKER_INSTANCE
+
+
+def reset_chunker() -> None:
+    """Reset the chunker singleton (useful for testing)."""
+    global _CHUNKER_INSTANCE
+    with _CHUNKER_LOCK:
+        _CHUNKER_INSTANCE = None
+
+
+# Global checkpoint lock for thread-safe file operations
+_CHECKPOINT_LOCK = threading.Lock()
+
+
+def load_checkpoint(checkpoint_file: Path) -> Set[str]:
+    """
+    Load checkpoint of already processed IDs from file.
+    
+    This function provides a centralized way to load checkpoints across
+    all ingestion scripts, eliminating duplicate load_checkpoint() implementations.
+    
+    Args:
+        checkpoint_file: Path to the checkpoint file
+        
+    Returns:
+        Set of processed IDs (strings)
+    """
+    if checkpoint_file.exists():
+        try:
+            content = checkpoint_file.read_text(encoding="utf-8")
+            return {line.strip() for line in content.splitlines() if line.strip()}
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint from {checkpoint_file}: {e}")
+            return set()
+    return set()
+
+
+def append_checkpoint(checkpoint_file: Path, ids: Iterable[str]) -> None:
+    """
+    Append IDs to checkpoint file in a thread-safe manner.
+    
+    Args:
+        checkpoint_file: Path to the checkpoint file
+        ids: Iterable of IDs to append
+    """
+    with _CHECKPOINT_LOCK:
+        checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+        with checkpoint_file.open("a", encoding="utf-8") as f:
+            for id_val in ids:
+                f.write(f"{id_val}\n")
+
+
+def detect_evidence_grade(article_type: str, pub_types: Optional[List[str]] = None,
+                          abstract: Optional[str] = None) -> str:
+    """
+    Detect evidence grade based on article type, publication types, and abstract content.
+    
+    This function unifies the duplicate detect_evidence_grade() implementations
+    across scripts 06, 07, 12, 21, and 08_monthly_update with different logic.
+    
+    Evidence Grades:
+        A: Highest evidence (guidelines, systematic reviews, meta-analyses)
+        B: High evidence (RCTs, clinical trials)
+        C: Moderate evidence (cohort studies, review articles, research articles)
+        D: Lower evidence (case reports, editorials, letters)
+    
+    Args:
+        article_type: The article type (e.g., 'research-article', 'review-article')
+        pub_types: Optional list of publication types from XML
+        abstract: Optional abstract text for content-based detection
+        
+    Returns:
+        Evidence grade as a string ('A', 'B', 'C', or 'D')
+    """
+    article_type_lower = (article_type or "").lower().replace("_", "-").replace(" ", "-")
+    pub_types_lower = [p.lower() for p in (pub_types or [])]
+    abstract_lower = (abstract or "").lower()
+    
+    # Priority 1: Check EVIDENCE_HIERARCHY for article_type patterns
+    for pattern, (grade, _) in EVIDENCE_HIERARCHY.items():
+        pattern_normalized = pattern.lower().replace("_", "-")
+        if pattern_normalized in article_type_lower:
+            return grade
+    
+    # Priority 2: Check publication types
+    for pub_type in pub_types_lower:
+        for pattern, (grade, _) in EVIDENCE_HIERARCHY.items():
+            pattern_normalized = pattern.lower().replace("_", "-")
+            if pattern_normalized in pub_type:
+                return grade
+    
+    # Priority 3: Content-based detection from abstract
+    if abstract_lower:
+        # Highest evidence (A)
+        if any(x in abstract_lower for x in ["systematic review", "meta-analysis", "meta analysis"]):
+            return "A"
+        if "guideline" in abstract_lower:
+            return "A"
+        
+        # High evidence (B) - RCT indicators
+        if any(x in abstract_lower for x in ["randomized controlled trial", "randomised controlled trial"]):
+            return "B"
+        if "rct" in abstract_lower:
+            return "B"
+        if "randomized trial" in abstract_lower and "phase" in abstract_lower:
+            return "B"
+        
+        # Moderate evidence (C) - cohort study indicators
+        if any(x in abstract_lower for x in ["cohort study", "prospective study", "observational study"]):
+            return "C"
+    
+    # Priority 4: Article type fallbacks
+    if article_type_lower in ("systematic-review", "meta-analysis", "guideline", "practice-guideline"):
+        return "A"
+    if article_type_lower in ("clinical-trial", "randomized-controlled-trial", "review-article", "review"):
+        return "B"
+    if article_type_lower in ("research-article", "journal-article", "article"):
+        return "C"
+    if article_type_lower in ("case-report", "case-series", "editorial", "letter", "news"):
+        return "D"
+    
+    # Default to moderate evidence
+    return "C"
+
+
+def get_evidence_level(grade: str) -> int:
+    """
+    Convert evidence grade to numeric level.
+    
+    Args:
+        grade: Evidence grade ('A', 'B', 'C', or 'D')
+        
+    Returns:
+        Numeric level (1=A, 2=B, 3=C, 4=D)
+    """
+    return {"A": 1, "B": 2, "C": 3, "D": 4}.get(grade.upper(), 3)

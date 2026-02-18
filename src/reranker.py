@@ -2,23 +2,18 @@
 ScholarQA-Style Reranker with Paper Aggregation.
 
 Implements ai2-scholarqa-lib's exact reranking methodology:
-- Passage-level reranking using CrossEncoder or Cohere
+- Passage-level reranking using DeepInfra Qwen3-Reranker
 - Paper aggregation using max rerank_score
 - DataFrame output with ScholarQA reference_string format
-
-Supports self-hosted reranking (mxbai-rerank-large-v2) and Cohere API.
 """
 
 import logging
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from anyascii import anyascii
-import yaml
-
-
 import requests
 from .config import (
-    RERANKER_PROVIDER, RERANKER_MODEL,
+    RERANKER_MODEL,
     DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL
 )
 
@@ -88,8 +83,8 @@ def get_ref_author_str(authors) -> str:
 # =============================================================================
 
 # Tier multipliers - strong differentiation to ensure guidelines rank above case reports
-# A case report with 0.92 Cohere score → 0.92 × 0.20 = 0.18
-# A guideline with 0.70 Cohere score → 0.70 × 3.00 = 2.10 (11x higher)
+# A case report with 0.92 reranker score → 0.92 × 0.20 = 0.18
+# A guideline with 0.70 reranker score → 0.70 × 3.00 = 2.10 (11x higher)
 TIER_1_BOOST = 3.00  # Guidelines, systematic reviews, meta-analyses
 TIER_2_BOOST = 1.50  # RCTs, clinical trials, review articles
 TIER_3_BOOST = 1.00  # Standard research
@@ -288,58 +283,7 @@ class AbstractReranker:
 # Self-Hosted Cross-Encoder Reranker (default)
 # =============================================================================
 
-class CrossEncoderReranker(AbstractReranker):
-    """
-    Self-hosted reranker using sentence-transformers CrossEncoder.
-    
-    Default model: mixedbread-ai/mxbai-rerank-large-v2 (Apache 2.0, 1.5B params)
-    - SOTA on BEIR (57.49), 8K token context, 100+ languages
-    - Eliminates Cohere API costs entirely
-    """
-    
-    def __init__(self, model_name: str = None):
-        model_name = model_name or RERANKER_MODEL
-        try:
-            from sentence_transformers import CrossEncoder
-            self.model = CrossEncoder(model_name, trust_remote_code=True)
-            self.model_name = model_name
-            logger.info(f"✅ CrossEncoder Reranker initialized with {model_name}")
-        except Exception as e:
-            raise ValueError(f"Failed to load CrossEncoder model '{model_name}': {e}")
-    
-    def get_scores(self, query: str, documents: List[str], top_n: Optional[int] = None) -> List[float]:
-        """
-        Get relevance scores using local cross-encoder model.
-        
-        Args:
-            query: Search query
-            documents: List of document strings
-            top_n: Number of top docs to score (scores all, returns all)
-            
-        Returns:
-            List of relevance scores (0-1 range via sigmoid)
-        """
-        if not documents:
-            return []
-        
-        try:
-            results = self.model.rank(
-                query,
-                documents,
-                top_k=top_n or len(documents),
-                return_documents=False,
-            )
-            
-            # Create score array indexed by original position
-            scores = [0.0] * len(documents)
-            for r in results:
-                scores[r["corpus_id"]] = float(r["score"])
-            
-            return scores
-            
-        except Exception as e:
-            logger.error(f"CrossEncoder reranking failed: {e}")
-            return [0.5] * len(documents)
+
 
 
 # =============================================================================
@@ -412,7 +356,7 @@ class PaperFinderWithReranker:
     ScholarQA-style paper finder with reranking.
     
     Flow:
-    1. Rerank passages using Cohere/DeepInfra/CrossEncoder
+    1. Rerank passages using DeepInfra Qwen3-Reranker
     2. Aggregate passages to paper level (max score)
     3. Format into DataFrame with reference strings
     """
@@ -433,10 +377,8 @@ class PaperFinderWithReranker:
         """
         if reranker is not None:
             self.reranker_engine = reranker
-        elif RERANKER_PROVIDER == "deepinfra":
-            self.reranker_engine = DeepInfraReranker(model=RERANKER_MODEL)
         else:
-            self.reranker_engine = CrossEncoderReranker()
+            self.reranker_engine = DeepInfraReranker(model=RERANKER_MODEL)
         
         self.n_rerank = n_rerank
         self.context_threshold = context_threshold
@@ -455,28 +397,28 @@ class PaperFinderWithReranker:
         query: str,
         retrieved_ctxs: List[Dict[str, Any]],
         pre_filter_threshold: float = 0.15,  # Lowered: hybrid RRF scores are normalized to 0.3-1.0
-        cohere_relevance_threshold: float = 0.1  # Cohere minimum relevance (filters truly irrelevant)
+        relevance_threshold: float = 0.1  # Minimum relevance score (filters truly irrelevant)
     ) -> List[Dict[str, Any]]:
         """
-        Rerank passages using Cohere + evidence hierarchy boosts.
+        Rerank passages using DeepInfra Qwen3-Reranker + evidence hierarchy boosts.
         
-        Threshold Strategy (based on Cohere best practices):
-        1. pre_filter_threshold (0.15): Filters by retrieval score BEFORE Cohere
+        Threshold Strategy:
+        1. pre_filter_threshold (0.15): Filters by retrieval score BEFORE reranking
            - Reduces API costs by removing obviously low-quality candidates
            - Set lower than post-rerank threshold to preserve recall
         
-        2. cohere_relevance_threshold (0.1): Filters by Cohere rerank score AFTER reranking
-           - Cohere scores are 0-1 normalized; <0.1 indicates very low relevance
-           - This removes documents Cohere considers irrelevant regardless of retrieval score
+        2. relevance_threshold (0.1): Filters by reranker score AFTER reranking
+           - Scores are 0-1 normalized; <0.1 indicates very low relevance
+           - This removes documents considered irrelevant regardless of retrieval score
         
         3. context_threshold (from __init__): Filters AFTER aggregation by boosted_score
            - Applied in aggregate_snippets_to_papers() using final combined scores
            - Controls the quality floor for papers included in context
         
         Pipeline:
-        1. Pre-filter by retrieval score (reduces Cohere API cost)
-        2. Cohere reranking for semantic relevance  
-        3. Post-filter by Cohere relevance score (removes irrelevant docs)
+        1. Pre-filter by retrieval score (reduces API cost)
+        2. Qwen3 reranking for semantic relevance  
+        3. Post-filter by relevance score (removes irrelevant docs)
         4. Calculate entity matching scores
         5. Apply evidence hierarchy boosts (article type, recency, journal)
         6. Sort by boosted_score
@@ -515,19 +457,10 @@ class PaperFinderWithReranker:
             # Prefer chunk/snippet text for chunked corpora; fall back to abstract/full-text.
             content = text if text else (abstract if abstract else full_text)
             
-            # Format as YAML for better performance
-            if isinstance(self.reranker_engine, CohereReranker):
-                yaml_doc = self.reranker_engine.format_document_as_yaml(
-                    title=title,
-                    content=content[:2000],  # Limit content length
-                    abstract=abstract[:500] if abstract else ""
-                )
-                passages.append(yaml_doc)
-            else:
-                # Fallback to plain text
-                passages.append((title + " " + content).strip()[:2000])
+            # Format as plain text for DeepInfra reranker
+            passages.append((title + " " + content).strip()[:2000])
         
-        # Stage 2: Get rerank scores from Cohere (0-1 normalized, query-dependent)
+        # Stage 2: Get rerank scores from DeepInfra Qwen3-Reranker (0-1 normalized, query-dependent)
         top_n_for_rerank = len(passages)
         if self.n_rerank > 0:
             top_n_for_rerank = min(self.n_rerank, len(passages))
@@ -537,25 +470,25 @@ class PaperFinderWithReranker:
         for i, score in enumerate(rerank_scores):
             retrieved_ctxs[i]["rerank_score"] = score
         
-        # Stage 3: Post-filter by Cohere relevance score
-        # Cohere best practice: scores <0.1 indicate very low relevance
-        pre_cohere_count = len(retrieved_ctxs)
-        if cohere_relevance_threshold > 0:
+        # Stage 3: Post-filter by reranker relevance score
+        # Best practice: scores <0.1 indicate very low relevance
+        pre_rerank_count = len(retrieved_ctxs)
+        if relevance_threshold > 0:
             retrieved_ctxs = [
                 ctx for ctx in retrieved_ctxs
-                if ctx.get("rerank_score", 0) >= cohere_relevance_threshold
+                if ctx.get("rerank_score", 0) >= relevance_threshold
             ]
-            if len(retrieved_ctxs) < pre_cohere_count:
-                logger.info(f"   Post-filter (Cohere score ≥{cohere_relevance_threshold}): {pre_cohere_count} → {len(retrieved_ctxs)} passages")
+            if len(retrieved_ctxs) < pre_rerank_count:
+                logger.info(f"   Post-filter (reranker score ≥{relevance_threshold}): {pre_rerank_count} → {len(retrieved_ctxs)} passages")
         
         if not retrieved_ctxs:
-            logger.warning("All passages filtered out by Cohere relevance threshold, returning empty")
+            logger.warning("All passages filtered out by reranker relevance threshold, returning empty")
             return []
         
         # Stage 4: Calculate entity matching scores
         entity_scores = self._calculate_entity_scores(query, retrieved_ctxs)
         
-        # Combine Cohere rerank scores with entity matching scores
+        # Combine reranker scores with entity matching scores
         # Weight: 70% rerank score, 30% entity score
         combined_scores = []
         for i, entity_score in enumerate(entity_scores):
@@ -565,7 +498,7 @@ class PaperFinderWithReranker:
             retrieved_ctxs[i]["entity_score"] = entity_score
             retrieved_ctxs[i]["combined_score"] = combined_score
         
-        logger.info(f"Cohere top scores: {sorted(rerank_scores, reverse=True)[:5]}")
+        logger.info(f"Reranker top scores: {sorted(rerank_scores, reverse=True)[:5]}")
         logger.info(f"Entity scores: {[round(s, 3) for s in entity_scores[:5]]}")
         logger.info(f"Combined scores: {[round(s, 3) for s in combined_scores[:5]]}")
         

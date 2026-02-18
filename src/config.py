@@ -23,7 +23,7 @@ load_dotenv(env_path)
 # =============================================================================
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", os.getenv("QDRANT_COLLECTION", "medical_rag"))
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", os.getenv("QDRANT_COLLECTION", "rag_pipeline"))
 GRAPHRAG_COLLECTION_NAME = os.getenv("GRAPHRAG_COLLECTION_NAME", "pmc_medical_graphrag")
 QDRANT_CLOUD_INFERENCE = _env_bool("QDRANT_CLOUD_INFERENCE", default=False)
 QDRANT_TIMEOUT = 180  # Client timeout in seconds
@@ -34,16 +34,15 @@ QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
 # LLM Configuration (DeepInfra)
 # =============================================================================
 DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
-DEEPINFRA_MODEL = os.getenv("DEEPINFRA_MODEL", "nvidia/Nemotron-3-Nano-30B-A3B")
+
 DEEPINFRA_BASE_URL = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
 
 # LLM Generation Parameters
 LLM_TEMPERATURE = 0.7  # Controls randomness (0=deterministic, 1=creative)
 LLM_TOP_P = 0.9  # Nucleus sampling threshold
 
-# Fallback LLM (for no-results scenarios - larger model with more knowledge)
-FALLBACK_LLM_MODEL = "deepseek-ai/DeepSeek-V3.2"
-FALLBACK_LLM_ENABLED = True
+# LLM Configuration (Single Model)
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
 
 # =============================================================================
 # Embedding Model Configuration
@@ -99,7 +98,7 @@ FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "50"))
 # Reranker Configuration
 # =============================================================================
 # Provider: "deepinfra" (default) or "cross-encoder" (self-hosted)
-RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "deepinfra").strip().lower()
+RERANKER_PROVIDER = "deepinfra"  # Fixed: Only DeepInfra supported
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
 
 # =============================================================================
@@ -112,15 +111,6 @@ BULK_RETRIEVAL_PER_QUERY = 100  # Reduced from 150 - more efficient with larger 
 RERANK_TOP_K = FINAL_TOP_ARTICLES  # Final articles after paper-level aggregation
 MAX_ABSTRACTS = FINAL_TOP_ARTICLES  # Context article cap
 MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)
-
-
-# =============================================================================
-# Multi-Stage Generation Configuration - NEW FOR 150+ ARTICLES
-# =============================================================================
-USE_MULTI_STAGE_GENERATION = True  # Enable multi-batch LLM generation
-BATCH_SIZE_FOR_GENERATION = 50  # Abstracts per generation batch
-MAX_GENERATION_BATCHES = 3  # Maximum number of generation batches (50 * 3 = 150 abstracts)
-PROGRESSIVE_SYNTHESIS = True  # Use progressive summarization across batches
 
 # =============================================================================
 # Validation
@@ -153,19 +143,17 @@ if __name__ == "__main__":
         print(f"✅ QDRANT_URL: {QDRANT_URL[:50]}...")
         print(f"✅ QDRANT_API_KEY: {QDRANT_API_KEY[:20]}...")
         print(f"✅ DEEPINFRA_API_KEY: {DEEPINFRA_API_KEY[:20]}...")
-        print(f"✅ DeepInfra Model: {DEEPINFRA_MODEL}")
+        print(f"✅ LLM Model: {LLM_MODEL}")
         print(f"✅ DeepInfra Base URL: {DEEPINFRA_BASE_URL}")
         print(f"✅ Embedding Model: {EMBEDDING_MODEL}")
         print(f"✅ Collection Name: {COLLECTION_NAME}")
         print("\n✅ All configuration validated!")
         
-        # Show optimized settings for 150+ articles
-        print("\n🎯 OPTIMIZED FOR 150+ ARTICLES:")
-        print(f"   - BULK_RETRIEVAL_LIMIT: {BULK_RETRIEVAL_LIMIT} (increased)")
-        print(f"   - RERANK_TOP_K: {RERANK_TOP_K} (increased)")
-        print(f"   - SCORE_THRESHOLD: {SCORE_THRESHOLD} (lowered)")
-        print(f"   - MAX_GENERATION_BATCHES: {MAX_GENERATION_BATCHES}")
-        print(f"   - BATCH_SIZE_FOR_GENERATION: {BATCH_SIZE_FOR_GENERATION}")
+        # Show search configuration
+        print("\n🎯 SEARCH CONFIGURATION:")
+        print(f"   - BULK_RETRIEVAL_LIMIT: {BULK_RETRIEVAL_LIMIT}")
+        print(f"   - RERANK_TOP_K: {RERANK_TOP_K}")
+        print(f"   - SCORE_THRESHOLD: {SCORE_THRESHOLD}")
         
     except ValueError as e:
         print(f"❌ Configuration error:\n{e}")

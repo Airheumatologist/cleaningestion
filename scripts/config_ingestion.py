@@ -22,7 +22,7 @@ class IngestionConfig:
     QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
     QDRANT_GRPC_URL = os.getenv("QDRANT_GRPC_URL", "localhost:6334")
-    COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", os.getenv("COLLECTION_NAME", "medical_rag"))
+    COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", os.getenv("COLLECTION_NAME", "rag_pipeline"))
 
     # Embedding provider: "deepinfra" (default) or "local"
     # Note: Qdrant Cloud Inference has been removed - DeepInfra is the only API provider
@@ -42,7 +42,7 @@ class IngestionConfig:
     # Each batch creates many chunks; smaller batches = fewer open files
     BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
     EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
-    MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.getenv("PARALLEL_WORKERS", "64")))
+    MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.getenv("PARALLEL_WORKERS", "8")))
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
     USE_GRPC = _as_bool(os.getenv("USE_GRPC"), default=True)
     CLOUD_INFERENCE = _as_bool(os.getenv("QDRANT_CLOUD_INFERENCE"), default=False)

@@ -22,7 +22,6 @@ from .config import (
     EMBEDDING_MODEL, EMBEDDING_PROVIDER, QDRANT_CLOUD_INFERENCE, QDRANT_TIMEOUT, 
     QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY, USE_HYBRID_SEARCH,
     SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
-    SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
     SPARSE_REMOVE_STOPWORDS, DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL
 )
 from .bm25_sparse import BM25SparseEncoder
@@ -330,6 +329,24 @@ class QdrantRetriever(AbstractRetriever):
                     FieldCondition(key="article_type", match=MatchValue(value=types[0]))
                 )
         
+        # Government affiliation filter (merged from gov pipeline)
+        if "is_gov_affiliated" in kwargs and kwargs["is_gov_affiliated"] is not None:
+            gov_value = kwargs["is_gov_affiliated"]
+            # Handle both boolean and string values
+            if isinstance(gov_value, str):
+                gov_value = gov_value.lower() in ("true", "1", "yes")
+            conditions.append(
+                FieldCondition(key="is_gov_affiliated", match=MatchValue(value=gov_value))
+            )
+        
+        # Government agency filter
+        if "gov_agency" in kwargs and kwargs["gov_agency"]:
+            agencies = [a.strip() for a in kwargs["gov_agency"].split(",")]
+            if len(agencies) == 1:
+                conditions.append(
+                    FieldCondition(key="gov_agencies", match=MatchValue(value=agencies[0]))
+                )
+        
         if conditions:
             return Filter(must=conditions)
         return None
@@ -430,7 +447,10 @@ class QdrantRetriever(AbstractRetriever):
                     "authors": self._parse_authors(point.payload.get("authors")),
                     "article_type": point.payload.get("article_type", ""),
                     "score": point.score,
-                    "stype": "vector_search"
+                    "stype": "vector_search",
+                    # Government affiliation (merged from gov pipeline)
+                    "is_gov_affiliated": point.payload.get("is_gov_affiliated", False),
+                    "gov_agencies": point.payload.get("gov_agencies", []),
                 }
 
             passages.append(passage)
