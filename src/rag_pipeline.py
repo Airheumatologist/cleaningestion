@@ -30,6 +30,7 @@ from .config import (
     RERANK_INPUT_CHUNK_LIMIT,
     RERANK_TOP_CHUNKS,
     FINAL_TOP_ARTICLES,
+    ENTITY_FILTER_ENABLED,
 )
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
@@ -364,9 +365,10 @@ class MedicalRAGPipeline:
         # Deduplicate DailyMed entries (keep max per drug)
         papers_df = self._deduplicate_dailymed(papers_df)
         
-        # Post-retrieval filtering: filter out papers that don't contain key medical entities
+        # Optional post-retrieval filtering: filter out papers that don't contain key medical entities
         # Pass both LLM-extracted conditions AND typo-corrected conditions for matching
-        papers_df = self._filter_by_entities(query, papers_df, medical_conditions, corrected_conditions)
+        if ENTITY_FILTER_ENABLED:
+            papers_df = self._filter_by_entities(query, papers_df, medical_conditions, corrected_conditions)
         
         # MERGE DailyMed results directly (bypass reranking and thresholds)
         if dailymed_results:

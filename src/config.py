@@ -47,7 +47,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
 # =============================================================================
 # Embedding Model Configuration
 # =============================================================================
-# Provider: "deepinfra" (default), "local", or "qdrant_cloud_inference"
+# Provider: "deepinfra" (default) or "qdrant_cloud_inference"
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra").strip().lower()
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B-batch")
 EMBEDDING_DIMENSION = 1024  # Qwen/Qwen3-Embedding-0.6B output dimension
@@ -84,6 +84,7 @@ SPARSE_REMOVE_STOPWORDS = _env_bool("SPARSE_REMOVE_STOPWORDS", default=True)
 TOP_K_RESULTS = 5  # Number of documents to retrieve
 SCORE_THRESHOLD = 0.25  # Lowered from 0.3 to capture more relevant papers
 # Lower threshold helps retrieve more candidates before aggressive filtering
+ENTITY_FILTER_ENABLED = _env_bool("ENTITY_FILTER_ENABLED", default=False)
 
 # Chunk retrieval/reranking profile for chunk-level indexing
 # Aligned with .env values for 2048-token chunks (larger chunks = fewer needed)

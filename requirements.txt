@@ -87,7 +87,7 @@ annotated-doc>=0.0.4
 #   - fastavro>=1.12.0
 #
 # Other removed:
-#   - tokenizers, safetensors, accelerate
+#   - safetensors, accelerate
 #   - huggingface-hub, hf-xet, fsspec, filelock
 #   - mpmath, networkx, sympy, joblib, regex
 #   - pillow, Jinja2, MarkupSafe, threadpoolctl

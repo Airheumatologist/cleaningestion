@@ -176,90 +176,40 @@ class SectionFilter:
         return False
 
 
-import threading
-
-_GLOBAL_TOKENIZER = None
-_TOKENIZER_LOCK = threading.Lock()
-
 class Chunker:
+    WORDS_PER_TOKEN = 0.75
+
     def __init__(self, chunk_size: int = None, overlap: int = None):
         # Read defaults from IngestionConfig to ensure consistency
         # This prevents hardcoded values from getting out of sync with .env
         self.chunk_size = chunk_size if chunk_size is not None else IngestionConfig.CHUNK_SIZE_TOKENS
         self.overlap = overlap if overlap is not None else IngestionConfig.CHUNK_OVERLAP_TOKENS
-        self._load_tokenizer()
-            
-    def _load_tokenizer(self):
-        global _GLOBAL_TOKENIZER
-        
-        # Double-check locking pattern
-        if _GLOBAL_TOKENIZER is not None:
-            self.tokenizer = _GLOBAL_TOKENIZER
-            return
-
-        with _TOKENIZER_LOCK:
-            if _GLOBAL_TOKENIZER is not None:
-                self.tokenizer = _GLOBAL_TOKENIZER
-                return
-
-            try:
-                from transformers import AutoTokenizer
-                # Use Qwen3-Embedding-0.6B tokenizer for consistency with embedding model
-                # This ensures token counts are accurate for chunking
-                logger.info("Loading tokenizer (Qwen/Qwen3-Embedding-0.6B)...")
-                tokenizer = AutoTokenizer.from_pretrained(
-                    "Qwen/Qwen3-Embedding-0.6B", 
-                    trust_remote_code=True,
-                    padding_side='left'  # Critical for correct last-token pooling
-                )
-                _GLOBAL_TOKENIZER = tokenizer
-                self.tokenizer = tokenizer
-                logger.info("✅ Tokenizer loaded with padding_side='left'")
-            except Exception as e:
-                logger.warning(f"Failed to load tokenizer (Qwen/Qwen3-Embedding-0.6B): {e}")
-                self.tokenizer = None
+        self.chunk_size_words = max(1, int(self.chunk_size * self.WORDS_PER_TOKEN))
+        self.overlap_words = max(0, int(self.overlap * self.WORDS_PER_TOKEN))
+        if self.overlap_words >= self.chunk_size_words:
+            self.overlap_words = max(0, self.chunk_size_words - 1)
             
     def count_tokens(self, text: str) -> int:
-        """Count tokens in text using the loaded tokenizer."""
+        """Estimate tokens from word count (1 token ≈ 0.75 words)."""
         if not text:
             return 0
-        
-        if self.tokenizer is not None:
-            try:
-                tokens = self.tokenizer.encode(text, add_special_tokens=False)
-                return len(tokens)
-            except Exception:
-                pass  # Fall through to approximation
-        
-        # Fallback: approximate with word count (1 token ≈ 0.75 words)
-        return int(len(text.split()) / 0.75)
+
+        return int(len(text.split()) / self.WORDS_PER_TOKEN)
     
     def chunk_text(self, text: str) -> List[Dict[str, Any]]:
         if not text:
             return []
-            
-        # Simple word-based fallback if tokenizer fails
-        if not self.tokenizer:
-            words = text.split()
-            chunks = []
-            for i in range(0, len(words), self.chunk_size - self.overlap):
-                chunk_words = words[i:i + self.chunk_size]
-                chunks.append({
-                    "text": " ".join(chunk_words),
-                    "token_count": len(chunk_words)
-                })
-            return chunks
-            
-        # Token-aware chunking
-        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+
+        words = text.split()
         chunks = []
-        
-        for i in range(0, len(tokens), self.chunk_size - self.overlap):
-            chunk_tokens = tokens[i:i + self.chunk_size]
-            chunk_text = self.tokenizer.decode(chunk_tokens)
+        stride = max(1, self.chunk_size_words - self.overlap_words)
+
+        for i in range(0, len(words), stride):
+            chunk_words = words[i:i + self.chunk_size_words]
+            chunk_text = " ".join(chunk_words)
             chunks.append({
                 "text": chunk_text,
-                "token_count": len(chunk_tokens)
+                "token_count": int(len(chunk_words) / self.WORDS_PER_TOKEN)
             })
             
         return chunks

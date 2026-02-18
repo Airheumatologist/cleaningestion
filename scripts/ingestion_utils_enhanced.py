@@ -54,6 +54,7 @@ class SemanticChunker:
         r'\b(?:FDA|EMA|NICE|WHO|CDC)\b',  # Regulatory
         r'\b(?:phase\s+[I II III IV]+|randomized|placebo-controlled|double-blind)\b',  # Trial types
     ]
+    WORDS_PER_TOKEN = 0.75
     
     def __init__(self, chunk_size: int = None, overlap: int = None):
         # Import here to avoid circular dependency issues
@@ -66,21 +67,6 @@ class SemanticChunker:
             self.chunk_size = chunk_size if chunk_size is not None else 2048
             self.overlap = overlap if overlap is not None else 256
         self.min_chunk_size = 100  # Minimum tokens for a valid chunk
-        self.tokenizer = None
-        self._load_tokenizer()
-        
-    def _load_tokenizer(self):
-        """Load tokenizer from ingestion_utils if available."""
-        try:
-            # Try to import and use the shared tokenizer from ingestion_utils
-            from ingestion_utils import Chunker as BaseChunker
-            base_chunker = BaseChunker(self.chunk_size, self.overlap)
-            if base_chunker.tokenizer is not None:
-                self.tokenizer = base_chunker.tokenizer
-                logger.debug("Loaded tokenizer from ingestion_utils")
-        except Exception:
-            # Silently fail - will use word-based approximation
-            pass
         
     def _split_into_sentences(self, text: str) -> List[str]:
         """Split text into sentences while preserving abbreviations."""
@@ -103,17 +89,9 @@ class SemanticChunker:
         return [s.strip() for s in sentences if s.strip()]
     
     def _count_tokens(self, text: str) -> int:
-        """Count tokens using tokenizer if available, otherwise approximate."""
-        if self.tokenizer is not None:
-            try:
-                tokens = self.tokenizer.encode(text, add_special_tokens=False)
-                return len(tokens)
-            except Exception:
-                pass  # Fall through to approximation
-        
-        # Fallback: Simple approximation (1 token ≈ 0.75 words)
+        """Estimate token count from words (1 token ≈ 0.75 words)."""
         words = len(text.split())
-        return int(words / 0.75)
+        return int(words / self.WORDS_PER_TOKEN)
     
     def _count_medical_entities(self, text: str) -> int:
         """Count medical entities in text."""
@@ -447,6 +425,7 @@ class ContentDeduplicator:
 
 class QualityValidator:
     """Validate chunk quality before ingestion."""
+    WORDS_PER_TOKEN = 0.75
     
     # Minimum thresholds
     MIN_TOKEN_COUNT = 50
@@ -468,7 +447,7 @@ class QualityValidator:
         issues = []
         
         # Check minimum length
-        token_count = len(chunk_text.split())
+        token_count = int(len(chunk_text.split()) / cls.WORDS_PER_TOKEN)
         if token_count < cls.MIN_TOKEN_COUNT:
             issues.append(f"Too short: {token_count} tokens (min {cls.MIN_TOKEN_COUNT})")
         
@@ -499,9 +478,9 @@ class QualityValidator:
         """
         score = 1.0
         
-        # Length scoring (optimal: 1500-2048 tokens for Qwen3-Embedding-0.6B)
-        # Updated for 2048 token chunks - CHUNK_SIZE_TOKENS from .env
-        token_count = len(chunk_text.split())
+        # Length scoring (optimal: ~1500-2048 estimated tokens)
+        # CHUNK_SIZE_TOKENS is interpreted via word-based token approximation
+        token_count = int(len(chunk_text.split()) / cls.WORDS_PER_TOKEN)
         if token_count < 50:
             score *= 0.3
         elif token_count < 100:

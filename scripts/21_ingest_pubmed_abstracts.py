@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ingest PubMed Abstracts to Qdrant with Hybrid Vectors and Token-Based Chunking.
+Ingest PubMed Abstracts to Qdrant with Hybrid Vectors and Word-Based Chunking.
 
 Ingests high-value PubMed abstracts (Reviews, Meta-Analyses, Practice Guidelines)
 matching the shared architecture of PMC/DailyMed ingestion.
@@ -8,7 +8,7 @@ matching the shared architecture of PMC/DailyMed ingestion.
 Features:
 - Embedding: Uses centralized EmbeddingProvider (DeepInfra)
 - Sparse: BM25 (if enabled in config)
-- Chunking: Token-based chunking (splits when content exceeds CHUNK_SIZE_TOKENS)
+- Chunking: Word-based chunking sized by estimated token limits
 - Deduplication: PMID-based UUIDs
 - Consistency: Shares config with other ingestion scripts
 - Supports full structured data from whitelist extraction (MeSH with qualifiers,
@@ -116,12 +116,12 @@ def load_checkpoint_namespaced(path: Path) -> set[str]:
         if (resolved := _resolve_checkpoint_line(line)) is not None
     }
 
-# Note: Tokenizer is handled by the shared Chunker class from ingestion_utils
-# We use Chunker's token counting for consistency across all ingestion scripts
+# Token counting is handled by the shared Chunker class from ingestion_utils.
+# Counts are estimated from words for consistency across ingestion scripts.
 
 
 def count_tokens(text: str) -> int:
-    """Count tokens using the shared Chunker's tokenizer."""
+    """Estimate tokens using the shared Chunker's word-based approximation."""
     chunker = get_shared_chunker(
         chunker_class=CHUNKER_CLASS,
         chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
@@ -132,10 +132,11 @@ def count_tokens(text: str) -> int:
 
 def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Create one or more payloads with token-based chunking.
+    Create one or more payloads with word-based chunking.
     
-    If the content exceeds CHUNK_SIZE_TOKENS, it will be split into multiple
-    chunks with overlap. Each chunk becomes a separate point in Qdrant.
+    If the content exceeds CHUNK_SIZE_TOKENS (estimated from words), it will be
+    split into multiple chunks with overlap. Each chunk becomes a separate point
+    in Qdrant.
     
     Merged PubMed pipeline: includes both high-value article types AND
     government affiliation detection (from former gov pipeline).
@@ -380,9 +381,9 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
 def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[Any], 
                  validate_chunks: bool = True, dedup_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
     """
-    Build Qdrant points from article batch with token-based chunking.
+    Build Qdrant points from article batch with word-based chunking.
     
-    Each article may generate 1 or multiple points depending on token count.
+    Each article may generate 1 or multiple points depending on estimated token count.
     
     Args:
         batch: List of articles to process
@@ -533,17 +534,17 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
 
     ensure_data_dirs()
     
-    # Preload tokenizer (handled by shared Chunker)
-    logger.info("Preloading tokenizer...")
+    # Preload shared chunker
+    logger.info("Preloading shared chunker...")
     try:
         get_shared_chunker(
             chunker_class=CHUNKER_CLASS,
             chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
             overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
         )
-        logger.info("Tokenizer preloaded successfully.")
+        logger.info("Shared chunker ready.")
     except Exception as e:
-        logger.warning(f"Tokenizer preload warning: {e}")
+        logger.warning(f"Shared chunker preload warning: {e}")
     
     client = QdrantClient(
         url=IngestionConfig.QDRANT_URL,
@@ -676,7 +677,7 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest PubMed Abstracts with token-based chunking")
+    parser = argparse.ArgumentParser(description="Ingest PubMed Abstracts with word-based chunking")
     parser.add_argument(
         "--input",
         type=Path,

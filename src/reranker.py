@@ -429,8 +429,8 @@ class PaperFinderWithReranker:
         original_count = len(retrieved_ctxs)
         logger.info(f"Reranking {original_count} passages...")
         
-        # Stage 1: Pre-filter by retrieval score (before Cohere API call)
-        # This reduces API cost while preserving candidates for Cohere's judgment
+        # Stage 1: Pre-filter by retrieval score (before DeepInfra API call)
+        # This reduces API cost while preserving candidates for reranker's judgment
         if pre_filter_threshold > 0:
             filtered_ctxs = [
                 ctx for ctx in retrieved_ctxs 
@@ -446,7 +446,7 @@ class PaperFinderWithReranker:
             return []
 
         
-        # Format documents as YAML for optimal Cohere reranking (best practice)
+        # Format documents as plain text for optimal DeepInfra reranking
         passages = []
         for doc in retrieved_ctxs:
             title = doc.get("title", "")

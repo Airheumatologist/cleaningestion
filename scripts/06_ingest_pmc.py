@@ -248,7 +248,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Dict[str, Any]]:
     """
-    Create multiple chunks from an article: sections + tables with token-aware chunking.
+    Create multiple chunks from an article: sections + tables with word-based chunking.
     Updated for PRD v1.0 compliant article structure.
     Includes full metadata propagation and parent-child ready fields.
     """
@@ -328,7 +328,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
             **base_metadata,
         })
     
-    # 2. Section chunks with token-aware splitting
+    # 2. Section chunks with word-based splitting
     # Use PRD-compliant sections structure
     sections = content.get("sections", []) if content else article.get("structured_sections", [])
     for i, section in enumerate(sections):
@@ -351,7 +351,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
         prefix = f"Title: {title}\n\nSection: {sec_title}\n\n"
         full_section_text = prefix + sec_text
         
-        # Use Chunker for token-aware chunking
+        # Use Chunker for word-based chunking
         section_chunks = chunker.chunk_text(full_section_text)
         
         for j, chunk_data in enumerate(section_chunks):
@@ -370,7 +370,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
                 **base_metadata,
             })
     
-    # 3. Table chunks with token-aware chunking for large tables
+    # 3. Table chunks with word-based chunking for large tables
     tables = content.get("tables", []) if content else article.get("tables", [])
     for i, table in enumerate(tables):
         # PRD-compliant table structure
@@ -398,7 +398,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
         # Create context-rich table text
         table_context = f"Title: {title}\n\n{section_title}\n\n{table_text}"
         
-        # Use Chunker for token-aware chunking of large tables
+        # Use Chunker for word-based chunking of large tables
         table_chunks = chunker.chunk_text(table_context)
         
         for j, chunk_data in enumerate(table_chunks):
@@ -688,17 +688,17 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
     if delete_source:
         logger.warning("Source file deletion enabled: XML/NXML files will be deleted after successful ingestion")
     
-    # Preload tokenizer once in main thread to avoid race conditions in workers
-    logger.info("Preloading tokenizer...")
+    # Preload shared chunker once in main thread to avoid race conditions in workers
+    logger.info("Preloading shared chunker...")
     try:
         chunker = get_shared_chunker(
             chunker_class=CHUNKER_CLASS,
             chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
             overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
         )
-        logger.info("Tokenizer preloaded (using %s).", chunker.__class__.__name__)
+        logger.info("Shared chunker ready (using %s).", chunker.__class__.__name__)
     except Exception as e:
-        logger.warning("Tokenizer preload warning: %s", e)
+        logger.warning("Shared chunker preload warning: %s", e)
     
     # Qdrant client is thread-safe (connection pooling)
     client = QdrantClient(

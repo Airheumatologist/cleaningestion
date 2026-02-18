@@ -397,7 +397,7 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
         # Create chunk with drug context
         full_section_text = f"# {drug_name} - {section_title}\n\n{section_text}"
         
-        # Use chunker for token-aware splitting
+        # Use chunker for word-based splitting
         section_chunks = chunker.chunk_text(full_section_text)
         
         for j, chunk_data in enumerate(section_chunks):
@@ -689,8 +689,8 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, refresh:
         logger.info("Refresh mode: clearing checkpoint file")
         CHECKPOINT_FILE.unlink()
     
-    # Preload tokenizer (uses SemanticChunker if available)
-    logger.info("Preloading tokenizer...")
+    # Preload shared chunker (uses SemanticChunker if available)
+    logger.info("Preloading shared chunker...")
     chunker: Optional[Any] = None
     try:
         chunker = get_shared_chunker(
@@ -698,9 +698,9 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, refresh:
             chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
             overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
         )
-        logger.info("Tokenizer preloaded (using %s).", chunker.__class__.__name__)
+        logger.info("Shared chunker ready (using %s).", chunker.__class__.__name__)
     except Exception as e:
-        logger.warning("Tokenizer preload failed: %s", e)
+        logger.warning("Shared chunker preload failed: %s", e)
 
     # Use rglob to find all XMLs
     xml_files = sorted(xml_dir.rglob("*.xml"))
