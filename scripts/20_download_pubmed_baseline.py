@@ -1054,8 +1054,24 @@ Examples:
         
         # Create symlink or copy reference
         xml_dir = args.output_dir / "xml"
-        if not xml_dir.exists():
-            xml_dir.symlink_to(args.baseline_dir.resolve())
+        baseline_dir_resolved = args.baseline_dir.resolve()
+        
+        if xml_dir.exists():
+            if xml_dir.is_symlink():
+                current_target = xml_dir.readlink()
+                if current_target != baseline_dir_resolved:
+                    logger.error(f"❌ Symlink {xml_dir} already exists but points to {current_target}")
+                    logger.error(f"   Expected: {baseline_dir_resolved}")
+                    logger.error(f"   Remove the existing symlink or use the correct --baseline-dir")
+                    sys.exit(1)
+                # Symlink already points to the correct target, no action needed
+            else:
+                logger.error(f"❌ Directory {xml_dir} already exists and is not a symlink")
+                logger.error(f"   Cannot create symlink to {baseline_dir_resolved}")
+                logger.error(f"   Remove the existing directory to use --baseline-dir")
+                sys.exit(1)
+        else:
+            xml_dir.symlink_to(baseline_dir_resolved)
             logger.info(f"   Created symlink: {xml_dir} -> {args.baseline_dir}")
         
         args.filter_only = True  # Force filter-only mode

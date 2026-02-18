@@ -610,7 +610,7 @@ def load_checkpoint_namespaced(path: Path) -> set[str]:
         if (resolved := _resolve_checkpoint_line(line)) is not None
     }
 
-def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker: Any) -> Tuple[int, int]:
+def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker: Any, refresh: bool = False) -> Tuple[int, int]:
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
     skipped = 0
@@ -621,11 +621,11 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
     # 1. Parse and filter
     for xml_file in batch_files:
         try:
-            # Fast skip: check filename (stem) against checkpoint
+            # Fast skip: check filename (stem) against checkpoint (unless refresh mode)
             # parse_spl_xml uses stem if set_id is missing, so this is a safe heuristic
             stem_id = xml_file.stem
             stem_checkpoint_id = _checkpoint_id(stem_id)
-            if stem_checkpoint_id in processed_ids:
+            if not refresh and stem_checkpoint_id in processed_ids:
                 skipped += 1
                 continue
 
@@ -639,8 +639,8 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
             
             set_id_checkpoint = _checkpoint_id(set_id)
             
-            # Double check exact ID
-            if set_id != stem_id and set_id_checkpoint in processed_ids:
+            # Double check exact ID (unless refresh mode)
+            if not refresh and set_id != stem_id and set_id_checkpoint in processed_ids:
                 skipped += 1
                 continue
             
@@ -681,8 +681,13 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
     return inserted, len(batch_files) - len(drugs) # skipped count approximation for stats
 
 
-def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
+def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, refresh: bool = False) -> None:
     ensure_data_dirs()
+    
+    # In refresh mode, clear checkpoint to allow re-ingestion
+    if refresh and CHECKPOINT_FILE.exists():
+        logger.info("Refresh mode: clearing checkpoint file")
+        CHECKPOINT_FILE.unlink()
     
     # Preload tokenizer (uses SemanticChunker if available)
     logger.info("Preloading tokenizer...")
@@ -760,7 +765,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
             current_super_batch = file_batches[i : i + SUPER_BATCH_SIZE]
             
             future_to_batch = {
-                executor.submit(process_batch, client, batch, embedding_provider, sparse_encoder, processed_ids, processed_lock, chunker): batch 
+                executor.submit(process_batch, client, batch, embedding_provider, sparse_encoder, processed_ids, processed_lock, chunker, refresh): batch 
                 for batch in current_super_batch
             }
             
@@ -791,6 +796,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest DailyMed into self-hosted Qdrant with improved section handling")
     parser.add_argument("--xml-dir", type=Path, default=IngestionConfig.DAILYMED_XML_DIR)
+    parser.add_argument("--refresh", action="store_true", help="Force re-ingestion of all labels (clears checkpoint)")
     args = parser.parse_args()
 
     if not args.xml_dir.exists():
@@ -799,7 +805,7 @@ if __name__ == "__main__":
 
     try:
         provider = EmbeddingProvider()
-        run_ingestion(args.xml_dir, provider)
+        run_ingestion(args.xml_dir, provider, refresh=args.refresh)
     except Exception as e:
         logger.error("Ingestion failed: %s", e)
         sys.exit(1)

@@ -58,6 +58,33 @@ PUBMED_UPDATE_DIR = "/pubmed/updatefiles/"
 PROCESSED_TRACKER = IngestionConfig.DATA_DIR / "processed_updates.json"
 UPDATE_DOWNLOAD_DIR = IngestionConfig.DATA_DIR / "pubmed_updatefiles"
 
+# PubMed filtering constants (must match 20_download_pubmed_baseline.py)
+DEFAULT_MIN_YEAR = 2015
+
+TARGET_PUBLICATION_TYPES = {
+    # TIER_1 types (1.80x boost in reranker) - Highest evidence
+    "practice guideline": "practice_guideline",
+    "meta-analysis": "meta_analysis",
+    "systematic review": "systematic_review",
+    # TIER_1 Clinical Trials (Phase 2 addition)
+    "randomized controlled trial": "randomized_controlled_trial",
+    "clinical trial": "clinical_trial",
+    "clinical trial, phase i": "clinical_trial_phase_i",
+    "clinical trial, phase ii": "clinical_trial_phase_ii",
+    "clinical trial, phase iii": "clinical_trial_phase_iii",
+    "clinical trial, phase iv": "clinical_trial_phase_iv",
+    "controlled clinical trial": "controlled_clinical_trial",
+    "multicenter study": "multicenter_study",
+    # TIER_2 types (1.25x boost in reranker)
+    "review": "review",
+}
+
+
+def is_target_article(pub_types: List[str]) -> bool:
+    """Check if article has any target publication type."""
+    pub_types_lower = [pt.lower().strip() for pt in pub_types]
+    return any(target in pub_types_lower for target in TARGET_PUBLICATION_TYPES.keys())
+
 def load_processed_files() -> Set[str]:
     if not PROCESSED_TRACKER.exists():
         return set()
@@ -114,7 +141,9 @@ def infer_article_type(pub_types: List[str]) -> str:
     return "research_article"
 
 
-def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
+def parse_pubmed_update_xml(
+    xml_gz_path: Path, min_year: int = DEFAULT_MIN_YEAR
+) -> Iterable[Dict[str, Any]]:
     with gzip.open(xml_gz_path, "rb") as handle:
         context = ET.iterparse(handle, events=("end",))
         for event, elem in context:
@@ -129,22 +158,49 @@ def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
             title = "".join(title_elem.itertext()).strip() if title_elem is not None else ""
             abstract = " ".join("".join(part.itertext()).strip() for part in abstract_parts if part is not None).strip()
 
+            # Basic presence check (line 132 equivalent)
             if not pmid or not title or not abstract:
                 elem.clear()
                 continue
 
+            # Filter: Abstract length check (matches baseline line 748-749)
+            if len(abstract) < 50:
+                elem.clear()
+                continue
+
+            # Extract publication types early for filtering
+            pub_types = []
+            for pt in elem.findall(".//PublicationType"):
+                if pt.text:
+                    pub_types.append(pt.text.strip())
+
+            # Filter: Target publication types (matches baseline line 726)
+            if not is_target_article(pub_types):
+                elem.clear()
+                continue
+
+            # Extract year from PubDate
             year = None
             year_elem = elem.find(".//PubDate/Year")
             if year_elem is not None and year_elem.text and year_elem.text.isdigit():
                 year = int(year_elem.text)
 
+            # Try MedlineDate if no Year element (matches baseline behavior)
+            if year is None:
+                medline_date_elem = elem.find(".//PubDate/MedlineDate")
+                if medline_date_elem is not None and medline_date_elem.text:
+                    import re
+                    match = re.search(r'(\d{4})', medline_date_elem.text)
+                    if match:
+                        year = int(match.group(1))
+
+            # Filter: Minimum year check (matches baseline line 740)
+            if year is None or year < min_year:
+                elem.clear()
+                continue
+
             journal_elem = elem.find(".//Journal/Title")
             journal = (journal_elem.text or "").strip() if journal_elem is not None and journal_elem.text else ""
-
-            pub_types = []
-            for pt in elem.findall(".//PublicationType"):
-                if pt.text:
-                    pub_types.append(pt.text.strip())
 
             doi = None
             for article_id in elem.findall(".//ArticleId"):
@@ -189,13 +245,16 @@ def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
 
 
 def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, 
-                 sparse_encoder: Optional[Any] = None) -> tuple[List[PointStruct], List[str]]:
+                 sparse_encoder: Optional[Any] = None,
+                 validate_chunks: bool = True, dedup_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
     """Build Qdrant points from article batch with semantic chunking.
     
     Args:
         batch: List of parsed articles
         embedding_provider: Provider for generating embeddings
         sparse_encoder: Optional sparse encoder for hybrid search (created once and reused)
+        validate_chunks: Whether to validate chunk quality before ingestion
+        dedup_chunks: Whether to deduplicate chunks within batch
     """
     # Use shared chunker instance (SemanticChunker if available)
     chunker = get_shared_chunker(
@@ -327,7 +386,12 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     return points, pmids
 
 
-def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingProvider, max_files: Optional[int]) -> int:
+def ingest_pubmed_updates(
+    client: QdrantClient, 
+    embedding_provider: EmbeddingProvider, 
+    max_files: Optional[int],
+    min_year: int = DEFAULT_MIN_YEAR
+) -> int:
     processed = load_processed_files()
     all_files = list_pubmed_update_files(max_files=max_files)
     new_files = [f for f in all_files if f not in processed]
@@ -362,11 +426,12 @@ def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingPro
         local_file = download_pubmed_file(file_name, UPDATE_DOWNLOAD_DIR)
 
         batch: List[Dict[str, Any]] = []
-        for article in parse_pubmed_update_xml(local_file):
+        for article in parse_pubmed_update_xml(local_file, min_year=min_year):
             batch.append(article)
             if len(batch) < IngestionConfig.BATCH_SIZE:
                 continue
-            points, _ = build_points(batch, embedding_provider, sparse_encoder)
+            points, _ = build_points(batch, embedding_provider, sparse_encoder,
+                                     validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
             if points:
                 upsert_with_retry(client, points)
                 inserted += len(points)
@@ -374,7 +439,8 @@ def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingPro
             batch.clear()
 
         if batch:
-            points, _ = build_points(batch, embedding_provider, sparse_encoder)
+            points, _ = build_points(batch, embedding_provider, sparse_encoder,
+                                     validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
             if points:
                 upsert_with_retry(client, points)
                 inserted += len(points)
@@ -387,9 +453,25 @@ def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingPro
 
 
 def run_dailymed_refresh() -> None:
-    logger.info("Starting DailyMed refresh")
-    subprocess.run([sys.executable, "scripts/03_download_dailymed.py", "--output-dir", str(IngestionConfig.DAILYMED_XML_DIR)], check=True)
-    subprocess.run([sys.executable, "scripts/07_ingest_dailymed.py", "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR)], check=True)
+    """Run DailyMed incremental update using weekly updates."""
+    logger.info("Starting DailyMed incremental refresh (weekly updates)")
+    # Download last 4 weeks of updates to catch any missed changes
+    subprocess.run([
+        sys.executable, "scripts/03_download_dailymed.py", 
+        "--output-dir", str(IngestionConfig.DAILYMED_XML_DIR),
+        "--update-type", "weekly",
+        "--weeks-back", "4"
+    ], check=True)
+    # Clear checkpoint entries for updated labels so they get re-ingested
+    subprocess.run([
+        sys.executable, "scripts/04_prepare_dailymed_updates.py",
+        "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR)
+    ], check=True)
+    # Ingest - updated labels will now be processed
+    subprocess.run([
+        sys.executable, "scripts/07_ingest_dailymed.py", 
+        "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR)
+    ], check=True)
 
 
 def main() -> None:
@@ -397,7 +479,14 @@ def main() -> None:
     parser.add_argument("--max-files", type=int, default=None, help="Process at most N newest PubMed update files")
     parser.add_argument("--skip-pubmed", action="store_true")
     parser.add_argument("--skip-dailymed", action="store_true")
+    parser.add_argument(
+        "--min-year",
+        type=int,
+        default=DEFAULT_MIN_YEAR,
+        help=f"Minimum publication year (default: {DEFAULT_MIN_YEAR})"
+    )
     args = parser.parse_args()
+    min_year = args.min_year
 
     ensure_data_dirs()
 
@@ -422,7 +511,7 @@ def main() -> None:
     total_inserted = 0
 
     if not args.skip_pubmed:
-        total_inserted += ingest_pubmed_updates(client, embedding_provider, max_files=args.max_files)
+        total_inserted += ingest_pubmed_updates(client, embedding_provider, max_files=args.max_files, min_year=min_year)
 
     if not args.skip_dailymed:
         run_dailymed_refresh()

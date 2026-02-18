@@ -221,9 +221,6 @@ Intelligent context assembly in `_get_papers_for_context()`:
 # Always include
 - Highlights of Prescribing Information (8000 chars)
 - Clinical Studies section (15000 chars)
-
-# Conditional (if query mentions mechanisms, PK/PD)
-- Clinical Pharmacology section (10000 chars)
 ```
 
 **Features:**

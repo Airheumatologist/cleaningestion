@@ -69,6 +69,7 @@ SOURCE_PMC_AUTHOR = "pmc_author_manuscript"
 SOURCE_MARKER_NAME = ".source"
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_ingested_ids.txt"
 LEGACY_AUTHOR_CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "author_manuscript_ingested_ids.txt"
+SUPPORTED_PMC_FILE_SUFFIXES = (".xml", ".nxml", ".xml.gz", ".nxml.gz")
 SOURCE_ALIAS_MAP = {
     "pmc": SOURCE_PMC_OA,
     "pmc_oa": SOURCE_PMC_OA,
@@ -138,10 +139,23 @@ def append_checkpoint(ids: Iterable[str]) -> None:
 
 
 def _extract_stem_id(xml_path: Path) -> str:
-    stem_id = xml_path.stem
-    if xml_path.name.endswith(".xml.gz"):
-        stem_id = stem_id.replace(".xml", "")
-    return stem_id.strip()
+    filename = xml_path.name
+    lowered = filename.lower()
+
+    if lowered.endswith(".xml.gz"):
+        return filename[: -len(".xml.gz")].strip()
+    if lowered.endswith(".nxml.gz"):
+        return filename[: -len(".nxml.gz")].strip()
+    if lowered.endswith(".xml"):
+        return filename[: -len(".xml")].strip()
+    if lowered.endswith(".nxml"):
+        return filename[: -len(".nxml")].strip()
+
+    return xml_path.stem.strip()
+
+
+def _is_supported_pmc_file(path: Path) -> bool:
+    return path.is_file() and path.name.lower().endswith(SUPPORTED_PMC_FILE_SUFFIXES)
 
 
 def _detect_source_type(xml_path: Path, xml_root: Path) -> str:
@@ -672,7 +686,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
     ensure_data_dirs()
     
     if delete_source:
-        logger.warning("Source file deletion enabled: XML files will be deleted after successful ingestion")
+        logger.warning("Source file deletion enabled: XML/NXML files will be deleted after successful ingestion")
     
     # Preload tokenizer once in main thread to avoid race conditions in workers
     logger.info("Preloading tokenizer...")
@@ -704,12 +718,19 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
     processed_lock = threading.Lock()
     logger.info("Already ingested from checkpoint: %s", len(processed_ids))
 
-    all_xml_files = sorted(list(xml_dir.rglob("*.xml*")))
+    all_xml_files = sorted(
+        {
+            path
+            for pattern in ("*.xml*", "*.nxml*")
+            for path in xml_dir.rglob(pattern)
+            if _is_supported_pmc_file(path)
+        }
+    )
     if not all_xml_files:
-        logger.warning("No XML files found in %s", xml_dir)
+        logger.warning("No XML/NXML files found in %s", xml_dir)
         return
         
-    logger.info("Found %s XML files to process", len(all_xml_files))
+    logger.info("Found %s XML/NXML files to process", len(all_xml_files))
 
     # Create shared sparse encoder (thread-safe, stateless)
     sparse_encoder = _create_sparse_encoder()
@@ -775,8 +796,13 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest PMC into self-hosted Qdrant with improved section/table handling")
-    parser.add_argument("--xml-dir", type=Path, default=IngestionConfig.PMC_XML_DIR, help="Directory with .xml/.xml.gz")
-    parser.add_argument("--delete-source", action="store_true", help="Delete XML file after successful ingestion")
+    parser.add_argument(
+        "--xml-dir",
+        type=Path,
+        default=IngestionConfig.PMC_XML_DIR,
+        help="Directory with .xml/.nxml (optionally .gz)",
+    )
+    parser.add_argument("--delete-source", action="store_true", help="Delete XML/NXML file after successful ingestion")
     args = parser.parse_args()
 
     provider = EmbeddingProvider()

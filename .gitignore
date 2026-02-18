@@ -29,3 +29,4 @@ fix_*.py
 
 # Node modules (frontend has its own .gitignore)
 node_modules/
+.claude/

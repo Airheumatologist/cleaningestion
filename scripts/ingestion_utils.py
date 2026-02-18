@@ -569,14 +569,28 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
         Article dict following PRD JSON structure, or None if invalid/skipped.
     """
     try:
+        file_name = xml_path.name
+        lowered_name = file_name.lower()
+
+        def _base_name_from_archive(name: str, lowered: str) -> str:
+            if lowered.endswith(".xml.gz"):
+                return name[: -len(".xml.gz")]
+            if lowered.endswith(".nxml.gz"):
+                return name[: -len(".nxml.gz")]
+            if lowered.endswith(".xml"):
+                return name[: -len(".xml")]
+            if lowered.endswith(".nxml"):
+                return name[: -len(".nxml")]
+            return xml_path.stem
+
         # Parse XML
-        if xml_path.name.endswith(".xml.gz"):
+        if lowered_name.endswith(".gz"):
             with gzip.open(xml_path, "rb") as f:
                 root = ET.fromstring(f.read())
-            pmcid_from_file = xml_path.stem.replace(".xml", "")
+            pmcid_from_file = _base_name_from_archive(file_name, lowered_name)
         else:
             root = ET.parse(str(xml_path)).getroot()
-            pmcid_from_file = xml_path.stem
+            pmcid_from_file = _base_name_from_archive(file_name, lowered_name)
 
         # Get article and article-meta elements
         article_elem = root.find(".//article")

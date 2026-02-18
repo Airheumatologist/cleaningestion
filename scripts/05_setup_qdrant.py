@@ -176,7 +176,17 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
 def main() -> None:
     parser = argparse.ArgumentParser(description="Setup self-hosted Qdrant collection")
     parser.add_argument("--collection-name", default=IngestionConfig.COLLECTION_NAME)
-    parser.add_argument("--keep-existing", action="store_true")
+    recreate_group = parser.add_mutually_exclusive_group()
+    recreate_group.add_argument(
+        "--keep-existing",
+        action="store_true",
+        help="Keep an existing collection and skip recreation",
+    )
+    recreate_group.add_argument(
+        "--recreate",
+        action="store_true",
+        help="Recreate the collection if it already exists (default behavior)",
+    )
     parser.add_argument("--shards", type=int, default=4)
     parser.add_argument("--no-2bit", action="store_true", help="Skip 2-bit patch and keep standard binary")
     parser.add_argument(

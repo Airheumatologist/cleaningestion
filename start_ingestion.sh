@@ -165,7 +165,7 @@ else
     else
         echo "   ⚠️  PubMed: No JSONL files found"
         echo "      Note: PubMed baseline must be in JSONL format."
-        echo "      If you have XML files, run: python scripts/20_download_pubmed_baseline.py --convert-only"
+        echo "      If you have XML files, run: python scripts/20_download_pubmed_baseline.py --filter-only"
     fi
 fi
 

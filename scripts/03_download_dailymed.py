@@ -17,18 +17,24 @@ Usage:
     
     # Or specify custom path
     python scripts/03_download_dailymed.py --output-dir /data/ingestion/dailymed/xml
+    
+    # Weekly incremental update (recommended for monthly refresh)
+    python scripts/03_download_dailymed.py --update-type weekly
 
-Expected Duration: 30-60 minutes
+Expected Duration: 30-60 minutes for full, 2-5 minutes for weekly updates
 """
 
 import os
 import io
+import re
 import sys
 import zipfile
 import logging
 import argparse
 import requests
 from pathlib import Path
+from datetime import datetime, timedelta
+from typing import List, Optional
 
 # Setup logging BEFORE any imports that might fail
 logging.basicConfig(
@@ -56,22 +62,106 @@ except Exception as e:
 # DailyMed bulk download configuration
 DAILYMED_PUBLIC_RELEASE_BASE = "https://dailymed-data.nlm.nih.gov/public-release-files"
 
-# Human prescription drug labels (5 ZIP parts)
+# Human prescription drug labels (6 ZIP parts)
 HUMAN_RX_ZIPS = [
     "dm_spl_release_human_rx_part1.zip",
     "dm_spl_release_human_rx_part2.zip",
     "dm_spl_release_human_rx_part3.zip",
     "dm_spl_release_human_rx_part4.zip",
     "dm_spl_release_human_rx_part5.zip",
+    "dm_spl_release_human_rx_part6.zip",
 ]
 
-# Optional: Additional categories
+# Optional: Additional categories (11 ZIP parts)
 HUMAN_OTC_ZIPS = [
     "dm_spl_release_human_otc_part1.zip",
     "dm_spl_release_human_otc_part2.zip",
     "dm_spl_release_human_otc_part3.zip",
     "dm_spl_release_human_otc_part4.zip",
+    "dm_spl_release_human_otc_part5.zip",
+    "dm_spl_release_human_otc_part6.zip",
+    "dm_spl_release_human_otc_part7.zip",
+    "dm_spl_release_human_otc_part8.zip",
+    "dm_spl_release_human_otc_part9.zip",
+    "dm_spl_release_human_otc_part10.zip",
+    "dm_spl_release_human_otc_part11.zip",
 ]
+
+
+def get_weekly_update_filename(weeks_ago: int = 0) -> Optional[str]:
+    """
+    Generate the filename for a weekly update based on weeks ago.
+    
+    DailyMed weekly files are named: dm_spl_weekly_update_MMDDYY_MMDDYY.zip
+    Weeks start on Monday and end on Friday (based on observed patterns).
+    
+    Args:
+        weeks_ago: Number of weeks ago (0 = current week, 1 = last week, etc.)
+    
+    Returns:
+        Filename string or None if date would be invalid
+    """
+    # Calculate the target week
+    today = datetime.now()
+    
+    # Find the most recent Friday (end of week)
+    # weekday(): Monday=0, Tuesday=1, ..., Friday=4, Saturday=5, Sunday=6
+    days_since_friday = (today.weekday() - 4) % 7
+    latest_friday = today - timedelta(days=days_since_friday)
+    
+    # Calculate target week
+    target_friday = latest_friday - timedelta(weeks=weeks_ago)
+    target_monday = target_friday - timedelta(days=4)
+    
+    # Format: dm_spl_weekly_update_MMDDYY_MMDDYY.zip
+    monday_str = target_monday.strftime("%m%d%y")
+    friday_str = target_friday.strftime("%m%d%y")
+    
+    return f"dm_spl_weekly_update_{monday_str}_{friday_str}.zip"
+
+
+def get_monthly_update_filename(months_ago: int = 0) -> Optional[str]:
+    """
+    Generate the filename for a monthly update based on months ago.
+    
+    DailyMed monthly files are named: dm_spl_monthly_update_monYYYY.zip
+    (e.g., dm_spl_monthly_update_jan2026.zip)
+    
+    Args:
+        months_ago: Number of months ago (0 = current month, 1 = last month, etc.)
+    
+    Returns:
+        Filename string or None if date would be invalid
+    """
+    today = datetime.now()
+    
+    # Calculate target month
+    target_month = today.month - months_ago
+    target_year = today.year
+    
+    while target_month <= 0:
+        target_month += 12
+        target_year -= 1
+    
+    month_abbr = datetime(target_year, target_month, 1).strftime("%b").lower()
+    return f"dm_spl_monthly_update_{month_abbr}{target_year}.zip"
+
+
+def get_daily_update_filename(days_ago: int = 0) -> Optional[str]:
+    """
+    Generate the filename for a daily update based on days ago.
+    
+    DailyMed daily files are named: dm_spl_daily_update_MMDDYYYY.zip
+    
+    Args:
+        days_ago: Number of days ago (0 = today, 1 = yesterday, etc.)
+    
+    Returns:
+        Filename string or None if date would be invalid
+    """
+    target_date = datetime.now() - timedelta(days=days_ago)
+    date_str = target_date.strftime("%m%d%Y")
+    return f"dm_spl_daily_update_{date_str}.zip"
 
 # Default output dir - uses centralized config if available, otherwise fallback
 if HAS_CONFIG:
@@ -110,7 +200,7 @@ def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 102
         return False
 
 
-def extract_nested_zip_xml(zip_path: Path, output_dir: Path) -> int:
+def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = False) -> int:
     """
     Extract XML files from a DailyMed ZIP.
     
@@ -137,7 +227,7 @@ def extract_nested_zip_xml(zip_path: Path, output_dir: Path) -> int:
                 if not target_name:
                     continue
                 dest_path = output_dir / target_name
-                if dest_path.exists():
+                if dest_path.exists() and not refresh:
                     continue
                 with zf.open(name) as src, open(dest_path, "wb") as dst:
                     dst.write(src.read())
@@ -163,7 +253,7 @@ def extract_nested_zip_xml(zip_path: Path, output_dir: Path) -> int:
                                 if not target_name:
                                     continue
                                 dest_path = output_dir / target_name
-                                if dest_path.exists():
+                                if dest_path.exists() and not refresh:
                                     continue
                                 
                                 # Extract XML from nested ZIP
@@ -179,13 +269,24 @@ def extract_nested_zip_xml(zip_path: Path, output_dir: Path) -> int:
     return extracted_count
 
 
-def download_dailymed(output_dir: Path, include_otc: bool = False):
+def download_dailymed(
+    output_dir: Path, 
+    include_otc: bool = False, 
+    refresh: bool = False,
+    update_type: Optional[str] = None,
+    weeks_back: int = 1,
+    days_back: int = 7
+):
     """
     Download and extract DailyMed drug labels.
     
     Args:
         output_dir: Directory to store extracted XML files
-        include_otc: Also download OTC (over-the-counter) drugs
+        include_otc: Also download OTC (over-the-counter) drugs (full refresh only)
+        refresh: If True, re-download and re-extract all files (full release)
+        update_type: Type of update - 'daily', 'weekly', 'monthly', or None for full release
+        weeks_back: Number of weeks to go back for weekly updates (default: 1 = last week)
+        days_back: Number of days to go back for daily updates (default: 7 = last 7 days)
     """
     logger.info("=" * 70)
     logger.info("💊 DailyMed Drug Labels Download")
@@ -198,35 +299,67 @@ def download_dailymed(output_dir: Path, include_otc: bool = False):
     # Also ensure the specific output dir exists
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Determine which ZIPs to download
-    zip_files = HUMAN_RX_ZIPS.copy()
-    if include_otc:
-        zip_files.extend(HUMAN_OTC_ZIPS)
+    # Determine which ZIPs to download based on update type
+    if update_type == "weekly":
+        zip_files = []
+        for i in range(weeks_back):
+            filename = get_weekly_update_filename(weeks_ago=i)
+            if filename:
+                zip_files.append(filename)
+        logger.info(f"📅 Weekly update mode: downloading {len(zip_files)} weekly update(s)")
+        
+    elif update_type == "daily":
+        zip_files = []
+        for i in range(days_back):
+            filename = get_daily_update_filename(days_ago=i)
+            if filename:
+                zip_files.append(filename)
+        logger.info(f"📅 Daily update mode: downloading {len(zip_files)} daily update(s)")
+        
+    elif update_type == "monthly":
+        filename = get_monthly_update_filename(months_ago=0)
+        zip_files = [filename] if filename else []
+        logger.info(f"📅 Monthly update mode: downloading {len(zip_files)} monthly update(s)")
+        
+    else:
+        # Full release (default)
+        zip_files = HUMAN_RX_ZIPS.copy()
+        if include_otc:
+            zip_files.extend(HUMAN_OTC_ZIPS)
+        logger.info(f"📦 Full release mode: downloading {len(zip_files)} ZIP files...")
     
-    logger.info(f"Downloading {len(zip_files)} ZIP files...")
     logger.info(f"Destination: {output_dir}")
     
     total_extracted = 0
+    downloaded_count = 0
     
     for zip_name in zip_files:
         zip_url = f"{DAILYMED_PUBLIC_RELEASE_BASE}/{zip_name}"
         local_zip = output_dir / zip_name
         
-        # Download if not exists
-        if local_zip.exists() and local_zip.stat().st_size > 0:
+        # Download if not exists (or refresh)
+        if not refresh and local_zip.exists() and local_zip.stat().st_size > 0:
             logger.info(f"ZIP already exists, reusing: {zip_name}")
         else:
+            if refresh and local_zip.exists():
+                logger.info(f"Refresh mode: re-downloading {zip_name}")
+                local_zip.unlink()
             success = download_file_stream(zip_url, local_zip)
             if not success:
-                logger.error(f"Failed to download {zip_name}, skipping...")
+                logger.warning(f"Failed to download {zip_name}, it may not exist yet...")
                 continue
+            downloaded_count += 1
         
         # Extract XML files
-        extracted = extract_nested_zip_xml(local_zip, output_dir)
+        # For incremental updates, always overwrite existing XMLs to get latest versions
+        extract_refresh = True if update_type else refresh
+        extracted = extract_nested_zip_xml(local_zip, output_dir, refresh=extract_refresh)
         total_extracted += extracted
         
-        # Optional: Remove ZIP to save space
-        # local_zip.unlink()
+        # For incremental updates, clean up ZIP files after extraction to save space
+        if update_type in ("daily", "weekly", "monthly"):
+            local_zip.unlink(missing_ok=True)
+            logger.info(f"🗑️  Cleaned up: {zip_name}")
     
     # Count total XML files
     xml_count = len(list(output_dir.glob("*.xml")))
@@ -234,12 +367,34 @@ def download_dailymed(output_dir: Path, include_otc: bool = False):
     logger.info("\n" + "=" * 70)
     logger.info("✅ DailyMed Download Complete!")
     logger.info("=" * 70)
-    logger.info(f"   Total XML files: {xml_count:,}")
+    logger.info(f"   Downloaded files: {downloaded_count}")
+    logger.info(f"   Total XML files extracted this run: {total_extracted:,}")
+    logger.info(f"   Total XML files in directory: {xml_count:,}")
     logger.info(f"   Location: {output_dir}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download DailyMed drug labels")
+    parser = argparse.ArgumentParser(
+        description="Download DailyMed drug labels",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Full baseline download (all labels)
+  python scripts/03_download_dailymed.py
+  
+  # Weekly incremental update (recommended for regular updates)
+  python scripts/03_download_dailymed.py --update-type weekly
+  
+  # Multiple weeks of updates
+  python scripts/03_download_dailymed.py --update-type weekly --weeks-back 4
+  
+  # Daily updates (last 7 days)
+  python scripts/03_download_dailymed.py --update-type daily
+  
+  # Monthly update
+  python scripts/03_download_dailymed.py --update-type monthly
+        """
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -249,11 +404,41 @@ def main():
     parser.add_argument(
         "--include-otc",
         action="store_true",
-        help="Also download OTC (over-the-counter) drug labels"
+        help="Also download OTC (over-the-counter) drug labels (full release only)"
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force re-download and re-extract all files (for full release)"
+    )
+    parser.add_argument(
+        "--update-type",
+        choices=["daily", "weekly", "monthly"],
+        default=None,
+        help="Type of incremental update to download (default: full release)"
+    )
+    parser.add_argument(
+        "--weeks-back",
+        type=int,
+        default=1,
+        help="Number of weeks to download for weekly updates (default: 1)"
+    )
+    parser.add_argument(
+        "--days-back",
+        type=int,
+        default=7,
+        help="Number of days to download for daily updates (default: 7)"
     )
     
     args = parser.parse_args()
-    download_dailymed(args.output_dir, args.include_otc)
+    download_dailymed(
+        args.output_dir, 
+        args.include_otc, 
+        args.refresh,
+        args.update_type,
+        args.weeks_back,
+        args.days_back
+    )
 
 
 if __name__ == "__main__":
