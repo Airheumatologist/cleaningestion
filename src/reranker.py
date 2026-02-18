@@ -461,18 +461,10 @@ class PaperFinderWithReranker:
 
         
         # Format documents as plain text for optimal DeepInfra reranking
+        # using the same chunk elements produced by ingestion.
         passages = []
         for doc in retrieved_ctxs:
-            title = doc.get("title", "")
-            abstract = doc.get("abstract", "")
-            text = doc.get("text", "")
-            full_text = doc.get("full_text", "")
-            
-            # Prefer chunk/snippet text for chunked corpora; fall back to abstract/full-text.
-            content = text if text else (abstract if abstract else full_text)
-            
-            # Format as plain text for DeepInfra reranker
-            passages.append((title + " " + content).strip()[:2000])
+            passages.append(self._build_rerank_text(doc))
         
         # Stage 2: Get rerank scores from DeepInfra Qwen3-Reranker (0-1 normalized, query-dependent)
         top_n_for_rerank = len(passages)
@@ -538,6 +530,38 @@ class PaperFinderWithReranker:
         top_scores = [round(d.get("boosted_score", 0), 3) for d in sorted_ctxs[:5]]
         logger.info(f"Done reranking: {len(sorted_ctxs)} passages (top scores: {top_scores})")
         return sorted_ctxs
+
+    def _build_rerank_text(self, doc: Dict[str, Any]) -> str:
+        """Build rerank input from ingestion-aligned text elements."""
+        title = str(doc.get("title", "")).strip()
+        section_title = str(doc.get("section_title", "")).strip()
+        content = self._get_document_content(doc)
+
+        if not content:
+            content = str(doc.get("abstract", "") or doc.get("full_text", "")).strip()
+
+        if title and content and content.lower().startswith(title.lower()):
+            text = content
+        elif title and content:
+            text = f"{title}\n\n{content}"
+        elif section_title and content and not content.lower().startswith(section_title.lower()):
+            text = f"{section_title}\n\n{content}"
+        else:
+            text = content or title
+
+        return text[:2000]
+
+    def _get_document_content(self, doc: Dict[str, Any]) -> str:
+        """
+        Return the best available chunk/document content using ingestion field order.
+        """
+        for key in ("page_content", "text", "full_section_text", "abstract", "full_text"):
+            value = doc.get(key)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+        return ""
     
     def _calculate_entity_scores(self, query: str, documents: List[Dict[str, Any]]) -> List[float]:
         """
@@ -565,7 +589,7 @@ class PaperFinderWithReranker:
         for doc in documents:
             title = str(doc.get("title", "")).lower()
             abstract = str(doc.get("abstract", "")).lower()
-            text = str(doc.get("text", "")).lower()
+            text = self._get_document_content(doc).lower()
             full_text = str(doc.get("full_text", "")).lower()
             
             # Combine text for searching
@@ -736,7 +760,7 @@ class PaperFinderWithReranker:
                     paper_snippets[duplicate_of]["relevance_judgement"] = max(current_score, new_score)
                     # Add snippet to existing paper
                     paper_snippets[duplicate_of]["sentences"].append({
-                        "text": snippet.get("text", ""),
+                        "text": snippet.get("text") or snippet.get("page_content", ""),
                         "section_title": snippet.get("section_title", "abstract"),
                         "char_start_offset": snippet.get("char_offset", 0),
                     })
@@ -784,7 +808,7 @@ class PaperFinderWithReranker:
             
             # Add sentence/snippet
             paper_snippets[corpus_id]["sentences"].append({
-                "text": snippet.get("text", ""),
+                "text": snippet.get("text") or snippet.get("page_content", ""),
                 "section_title": snippet.get("section_title", "abstract"),
                 "char_start_offset": snippet.get("char_offset", 0),
             })
@@ -796,7 +820,7 @@ class PaperFinderWithReranker:
             
             # Update abstract if from abstract section
             if snippet.get("section_title") == "abstract" and not paper_snippets[corpus_id]["abstract"]:
-                paper_snippets[corpus_id]["abstract"] = snippet.get("text", "")
+                paper_snippets[corpus_id]["abstract"] = snippet.get("text") or snippet.get("page_content", "")
 
         
         # Log deduplication stats
