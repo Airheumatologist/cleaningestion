@@ -7,7 +7,7 @@ by the downloader) and removes those IDs from the checkpoint file so only
 updated labels get re-ingested.
 
 Usage:
-    python scripts/04_prepare_dailymed_updates.py --set-id-manifest /data/ingestion/dailymed/xml/dailymed_last_update_set_ids.txt
+    python scripts/04_prepare_dailymed_updates.py --set-id-manifest /data/ingestion/dailymed/state/dailymed_last_update_set_ids.txt
 """
 
 import os
@@ -36,21 +36,25 @@ def _fallback_data_dir() -> Path:
 FALLBACK_DAILYMED_XML_DIR = Path(
     os.getenv("DAILYMED_XML_DIR", str(_fallback_data_dir() / "dailymed" / "xml"))
 )
+FALLBACK_SET_ID_MANIFEST = Path(
+    os.getenv(
+        "DAILYMED_SET_ID_MANIFEST",
+        str(_fallback_data_dir() / "dailymed" / "state" / "dailymed_last_update_set_ids.txt"),
+    )
+)
+FALLBACK_CHECKPOINT_FILE = Path(
+    os.getenv("DAILYMED_CHECKPOINT_FILE", str(_fallback_data_dir() / "dailymed_ingested_ids.txt"))
+)
 
 try:
     from config_ingestion import IngestionConfig
-    _HAS_INGESTION_CONFIG = True
     DEFAULT_DAILYMED_XML_DIR = IngestionConfig.DAILYMED_XML_DIR
-    CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "dailymed_ingested_ids.txt"
+    CHECKPOINT_FILE = IngestionConfig.DAILYMED_CHECKPOINT_FILE
+    DEFAULT_SET_ID_MANIFEST = IngestionConfig.DAILYMED_SET_ID_MANIFEST
 except Exception:
-    _HAS_INGESTION_CONFIG = False
     DEFAULT_DAILYMED_XML_DIR = FALLBACK_DAILYMED_XML_DIR
-    CHECKPOINT_FILE = _fallback_data_dir() / "dailymed_ingested_ids.txt"
-
-if _HAS_INGESTION_CONFIG:
-    DEFAULT_SET_ID_MANIFEST = IngestionConfig.DAILYMED_XML_DIR / "dailymed_last_update_set_ids.txt"
-else:
-    DEFAULT_SET_ID_MANIFEST = FALLBACK_DAILYMED_XML_DIR / "dailymed_last_update_set_ids.txt"
+    CHECKPOINT_FILE = FALLBACK_CHECKPOINT_FILE
+    DEFAULT_SET_ID_MANIFEST = FALLBACK_SET_ID_MANIFEST
 
 
 def normalize_set_id(value: str) -> str:

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import ftplib
 import gzip
+import importlib.util
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -26,11 +28,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
-from src.bm25_sparse import BM25SparseEncoder
 from ingestion_utils import (
     Chunker as BaseChunker, 
     EmbeddingProvider, 
     upsert_with_retry,
+    append_checkpoint as append_checkpoint_file,
     generate_section_id,
     get_section_weight,
     get_chunker as get_shared_chunker,
@@ -42,6 +44,13 @@ from pubmed_publication_filters import (
     is_target_article,
     map_publication_type,
 )
+
+# Import BM25SparseEncoder (optional)
+spec = importlib.util.find_spec("src.bm25_sparse")
+if spec is not None:
+    from src.bm25_sparse import BM25SparseEncoder
+else:
+    BM25SparseEncoder = None  # type: ignore
 
 # Import enhanced utilities for semantic chunking
 try:
@@ -66,6 +75,11 @@ PUBMED_CHECKPOINT_NAMESPACE = "pubmed"
 
 # PubMed filtering constants
 DEFAULT_MIN_YEAR = 2015
+
+
+def _checkpoint_id(pmid: str) -> str:
+    """Generate namespaced checkpoint ID for PubMed abstracts."""
+    return f"{PUBMED_CHECKPOINT_NAMESPACE}:{pmid.strip()}"
 
 def load_processed_files() -> Set[str]:
     if not PROCESSED_TRACKER.exists():
@@ -139,6 +153,243 @@ def download_pubmed_file(file_name: str, output_dir: Path) -> Path:
     return local_path
 
 
+def parse_pubmed_date(pub_date_elem: Optional[ET.Element]) -> Dict[str, Any]:
+    """Parse PubDate into a normalized dict used by baseline ingestion."""
+    result = {
+        "year": None,
+        "month": None,
+        "day": None,
+        "medline_date": None,
+        "date_str": None,
+    }
+
+    if pub_date_elem is None:
+        return result
+
+    year_elem = pub_date_elem.find("Year")
+    month_elem = pub_date_elem.find("Month")
+    day_elem = pub_date_elem.find("Day")
+
+    if year_elem is not None and year_elem.text:
+        result["year"] = year_elem.text.strip()
+    if month_elem is not None and month_elem.text:
+        result["month"] = month_elem.text.strip()
+    if day_elem is not None and day_elem.text:
+        result["day"] = day_elem.text.strip()
+
+    if result["year"] is None:
+        medline_date_elem = pub_date_elem.find("MedlineDate")
+        if medline_date_elem is not None and medline_date_elem.text:
+            result["medline_date"] = medline_date_elem.text.strip()
+            match = re.search(r"(\d{4})", result["medline_date"])
+            if match:
+                result["year"] = match.group(1)
+
+    if result["year"]:
+        parts = [result["year"]]
+        if result["month"]:
+            parts.append(result["month"])
+            if result["day"]:
+                parts.append(result["day"])
+        result["date_str"] = " ".join(parts)
+    elif result["medline_date"]:
+        result["date_str"] = result["medline_date"]
+
+    return result
+
+
+def extract_abstract(article_elem: ET.Element) -> Dict[str, Any]:
+    """Extract plain + structured abstract sections."""
+    result: Dict[str, Any] = {
+        "abstract_text": "",
+        "abstract_structured": [],
+        "has_structured_abstract": False,
+    }
+
+    abstract_elem = article_elem.find(".//Abstract")
+    if abstract_elem is None:
+        return result
+
+    abstract_parts: List[str] = []
+    structured_parts: List[Dict[str, Any]] = []
+    has_structured = False
+
+    for abstract_text in abstract_elem.findall("AbstractText"):
+        label = abstract_text.get("Label", "")
+        nlm_category = abstract_text.get("NlmCategory", "")
+        text = "".join(abstract_text.itertext()).strip()
+        if not text:
+            continue
+
+        if label:
+            has_structured = True
+            structured_parts.append(
+                {
+                    "label": label,
+                    "nlm_category": nlm_category,
+                    "text": text,
+                }
+            )
+            abstract_parts.append(f"{label}: {text}")
+        else:
+            abstract_parts.append(text)
+
+    result["abstract_text"] = " ".join(abstract_parts).strip()
+    result["abstract_structured"] = structured_parts
+    result["has_structured_abstract"] = has_structured
+    return result
+
+
+def extract_journal_info(article_elem: ET.Element) -> Dict[str, Any]:
+    """Extract journal info fields compatible with baseline ingestion."""
+    result: Dict[str, Any] = {
+        "title": None,
+        "iso_abbreviation": None,
+        "issn": None,
+        "issn_type": None,
+        "volume": None,
+        "issue": None,
+        "pub_date": {},
+        "cited_medium": None,
+    }
+
+    journal_elem = article_elem.find(".//Journal")
+    if journal_elem is None:
+        return result
+
+    issn_elem = journal_elem.find("ISSN")
+    if issn_elem is not None:
+        result["issn"] = issn_elem.text.strip() if issn_elem.text else None
+        result["issn_type"] = issn_elem.get("IssnType")
+
+    title_elem = journal_elem.find("Title")
+    if title_elem is not None and title_elem.text:
+        result["title"] = title_elem.text.strip()
+
+    iso_elem = journal_elem.find("ISOAbbreviation")
+    if iso_elem is not None and iso_elem.text:
+        result["iso_abbreviation"] = iso_elem.text.strip()
+
+    issue_elem = journal_elem.find("JournalIssue")
+    if issue_elem is not None:
+        result["cited_medium"] = issue_elem.get("CitedMedium")
+
+        volume_elem = issue_elem.find("Volume")
+        if volume_elem is not None and volume_elem.text:
+            result["volume"] = volume_elem.text.strip()
+
+        issue_num_elem = issue_elem.find("Issue")
+        if issue_num_elem is not None and issue_num_elem.text:
+            result["issue"] = issue_num_elem.text.strip()
+
+        result["pub_date"] = parse_pubmed_date(issue_elem.find("PubDate"))
+
+    return result
+
+
+def extract_article_ids(article_elem: ET.Element) -> Dict[str, Any]:
+    """Extract PMID/DOI/PMCID/PII and other IDs."""
+    result: Dict[str, Any] = {
+        "pmid": None,
+        "doi": None,
+        "pmc": None,
+        "pii": None,
+        "other_ids": {},
+    }
+
+    pmid_elem = article_elem.find(".//PMID")
+    if pmid_elem is not None and pmid_elem.text:
+        result["pmid"] = pmid_elem.text.strip()
+
+    for article_id in article_elem.findall(".//ArticleId"):
+        id_type = article_id.get("IdType", "").lower()
+        id_value = article_id.text.strip() if article_id.text else None
+        if not id_value:
+            continue
+
+        if id_type == "doi":
+            result["doi"] = id_value
+        elif id_type == "pubmed":
+            result["pmid"] = id_value
+        elif id_type in {"pmc", "pmcid"}:
+            result["pmc"] = id_value
+        elif id_type == "pii":
+            result["pii"] = id_value
+        else:
+            result["other_ids"][id_type] = id_value
+
+    for eloc_id in article_elem.findall(".//ELocationID"):
+        id_type = eloc_id.get("EIdType", "").lower()
+        id_value = eloc_id.text.strip() if eloc_id.text else None
+        if not id_value:
+            continue
+        if id_type == "doi" and not result["doi"]:
+            result["doi"] = id_value
+        elif id_type == "pii" and not result["pii"]:
+            result["pii"] = id_value
+
+    return result
+
+
+def extract_mesh_terms(article_elem: ET.Element) -> List[Dict[str, Any]]:
+    """Extract structured MeSH terms including qualifiers."""
+    mesh_terms: List[Dict[str, Any]] = []
+    for mesh_heading in article_elem.findall(".//MeshHeading"):
+        descriptor = mesh_heading.find("DescriptorName")
+        if descriptor is None or not descriptor.text:
+            continue
+
+        term: Dict[str, Any] = {
+            "descriptor": descriptor.text.strip(),
+            "descriptor_ui": descriptor.get("UI"),
+            "major_topic": descriptor.get("MajorTopicYN") == "Y",
+            "type": descriptor.get("Type"),
+            "qualifiers": [],
+        }
+        qualifiers: List[Dict[str, Any]] = []
+        for qualifier in mesh_heading.findall("QualifierName"):
+            if qualifier.text:
+                qualifiers.append(
+                    {
+                        "name": qualifier.text.strip(),
+                        "ui": qualifier.get("UI"),
+                        "major_topic": qualifier.get("MajorTopicYN") == "Y",
+                    }
+                )
+        term["qualifiers"] = qualifiers
+        mesh_terms.append(term)
+    return mesh_terms
+
+
+def extract_keywords(article_elem: ET.Element) -> List[Dict[str, Any]]:
+    """Extract structured keyword entries."""
+    keywords: List[Dict[str, Any]] = []
+    keyword_list = article_elem.find(".//KeywordList")
+    if keyword_list is None:
+        return keywords
+
+    owner = keyword_list.get("Owner", "")
+    for keyword in keyword_list.findall("Keyword"):
+        if keyword.text:
+            keywords.append(
+                {
+                    "keyword": keyword.text.strip(),
+                    "major_topic": keyword.get("MajorTopicYN") == "Y",
+                    "owner": owner,
+                }
+            )
+    return keywords
+
+
+def extract_publication_types(article_elem: ET.Element) -> List[Dict[str, Any]]:
+    """Extract publication type entries."""
+    pub_types: List[Dict[str, Any]] = []
+    for pub_type in article_elem.findall(".//PublicationType"):
+        if pub_type.text:
+            pub_types.append({"type": pub_type.text.strip(), "ui": pub_type.get("UI")})
+    return pub_types
+
+
 def parse_pubmed_update_xml(
     xml_gz_path: Path, min_year: int = DEFAULT_MIN_YEAR
 ) -> Iterable[Dict[str, Any]]:
@@ -148,13 +399,16 @@ def parse_pubmed_update_xml(
             if elem.tag != "PubmedArticle":
                 continue
 
-            pmid_elem = elem.find(".//PMID")
-            title_elem = elem.find(".//ArticleTitle")
-            abstract_parts = elem.findall(".//Abstract/AbstractText")
+            article_ids = extract_article_ids(elem)
+            pmid = str(article_ids.get("pmid") or "").strip()
+            if not pmid:
+                elem.clear()
+                continue
 
-            pmid = (pmid_elem.text or "").strip() if pmid_elem is not None else ""
+            title_elem = elem.find(".//ArticleTitle")
             title = "".join(title_elem.itertext()).strip() if title_elem is not None else ""
-            abstract = " ".join("".join(part.itertext()).strip() for part in abstract_parts if part is not None).strip()
+            abstract_data = extract_abstract(elem)
+            abstract = str(abstract_data.get("abstract_text") or "").strip()
 
             # Basic presence check (line 132 equivalent)
             if not pmid or not title or not abstract:
@@ -167,52 +421,43 @@ def parse_pubmed_update_xml(
                 continue
 
             # Extract publication types early for filtering
-            pub_types = []
-            for pt in elem.findall(".//PublicationType"):
-                if pt.text:
-                    pub_types.append(pt.text.strip())
+            pub_types_data = extract_publication_types(elem)
+            pub_types_flat = [pt["type"] for pt in pub_types_data]
 
             # Filter: Target publication types (matches baseline line 726)
-            if not is_target_article(pub_types):
+            if not is_target_article(pub_types_flat):
                 elem.clear()
                 continue
 
-            # Extract year from PubDate
-            year = None
-            year_elem = elem.find(".//PubDate/Year")
-            if year_elem is not None and year_elem.text and year_elem.text.isdigit():
-                year = int(year_elem.text)
+            journal_info = extract_journal_info(elem)
+            pub_date = journal_info.get("pub_date", {})
 
-            # Try MedlineDate if no Year element (matches baseline behavior)
-            if year is None:
-                medline_date_elem = elem.find(".//PubDate/MedlineDate")
-                if medline_date_elem is not None and medline_date_elem.text:
-                    import re
-                    match = re.search(r'(\d{4})', medline_date_elem.text)
-                    if match:
-                        year = int(match.group(1))
+            year: Optional[int] = None
+            year_str = pub_date.get("year")
+            if year_str is not None:
+                try:
+                    year = int(str(year_str))
+                except ValueError:
+                    year = None
 
             # Filter: Minimum year check (matches baseline line 740)
             if year is None or year < min_year:
                 elem.clear()
                 continue
 
-            journal_elem = elem.find(".//Journal/Title")
-            journal = (journal_elem.text or "").strip() if journal_elem is not None and journal_elem.text else ""
+            journal = (
+                journal_info.get("title")
+                or journal_info.get("iso_abbreviation")
+                or ""
+            )
 
-            doi = None
-            for article_id in elem.findall(".//ArticleId"):
-                if article_id.attrib.get("IdType") == "doi" and article_id.text:
-                    doi = article_id.text.strip()
-                    break
-
-            article_type = map_publication_type(pub_types)
+            article_type = map_publication_type(pub_types_flat)
             if not article_type:
                 elem.clear()
                 continue
             evidence = classify_evidence_metadata(
                 article_type=article_type,
-                pub_types=pub_types,
+                pub_types=pub_types_flat,
                 abstract=abstract,
             )
             evidence_grade = evidence["grade"]
@@ -220,24 +465,48 @@ def parse_pubmed_update_xml(
             evidence_term = evidence["matched_term"]
             evidence_source = evidence["matched_from"]
 
+            mesh_terms = extract_mesh_terms(elem)
+            keywords = extract_keywords(elem)
+
             # Extract government affiliations
             is_gov_affiliated, gov_agencies = extract_gov_affiliations_from_pubmed_xml(elem)
 
             yield {
                 "pmid": pmid,
-                "doi": doi,
+                "doi": article_ids.get("doi"),
+                "pmc": article_ids.get("pmc"),
+                "pii": article_ids.get("pii"),
+                "other_ids": article_ids.get("other_ids", {}),
                 "title": title,
                 "abstract": abstract,
+                "abstract_structured": abstract_data.get("abstract_structured", []),
+                "has_structured_abstract": abstract_data.get("has_structured_abstract", False),
                 "year": year,
                 "journal": journal,
+                "journal_full": {
+                    "title": journal_info.get("title"),
+                    "iso_abbreviation": journal_info.get("iso_abbreviation"),
+                    "issn": journal_info.get("issn"),
+                    "issn_type": journal_info.get("issn_type"),
+                    "volume": journal_info.get("volume"),
+                    "issue": journal_info.get("issue"),
+                    "cited_medium": journal_info.get("cited_medium"),
+                },
+                "publication_date": pub_date,
+                "mesh_terms": mesh_terms,
+                "mesh_terms_flat": [m["descriptor"] for m in mesh_terms],
+                "keywords": keywords,
+                "keywords_flat": [k["keyword"] for k in keywords],
+                "publication_types": pub_types_data,
+                "publication_types_flat": pub_types_flat,
                 "article_type": article_type,
-                "publication_type": pub_types[:5],
                 "evidence_grade": evidence_grade,
                 "evidence_level": evidence_level,
                 "evidence_term": evidence_term,
                 "evidence_source": evidence_source,
                 "source": "pubmed_abstract",
                 "has_full_text": False,
+                "content_type": "abstract",
                 "is_gov_affiliated": is_gov_affiliated,
                 "gov_agencies": gov_agencies,
             }
@@ -265,7 +534,8 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     )
 
     points: List[PointStruct] = []
-    pmids: List[str] = []
+    processed_pmids: List[str] = []
+    seen_pmids: Set[str] = set()
     
     # Batch collection
     all_chunks_text: List[str] = []
@@ -276,8 +546,6 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         if not pmid:
             continue
             
-        pmids.append(pmid)
-        
         title = article.get("title", "")
         abstract = article.get("abstract", "")
         
@@ -285,9 +553,61 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         text = f"Title: {title}\n\nAbstract: {abstract}" if title or abstract else ""
         if len(text) < 50:
             continue
-            
-        # Generate section ID for abstract
-        section_id = generate_section_id(pmid, "Abstract")
+
+        abstract_structured = article.get("abstract_structured", [])
+        has_structured_abstract = bool(article.get("has_structured_abstract", False))
+        journal_full = article.get("journal_full", {})
+        publication_date = article.get("publication_date", {})
+
+        mesh_terms_data = article.get("mesh_terms", [])
+        mesh_terms_full = (
+            mesh_terms_data
+            if isinstance(mesh_terms_data, list) and mesh_terms_data and isinstance(mesh_terms_data[0], dict)
+            else []
+        )
+        mesh_terms_flat = article.get("mesh_terms_flat", [])
+        if not mesh_terms_flat:
+            if mesh_terms_full:
+                mesh_terms_flat = [m.get("descriptor", "") for m in mesh_terms_full if m.get("descriptor")]
+            elif isinstance(mesh_terms_data, list):
+                mesh_terms_flat = [str(m).strip() for m in mesh_terms_data if m]
+
+        keywords_data = article.get("keywords", [])
+        keywords_full = (
+            keywords_data
+            if isinstance(keywords_data, list) and keywords_data and isinstance(keywords_data[0], dict)
+            else []
+        )
+        keywords_flat = article.get("keywords_flat", [])
+        if not keywords_flat:
+            if keywords_full:
+                keywords_flat = [k.get("keyword", "") for k in keywords_full if k.get("keyword")]
+            elif isinstance(keywords_data, list):
+                keywords_flat = [str(k).strip() for k in keywords_data if k]
+
+        publication_types_data = article.get("publication_types", [])
+        publication_types_full = (
+            publication_types_data
+            if isinstance(publication_types_data, list)
+            and publication_types_data
+            and isinstance(publication_types_data[0], dict)
+            else []
+        )
+        publication_types_flat = article.get("publication_types_flat", [])
+        if not publication_types_flat:
+            if publication_types_full:
+                publication_types_flat = [p.get("type", "") for p in publication_types_full if p.get("type")]
+            elif isinstance(publication_types_data, list):
+                publication_types_flat = [str(p).strip() for p in publication_types_data if p]
+        if not publication_types_flat:
+            legacy_pub_types = article.get("publication_type", [])
+            if isinstance(legacy_pub_types, list):
+                publication_types_flat = [str(p).strip() for p in legacy_pub_types if p]
+            elif legacy_pub_types:
+                publication_types_flat = [str(legacy_pub_types).strip()]
+
+        # Base section ID for abstract
+        base_section_id = generate_section_id(pmid, "Abstract")
         
         # Chunk the content using shared chunker
         text_chunks = chunker.chunk_text(text)
@@ -295,13 +615,19 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         for i, chunk in enumerate(text_chunks):
             chunk_text = chunk["text"]
             all_chunks_text.append(chunk_text)
+
+            chunk_section_id = (
+                base_section_id if len(text_chunks) == 1 else generate_section_id(pmid, f"Abstract_{i}")
+            )
             
             # Extract chunk abstract (remove title prefix if present)
             chunk_abstract = chunk_text
-            if chunk_text.startswith(f"Title: {title}\n\nAbstract: "):
-                chunk_abstract = chunk_text[len(f"Title: {title}\n\nAbstract: "):]
-            elif chunk_text.startswith("Title: "):
-                chunk_abstract = chunk_text[chunk_text.find("\n\nAbstract: ") + 12:]
+            abstract_prefix = "\n\nAbstract: "
+            prefixed_title = f"Title: {title}{abstract_prefix}"
+            if chunk_text.startswith(prefixed_title):
+                chunk_abstract = chunk_text[len(prefixed_title):]
+            elif chunk_text.startswith("Title: ") and abstract_prefix in chunk_text:
+                chunk_abstract = chunk_text.split(abstract_prefix, 1)[1]
             
             # Build enhanced payload consistent with other ingestion scripts
             payload = {
@@ -309,8 +635,10 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 "doc_id": pmid,
                 "chunk_id": f"{pmid}_abstract_chunk_{i}" if len(text_chunks) > 1 else f"{pmid}_abstract",
                 "pmid": pmid,
-                "pmcid": None,
+                "pmcid": article.get("pmc"),
                 "doi": article.get("doi"),
+                "pii": article.get("pii"),
+                "other_ids": article.get("other_ids", {}),
                 
                 # CRITICAL: Full text for retriever
                 "page_content": chunk_text,
@@ -318,6 +646,9 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 # Content
                 "title": title if i == 0 else f"{title} (cont.)" if title else f"Abstract (Part {i+1})",
                 "abstract": chunk_abstract,
+                "abstract_structured": abstract_structured if i == 0 else [],
+                "has_structured_abstract": has_structured_abstract if i == 0 else False,
+                "full_text": "",
                 
                 # Chunking metadata
                 "chunk_index": i,
@@ -327,30 +658,41 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 # Publication info
                 "year": article.get("year"),
                 "journal": article.get("journal", ""),
+                "journal_full": journal_full,
+                "publication_date": publication_date,
                 "article_type": article.get("article_type", "research_article"),
-                "publication_type": article.get("publication_type", []),
+                "publication_type": publication_types_flat,
+                "publication_types_full": publication_types_full if i == 0 else [],
                 
                 # Evidence
                 "evidence_grade": article.get("evidence_grade", "C"),
                 "evidence_level": article.get("evidence_level", get_evidence_level(article.get("evidence_grade", "C"))),
                 "evidence_term": article.get("evidence_term"),
                 "evidence_source": article.get("evidence_source", "fallback"),
+
+                # Classification
+                "mesh_terms": mesh_terms_flat if i == 0 else [],
+                "mesh_terms_full": mesh_terms_full if i == 0 else [],
+                "keywords": keywords_flat if i == 0 else [],
+                "keywords_full": keywords_full if i == 0 else [],
                 
                 # Government Affiliation
                 "is_gov_affiliated": article.get("is_gov_affiliated", False),
-                "gov_agencies": article.get("gov_agencies", []),
+                "gov_agencies": article.get("gov_agencies", []) if i == 0 else [],
                 
                 # Parent-child indexing fields
                 "section_title": f"Abstract (Part {i+1}/{len(text_chunks)})" if len(text_chunks) > 1 else "Abstract",
                 "section_type": "abstract",
-                "section_id": section_id,
+                "section_id": chunk_section_id,
+                "parent_section_id": base_section_id if len(text_chunks) > 1 else None,
                 "section_weight": get_section_weight("abstract") - (i * 0.05),  # Slight decay for later chunks
-                "full_section_text": text,
+                "full_section_text": chunk_text,
                 
                 # Source and type
                 "source": article.get("source", "pubmed_abstract"),
                 "has_full_text": False,
                 "content_type": "abstract",
+                "table_count": 0,
                 
                 # Preview for dashboard
                 "text_preview": chunk_text[:500],
@@ -359,7 +701,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             chunk_metadata.append(payload)
 
     if not all_chunks_text:
-        return [], pmids
+        return [], []
 
     # Embed all chunks using shared embedding provider
     vectors = embedding_provider.embed_batch(all_chunks_text)
@@ -383,8 +725,12 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             vector_data["sparse"] = sparse_vectors[i].model_dump() if hasattr(sparse_vectors[i], 'model_dump') else sparse_vectors[i]
         
         points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
+        point_pmid = str(payload.get("pmid") or "").strip()
+        if point_pmid and point_pmid not in seen_pmids:
+            seen_pmids.add(point_pmid)
+            processed_pmids.append(point_pmid)
 
-    return points, pmids
+    return points, processed_pmids
 
 
 def ingest_pubmed_updates(
@@ -415,7 +761,11 @@ def ingest_pubmed_updates(
     
     # Create sparse encoder once (reused for all batches)
     sparse_encoder: Optional[Any] = None
-    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
+    if (
+        IngestionConfig.SPARSE_ENABLED
+        and IngestionConfig.SPARSE_MODE == "bm25"
+        and BM25SparseEncoder is not None
+    ):
         sparse_encoder = BM25SparseEncoder(
             max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
             max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
@@ -423,6 +773,8 @@ def ingest_pubmed_updates(
             remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
         )
         logger.info("BM25 sparse encoder initialized for hybrid search")
+    elif IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
+        logger.warning("BM25 sparse encoder unavailable; continuing with dense-only indexing")
 
     inserted = 0
     for file_name in new_files:
@@ -441,20 +793,38 @@ def ingest_pubmed_updates(
             batch.append(article)
             if len(batch) < IngestionConfig.BATCH_SIZE:
                 continue
-            points, _ = build_points(batch, embedding_provider, sparse_encoder,
-                                     validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
+            points, ingested_pmids = build_points(
+                batch,
+                embedding_provider,
+                sparse_encoder,
+                validate_chunks=ENHANCED_UTILS_AVAILABLE,
+                dedup_chunks=ENHANCED_UTILS_AVAILABLE,
+            )
             if points:
                 upsert_with_retry(client, points)
+                checkpoint_ids = [_checkpoint_id(pmid) for pmid in ingested_pmids]
+                if checkpoint_ids:
+                    append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
+                    baseline_pmids.update(ingested_pmids)
                 inserted += len(points)
                 file_inserted += len(points)
                 time.sleep(0.5)  # Throttle: allow RocksDB compaction
             batch.clear()
 
         if batch:
-            points, _ = build_points(batch, embedding_provider, sparse_encoder,
-                                     validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
+            points, ingested_pmids = build_points(
+                batch,
+                embedding_provider,
+                sparse_encoder,
+                validate_chunks=ENHANCED_UTILS_AVAILABLE,
+                dedup_chunks=ENHANCED_UTILS_AVAILABLE,
+            )
             if points:
                 upsert_with_retry(client, points)
+                checkpoint_ids = [_checkpoint_id(pmid) for pmid in ingested_pmids]
+                if checkpoint_ids:
+                    append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
+                    baseline_pmids.update(ingested_pmids)
                 inserted += len(points)
                 file_inserted += len(points)
 
@@ -469,26 +839,27 @@ def ingest_pubmed_updates(
 def run_dailymed_refresh() -> None:
     """Run DailyMed incremental update using weekly updates."""
     logger.info("Starting DailyMed incremental refresh (weekly updates)")
-    set_id_manifest = IngestionConfig.DAILYMED_XML_DIR / "dailymed_last_update_set_ids.txt"
+    set_id_manifest = IngestionConfig.DAILYMED_SET_ID_MANIFEST
+    scripts_dir = PROJECT_ROOT / "scripts"
     # Download last 4 weeks of updates to catch any missed changes
     subprocess.run([
-        sys.executable, "scripts/03_download_dailymed.py", 
+        sys.executable, str(scripts_dir / "03_download_dailymed.py"),
         "--output-dir", str(IngestionConfig.DAILYMED_XML_DIR),
         "--update-type", "weekly",
         "--weeks-back", "4",
         "--set-id-manifest", str(set_id_manifest),
-    ], check=True)
+    ], check=True, cwd=PROJECT_ROOT)
     # Clear checkpoint entries for updated labels so they get re-ingested
     subprocess.run([
-        sys.executable, "scripts/04_prepare_dailymed_updates.py",
+        sys.executable, str(scripts_dir / "04_prepare_dailymed_updates.py"),
         "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR),
         "--set-id-manifest", str(set_id_manifest),
-    ], check=True)
+    ], check=True, cwd=PROJECT_ROOT)
     # Ingest - updated labels will now be processed
     subprocess.run([
-        sys.executable, "scripts/07_ingest_dailymed.py", 
+        sys.executable, str(scripts_dir / "07_ingest_dailymed.py"),
         "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR)
-    ], check=True)
+    ], check=True, cwd=PROJECT_ROOT)
 
 
 def main() -> None:

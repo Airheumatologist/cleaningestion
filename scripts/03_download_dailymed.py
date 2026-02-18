@@ -70,6 +70,18 @@ def _fallback_dailymed_xml_dir() -> Path:
     default_xml_dir = default_data_dir / "dailymed" / "xml"
     return Path(os.getenv("DAILYMED_XML_DIR", str(default_xml_dir)))
 
+
+def _fallback_set_id_manifest() -> Path:
+    """Fallback manifest path when centralized config is unavailable."""
+    default_data_dir = Path(os.getenv("DATA_DIR", "/data/ingestion"))
+    default_state_dir = default_data_dir / "dailymed" / "state"
+    return Path(
+        os.getenv(
+            "DAILYMED_SET_ID_MANIFEST",
+            str(default_state_dir / "dailymed_last_update_set_ids.txt"),
+        )
+    )
+
 # Human prescription drug labels (6 ZIP parts)
 HUMAN_RX_ZIPS = [
     "dm_spl_release_human_rx_part1.zip",
@@ -189,8 +201,10 @@ def write_set_id_manifest(set_ids: Set[str], manifest_path: Path) -> None:
 # Default output dir - uses centralized config if available, otherwise fallback
 if HAS_CONFIG:
     DEFAULT_OUTPUT_DIR = IngestionConfig.DAILYMED_XML_DIR
+    DEFAULT_SET_ID_MANIFEST = IngestionConfig.DAILYMED_SET_ID_MANIFEST
 else:
     DEFAULT_OUTPUT_DIR = _fallback_dailymed_xml_dir()
+    DEFAULT_SET_ID_MANIFEST = _fallback_set_id_manifest()
 
 
 def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 1024):
@@ -398,7 +412,7 @@ def download_dailymed(
     manifest_path = set_id_manifest
     if update_type:
         if manifest_path is None:
-            manifest_path = output_dir / "dailymed_last_update_set_ids.txt"
+            manifest_path = DEFAULT_SET_ID_MANIFEST
         write_set_id_manifest(updated_set_ids, manifest_path)
     
     logger.info("\n" + "=" * 70)
@@ -472,8 +486,8 @@ Examples:
     parser.add_argument(
         "--set-id-manifest",
         type=Path,
-        default=None,
-        help="Optional path to write updated set_ids (incremental modes only)"
+        default=DEFAULT_SET_ID_MANIFEST,
+        help="Path to write updated set_ids (incremental modes only)"
     )
     
     args = parser.parse_args()

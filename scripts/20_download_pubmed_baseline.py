@@ -53,8 +53,10 @@ import re
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 import xml.etree.ElementTree as ET
+from config_ingestion import IngestionConfig, ensure_data_dirs
+from ingestion_utils import extract_gov_affiliations_from_pubmed_xml
 from pubmed_publication_filters import (
     TARGET_PUBLICATION_TYPES,
     is_target_article,
@@ -72,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 PUBMED_FTP_BASELINE = "ftp.ncbi.nlm.nih.gov::pubmed/baseline/"
-DEFAULT_OUTPUT_DIR = Path(os.getenv("PUBMED_BASELINE_DIR", "/data/ingestion/pubmed_baseline"))
+DEFAULT_OUTPUT_DIR = IngestionConfig.PUBMED_BASELINE_DIR
 DEFAULT_MIN_YEAR = 2015
 
 
@@ -89,140 +91,6 @@ def configure_logging(output_dir: Path) -> None:
         ],
         force=True,
     )
-
-# Government affiliation patterns for detecting US government-authored articles
-GOV_AFFILIATION_PATTERNS = [
-    # NIH and institutes
-    "national institutes of health",
-    "national institute of",
-    "nih,",
-    "(nih)",
-    " nih ",
-    # CDC
-    "centers for disease control",
-    "cdc,",
-    "(cdc)",
-    " cdc ",
-    # FDA
-    "food and drug administration",
-    "fda,",
-    "(fda)",
-    " fda ",
-    # Other federal
-    "veterans affairs",
-    "va medical",
-    "va hospital",
-    "department of health and human services",
-    "hhs,",
-    "walter reed",
-    "uniformed services university",
-    "national library of medicine",
-    "national cancer institute",
-    "national heart, lung, and blood",
-    "national institute of allergy",
-    "national institute of mental health",
-    "national eye institute",
-    "national institute of diabetes",
-    "national institute on aging",
-    "national institute of child health",
-    "national institute of neurological",
-    "national human genome research",
-    "agency for healthcare research and quality",
-    "ahrq",
-    # Location-based
-    "bethesda, md",
-    "bethesda, maryland",
-    "bethesda md",
-    "atlanta, ga",
-    "atlanta, georgia",
-    "silver spring, md",
-    "silver spring, maryland",
-    "rockville, md",
-    "rockville, maryland",
-]
-
-
-def extract_gov_affiliations(article_elem: ET.Element) -> Tuple[bool, List[str]]:
-    """
-    Extract government affiliations from article.
-    
-    Returns:
-        Tuple of (is_gov_affiliated, list_of_matched_agencies)
-    """
-    matched_agencies = set()
-    
-    # Check all affiliation elements
-    for aff in article_elem.findall(".//Affiliation"):
-        if aff.text:
-            aff_text = aff.text.lower()
-            for pattern in GOV_AFFILIATION_PATTERNS:
-                if pattern.lower() in aff_text:
-                    # Extract agency name from matched pattern
-                    agency = extract_agency_name(pattern, aff_text)
-                    if agency:
-                        matched_agencies.add(agency)
-    
-    # Check AffiliationInfo elements (newer format)
-    for aff_info in article_elem.findall(".//AffiliationInfo/Affiliation"):
-        if aff_info.text:
-            aff_text = aff_info.text.lower()
-            for pattern in GOV_AFFILIATION_PATTERNS:
-                if pattern.lower() in aff_text:
-                    agency = extract_agency_name(pattern, aff_text)
-                    if agency:
-                        matched_agencies.add(agency)
-    
-    # Check grant list for NIH/government grants
-    for grant in article_elem.findall(".//Grant"):
-        agency = grant.find("Agency")
-        if agency is not None and agency.text:
-            agency_lower = agency.text.lower()
-            if any(g in agency_lower for g in ["nih", "national institutes", "cdc", "fda", "va ", "veterans", "ahrq"]):
-                matched_agencies.add(agency.text.strip())
-    
-    is_gov = len(matched_agencies) > 0
-    return is_gov, sorted(list(matched_agencies))
-
-
-def extract_agency_name(pattern: str, aff_text: str) -> Optional[str]:
-    """Extract standardized agency name from matched pattern."""
-    pattern_lower = pattern.lower()
-    
-    # Map patterns to standardized agency names
-    agency_map = {
-        "nih": "NIH",
-        "national institutes of health": "NIH",
-        "national institute of": "NIH",
-        "national cancer institute": "NCI",
-        "national heart": "NHLBI",
-        "national institute of allergy": "NIAID",
-        "national institute of mental health": "NIMH",
-        "national eye institute": "NEI",
-        "national institute of diabetes": "NIDDK",
-        "national institute on aging": "NIA",
-        "national institute of child health": "NICHD",
-        "national institute of neurological": "NINDS",
-        "national human genome research": "NHGRI",
-        "national library of medicine": "NLM",
-        "cdc": "CDC",
-        "centers for disease control": "CDC",
-        "fda": "FDA",
-        "food and drug administration": "FDA",
-        "veterans affairs": "VA",
-        "va medical": "VA",
-        "va hospital": "VA",
-        "uniformed services university": "USUHS",
-        "walter reed": "Walter Reed",
-        "ahrq": "AHRQ",
-        "agency for healthcare research": "AHRQ",
-    }
-    
-    for key, agency in agency_map.items():
-        if key in pattern_lower:
-            return agency
-    
-    return None
-
 
 class ProgressTracker:
     """Track and persist progress across stages."""
@@ -697,7 +565,7 @@ def extract_article_data(article_elem: ET.Element, min_year: int) -> Optional[Di
         article_type = map_publication_type(pub_types)
         
         # Extract government affiliations (merged from gov pipeline)
-        is_gov_affiliated, gov_agencies = extract_gov_affiliations(article_elem)
+        is_gov_affiliated, gov_agencies = extract_gov_affiliations_from_pubmed_xml(article_elem)
         
         # Build result - NO CHARACTER LIMITS on any field
         return {
@@ -968,7 +836,8 @@ Examples:
     )
     
     args = parser.parse_args()
-    
+
+    ensure_data_dirs()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(args.output_dir)
     

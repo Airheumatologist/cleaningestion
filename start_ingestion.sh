@@ -34,6 +34,8 @@ echo "=========================================="
 
 # Configuration
 DATA_DIR="${DATA_DIR:-/data/ingestion}"
+PUBMED_BASELINE_DIR="${PUBMED_BASELINE_DIR:-$DATA_DIR/pubmed_baseline}"
+PUBMED_DEFAULT_FILE="${PUBMED_ABSTRACTS_FILE:-$PUBMED_BASELINE_DIR/filtered/pubmed_abstracts.jsonl}"
 LOG_DIR="$DATA_DIR/logs"
 mkdir -p "$LOG_DIR"
 
@@ -65,12 +67,11 @@ if [ "$FRESH_MODE" = true ]; then
     echo ""
     echo "🧹 Step 1: Clearing checkpoint files..."
     
-    # List of checkpoint files to clear
+    # Active checkpoint files to clear
     CHECKPOINT_FILES=(
         "$DATA_DIR/pubmed_ingested_ids.txt"
         "$DATA_DIR/dailymed_ingested_ids.txt"
         "$DATA_DIR/pmc_ingested_ids.txt"
-        "$DATA_DIR/author_manuscript_ingested_ids.txt"
     )
     
     for file in "${CHECKPOINT_FILES[@]}"; do
@@ -79,6 +80,14 @@ if [ "$FRESH_MODE" = true ]; then
             rm -f "$file"
         fi
     done
+
+    # Legacy migration checkpoint (read-only in current ingest code).
+    # Keep clearing it in fresh mode so old IDs cannot affect a true reset.
+    LEGACY_AUTHOR_CHECKPOINT_FILE="$DATA_DIR/author_manuscript_ingested_ids.txt"
+    if [ -f "$LEGACY_AUTHOR_CHECKPOINT_FILE" ]; then
+        echo "   Removing legacy: $(basename "$LEGACY_AUTHOR_CHECKPOINT_FILE")"
+        rm -f "$LEGACY_AUTHOR_CHECKPOINT_FILE"
+    fi
     
     # Also clear any PID files
     if [ -d "$LOG_DIR" ]; then
@@ -151,7 +160,6 @@ fi
 
 # Check PubMed
 PUBMED_AVAILABLE=false
-PUBMED_DEFAULT_FILE="$DATA_DIR/pubmed_baseline/filtered/pubmed_abstracts.jsonl"
 if [ -f "$PUBMED_DEFAULT_FILE" ]; then
     echo "   ✅ PubMed: Found $PUBMED_DEFAULT_FILE"
     PUBMED_AVAILABLE=true

@@ -103,8 +103,7 @@ RAG-pipeline/
 │   └── specialty_journals.py               # Journal priority lists
 │
 ├── scripts/                                # Data ingestion pipeline
-│   ├── 01_download_pmc_unified.py          # Download PMC OA + Author Manuscripts from NCBI FTP
-│   ├── 01_download_pmc.py                  # Deprecated compatibility wrapper (disabled by default)
+│   ├── 01_download_pmc_unified.py          # Download PMC OA + Author Manuscripts from PMC Cloud Service (AWS S3)
 │   ├── 03_download_dailymed.py             # Download FDA drug labels
 │   ├── 05_setup_qdrant.py                  # Initialize Qdrant collection
 │   ├── 06_ingest_pmc.py                    # Ingest unified PMC XML sources to Qdrant
@@ -317,6 +316,11 @@ FINAL_TOP_ARTICLES=50
 DATA_DIR=/data/ingestion
 PMC_XML_DIR=/data/ingestion/pmc_xml
 DAILYMED_XML_DIR=/data/ingestion/dailymed/xml
+DAILYMED_STATE_DIR=/data/ingestion/dailymed/state
+DAILYMED_CHECKPOINT_FILE=/data/ingestion/dailymed_ingested_ids.txt
+DAILYMED_SET_ID_MANIFEST=/data/ingestion/dailymed/state/dailymed_last_update_set_ids.txt
+PUBMED_BASELINE_DIR=/data/ingestion/pubmed_baseline
+PUBMED_ABSTRACTS_FILE=/data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 ```
 
 ### 3. Local Development (without full dataset)
@@ -371,8 +375,13 @@ The script will:
 # Setup collection (fresh start)
 python scripts/05_setup_qdrant.py --recreate
 
-# 1. Unified PMC pipeline (OA + Author Manuscripts)
-python scripts/01_download_pmc_unified.py --datasets pmc_oa,author_manuscript
+# 1. Unified PMC pipeline on PMC Cloud Service (AWS S3)
+# all: full metadata inventory scan
+# incremental: only metadata rows newer than last successful incremental run
+python scripts/01_download_pmc_unified.py --datasets pmc_oa,author_manuscript --release-mode all
+
+# Incremental refresh (recommended for regular update runs)
+python scripts/01_download_pmc_unified.py --datasets pmc_oa,author_manuscript --release-mode incremental
 python scripts/06_ingest_pmc.py --xml-dir /data/ingestion/pmc_xml
 
 # 2. DailyMed Drug Labels
@@ -388,7 +397,7 @@ python scripts/generate_drug_lookup.py
 # - High-value article types (reviews, trials, guidelines)
 # - Government affiliations (NIH, CDC, FDA, VA, etc.)
 python scripts/20_download_pubmed_baseline.py
-python scripts/21_ingest_pubmed_abstracts.py --input /data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
+python scripts/21_ingest_pubmed_abstracts.py
 
 # NOTE: Government abstracts pipeline has been MERGED into PubMed pipeline above.
 # Old scripts (10_download_gov_abstracts.py, 13_ingest_gov_abstracts.py) are deprecated.

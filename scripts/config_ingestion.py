@@ -31,8 +31,24 @@ class IngestionConfig:
     # Data paths
     DATA_DIR = Path(os.getenv("DATA_DIR", "/data/ingestion"))
     PMC_XML_DIR = Path(os.getenv("PMC_XML_DIR", str(DATA_DIR / "pmc_xml")))
-    PMC_JSONL_FILE = Path(os.getenv("PMC_JSONL_FILE", str(DATA_DIR / "pmc_articles.jsonl")))
     DAILYMED_XML_DIR = Path(os.getenv("DAILYMED_XML_DIR", str(DATA_DIR / "dailymed" / "xml")))
+    DAILYMED_STATE_DIR = Path(os.getenv("DAILYMED_STATE_DIR", str(DATA_DIR / "dailymed" / "state")))
+    DAILYMED_CHECKPOINT_FILE = Path(
+        os.getenv("DAILYMED_CHECKPOINT_FILE", str(DATA_DIR / "dailymed_ingested_ids.txt"))
+    )
+    DAILYMED_SET_ID_MANIFEST = Path(
+        os.getenv(
+            "DAILYMED_SET_ID_MANIFEST",
+            str(DAILYMED_STATE_DIR / "dailymed_last_update_set_ids.txt"),
+        )
+    )
+    PUBMED_BASELINE_DIR = Path(os.getenv("PUBMED_BASELINE_DIR", str(DATA_DIR / "pubmed_baseline")))
+    PUBMED_ABSTRACTS_FILE = Path(
+        os.getenv(
+            "PUBMED_ABSTRACTS_FILE",
+            str(PUBMED_BASELINE_DIR / "filtered" / "pubmed_abstracts.jsonl"),
+        )
+    )
 
     # Tuning
     # Default 100 - can be reduced to 25 if "too many open files" errors with RocksDB occur
@@ -83,3 +99,8 @@ def ensure_data_dirs() -> None:
     IngestionConfig.DATA_DIR.mkdir(parents=True, exist_ok=True)
     IngestionConfig.PMC_XML_DIR.mkdir(parents=True, exist_ok=True)
     IngestionConfig.DAILYMED_XML_DIR.mkdir(parents=True, exist_ok=True)
+    IngestionConfig.DAILYMED_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    IngestionConfig.DAILYMED_CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    IngestionConfig.DAILYMED_SET_ID_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    IngestionConfig.PUBMED_BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    IngestionConfig.PUBMED_ABSTRACTS_FILE.parent.mkdir(parents=True, exist_ok=True)

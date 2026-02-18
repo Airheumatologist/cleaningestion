@@ -24,6 +24,7 @@ Payload Structure:
 - Chunking: chunk_index, total_chunks, parent_section_id
 
 Usage:
+    python 21_ingest_pubmed_abstracts.py
     python 21_ingest_pubmed_abstracts.py --input /data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 """
 
@@ -82,6 +83,7 @@ else:
     BM25SparseEncoder = None  # type: ignore
 
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
+DEFAULT_INPUT_FILE = IngestionConfig.PUBMED_ABSTRACTS_FILE
 
 # Namespace for PubMed checkpoint IDs to prevent collision with PMC/DailyMed
 PUBMED_CHECKPOINT_NAMESPACE = "pubmed"
@@ -675,7 +677,12 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest PubMed Abstracts with token-based chunking")
-    parser.add_argument("--input", type=Path, required=True, help="Path to pubmed_abstracts.jsonl")
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=DEFAULT_INPUT_FILE,
+        help=f"Path to pubmed_abstracts.jsonl (default: {DEFAULT_INPUT_FILE})",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Limit number of docs")
     
     args = parser.parse_args()

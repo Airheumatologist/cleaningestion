@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Download PMC OA and Author Manuscript bulk files from NCBI FTP."""
+"""Download PMC OA and Author Manuscript XML files from PMC Cloud Service (AWS S3)."""
 
 from __future__ import annotations
 
 import argparse
-import ftplib
+import csv
 import gzip
+import json
 import logging
-import shutil
-import tarfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Literal, Tuple
+from urllib.parse import quote, urlparse
+import xml.etree.ElementTree as ET
 
 import requests
 
@@ -20,33 +21,45 @@ from config_ingestion import IngestionConfig, ensure_data_dirs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-FTP_HOST = "ftp.ncbi.nlm.nih.gov"
+S3_BUCKET = "pmc-oa-opendata"
+S3_BASE_URL = f"https://{S3_BUCKET}.s3.amazonaws.com"
+INVENTORY_ROOT_PREFIX = f"inventory-reports/{S3_BUCKET}/metadata/"
+DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}Z/$")
+
 REMOTE_DIRS = {
-    # PMC OA commercial subset. Full OA also includes oa_noncomm + oa_other.
-    "pmc_oa": "/pub/pmc/oa_bulk/oa_comm/xml/",
-    "author_manuscript": "/pub/pmc/manuscript/xml/",
+    "pmc_oa": "pmc_oa",
+    "author_manuscript": "author_manuscript",
 }
-ALLOWED_SUFFIXES = (".xml.gz", ".tar.gz")
+
+# Kept for backward compatibility with existing CLI usage.
+RELEASE_MODES = ("all", "baseline", "incremental")
+ReleaseMode = Literal["all", "baseline", "incremental"]
+
+STATE_FILE_NAME = ".pmc_s3_inventory_state.json"
+MARKER_DIR_NAME = ".pmc_s3_markers"
 
 
-def _iter_remote_files(ftp: ftplib.FTP, max_files: int | None = None) -> Iterable[str]:
-    entries: list[str] = []
-    ftp.retrlines("NLST", entries.append)
-
-    matched = [f for f in sorted(entries) if any(f.endswith(s) for s in ALLOWED_SUFFIXES)]
-    if max_files is not None:
-        matched = matched[:max_files]
-    yield from matched
+def _s3_key_to_https(key: str) -> str:
+    return f"{S3_BASE_URL}/{quote(key, safe='/')}"
 
 
-def _download_file_http(remote_path: str, local_path: Path, chunk_size: int = 1024 * 1024) -> bool:
-    """Download file via HTTPS from NCBI, returning True if successful."""
-    url = f"https://ftp.ncbi.nlm.nih.gov{remote_path}"
+def _normalize_s3_or_https_url(value: str) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme == "s3":
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        query = f"?{parsed.query}" if parsed.query else ""
+        return f"https://{bucket}.s3.amazonaws.com/{quote(key, safe='/')}{query}"
+    if parsed.scheme in {"http", "https"}:
+        return value
+    raise ValueError(f"Unsupported URL scheme in xml_url: {value}")
 
+
+def _download_file_http(url: str, local_path: Path, chunk_size: int = 1024 * 1024) -> bool:
     temp_path = local_path.with_suffix(local_path.suffix + ".tmp")
     try:
-        logger.info("Downloading via HTTP: %s", url)
-        with requests.get(url, stream=True, timeout=60) as response:
+        logger.info("Downloading: %s", url)
+        with requests.get(url, stream=True, timeout=120) as response:
             if response.status_code != 200:
                 logger.warning("HTTP missing (status %s): %s", response.status_code, url)
                 return False
@@ -57,194 +70,374 @@ def _download_file_http(remote_path: str, local_path: Path, chunk_size: int = 10
                     if chunk:
                         handle.write(chunk)
 
-        temp_path.rename(local_path)
+        temp_path.replace(local_path)
         return True
     except Exception as exc:  # pragma: no cover - network dependent
-        logger.warning("HTTP download failed: %s", exc)
+        logger.warning("HTTP download failed for %s: %s", url, exc)
         return False
     finally:
         temp_path.unlink(missing_ok=True)
 
 
-def _extract_tar_gz(tar_path: Path, extract_dir: Path, delete_after: bool = True) -> int | None:
-    """Extract .tar.gz archive and return extracted count, or None on failure."""
-    extracted = 0
-    logger.info("Extracting %s...", tar_path.name)
+def _list_common_prefixes(prefix: str) -> list[str]:
+    prefixes: list[str] = []
+    continuation_token: str | None = None
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
 
-    tar_subdir = extract_dir / tar_path.stem.replace(".tar", "")
+    while True:
+        params = {
+            "list-type": "2",
+            "prefix": prefix,
+            "delimiter": "/",
+            "max-keys": "1000",
+        }
+        if continuation_token:
+            params["continuation-token"] = continuation_token
+
+        response = requests.get(f"{S3_BASE_URL}/", params=params, timeout=120)
+        response.raise_for_status()
+
+        root = ET.fromstring(response.content)
+        for entry in root.findall("s3:CommonPrefixes/s3:Prefix", ns):
+            if entry.text:
+                prefixes.append(entry.text)
+
+        is_truncated = root.findtext("s3:IsTruncated", default="false", namespaces=ns).lower() == "true"
+        continuation_token = root.findtext("s3:NextContinuationToken", default=None, namespaces=ns)
+        if not is_truncated:
+            break
+
+    return prefixes
+
+
+def _latest_inventory_prefix() -> str:
+    common_prefixes = _list_common_prefixes(INVENTORY_ROOT_PREFIX)
+    version_dirs: list[str] = []
+
+    for full_prefix in common_prefixes:
+        suffix = full_prefix[len(INVENTORY_ROOT_PREFIX) :]
+        if DATE_PREFIX_RE.match(suffix):
+            version_dirs.append(full_prefix)
+
+    if not version_dirs:
+        raise RuntimeError("No dated inventory versions found under inventory-reports/")
+
+    return sorted(version_dirs)[-1]
+
+
+def _inventory_csv_keys_for_latest_version() -> list[str]:
+    latest_prefix = _latest_inventory_prefix()
+    manifest_key = f"{latest_prefix}manifest.json"
+    manifest_url = _s3_key_to_https(manifest_key)
+
+    response = requests.get(manifest_url, timeout=120)
+    response.raise_for_status()
+    manifest = response.json()
+
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError(f"Inventory manifest has no files: {manifest_url}")
+
+    csv_keys = [entry["key"] for entry in files if isinstance(entry, dict) and entry.get("key")]
+    if not csv_keys:
+        raise RuntimeError(f"Inventory manifest files list is empty: {manifest_url}")
+
+    logger.info("Using inventory version prefix: %s", latest_prefix)
+    logger.info("Inventory CSV partitions: %s", len(csv_keys))
+    return csv_keys
+
+
+def _iter_inventory_entries(csv_keys: list[str]) -> Iterable[Tuple[str, str, str]]:
+    """Yield (metadata_key, last_modified_utc, etag) rows from inventory CSV files."""
+    for csv_key in csv_keys:
+        csv_url = _s3_key_to_https(csv_key)
+        logger.info("Reading inventory CSV: %s", csv_key)
+
+        with requests.get(csv_url, stream=True, timeout=180) as response:
+            response.raise_for_status()
+            with gzip.open(response.raw, mode="rt", encoding="utf-8", newline="") as handle:
+                reader = csv.reader(handle)
+                for row in reader:
+                    if len(row) < 4:
+                        continue
+                    _bucket, key, last_modified, etag = row[0], row[1], row[2], row[3]
+                    if not key.startswith("metadata/") or not key.endswith(".json"):
+                        continue
+                    yield key, last_modified, etag.strip('"')
+
+
+def _iter_metadata_entries_via_list_api() -> Iterable[Tuple[str, str, str]]:
+    """Yield (metadata_key, last_modified_utc, etag) by listing metadata/ directly."""
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    continuation_token: str | None = None
+    page = 0
+
+    while True:
+        page += 1
+        params = {
+            "list-type": "2",
+            "prefix": "metadata/",
+            "max-keys": "1000",
+        }
+        if continuation_token:
+            params["continuation-token"] = continuation_token
+
+        response = requests.get(f"{S3_BASE_URL}/", params=params, timeout=180)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+
+        yielded = 0
+        for content in root.findall("s3:Contents", ns):
+            key = content.findtext("s3:Key", default="", namespaces=ns)
+            if not key.startswith("metadata/") or not key.endswith(".json"):
+                continue
+            last_modified = content.findtext("s3:LastModified", default="", namespaces=ns)
+            etag = content.findtext("s3:ETag", default="", namespaces=ns).strip('"')
+            if not last_modified:
+                continue
+            yielded += 1
+            yield key, last_modified, etag
+
+        logger.info("Listed metadata page %s (yielded=%s)", page, yielded)
+
+        is_truncated = root.findtext("s3:IsTruncated", default="false", namespaces=ns).lower() == "true"
+        continuation_token = root.findtext("s3:NextContinuationToken", default=None, namespaces=ns)
+        if not is_truncated:
+            break
+
+
+def _iter_metadata_entries() -> Iterable[Tuple[str, str, str]]:
+    """Prefer inventory CSV when available, else fall back to listing metadata/."""
     try:
-        with tarfile.open(tar_path, "r:gz") as tar:
-            members = [
-                member
-                for member in tar.getmembers()
-                if member.isfile() and (member.name.endswith(".nxml") or member.name.endswith(".xml"))
-            ]
-
-            tar_subdir.mkdir(parents=True, exist_ok=True)
-            for member in members:
-                tar.extract(member, path=tar_subdir)
-                extracted_path = tar_subdir / member.name
-                if extracted_path.exists():
-                    final_path = extract_dir / Path(member.name).name
-                    shutil.move(str(extracted_path), str(final_path))
-                    extracted += 1
-
-        if delete_after:
-            tar_path.unlink(missing_ok=True)
-
-        logger.info("Extracted %s files from %s", extracted, tar_path.name)
-        return extracted
+        csv_keys = _inventory_csv_keys_for_latest_version()
     except Exception as exc:
-        logger.error("Failed to extract %s: %s", tar_path.name, exc)
-        return None
-    finally:
-        shutil.rmtree(tar_subdir, ignore_errors=True)
+        logger.warning(
+            "Inventory listing unavailable (%s). Falling back to ListObjectsV2 on metadata/.",
+            exc,
+        )
+        yield from _iter_metadata_entries_via_list_api()
+        return
+
+    yield from _iter_inventory_entries(csv_keys)
 
 
-def _extract_xml_gz(gz_path: Path, delete_after: bool = True) -> int | None:
-    """Extract .xml.gz archive and return 1 on success, or None on failure."""
-    output_path = gz_path.with_suffix("")
-    try:
-        logger.info("Extracting %s...", gz_path.name)
-        with gzip.open(gz_path, "rb") as src:
-            with open(output_path, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-
-        if delete_after:
-            gz_path.unlink(missing_ok=True)
-
-        logger.info("Extracted to %s", output_path.name)
-        return 1
-    except Exception as exc:
-        output_path.unlink(missing_ok=True)
-        logger.error("Failed to extract %s: %s", gz_path.name, exc)
-        return None
+def _metadata_matches_dataset(metadata: dict, dataset_key: str) -> bool:
+    if dataset_key == "pmc_oa":
+        return bool(metadata.get("is_pmc_openaccess"))
+    if dataset_key == "author_manuscript":
+        return bool(metadata.get("is_manuscript"))
+    return False
 
 
-def _download_dataset(output_dir: Path, remote_dir: str, max_files: int | None = None) -> tuple[int, int]:
-    output_dir.mkdir(parents=True, exist_ok=True)
+def _dataset_signature(datasets: List[str]) -> str:
+    return ",".join(sorted(datasets))
 
-    ftp = None
 
-    def _get_ftp() -> ftplib.FTP:
-        nonlocal ftp
-        if ftp is not None:
-            try:
-                ftp.voidcmd("NOOP")
-                return ftp
-            except Exception:
-                ftp = None
-
-        ftp = ftplib.FTP(FTP_HOST, timeout=120)
-        ftp.login()
-        ftp.cwd(remote_dir)
-        return ftp
+def _load_state(state_path: Path) -> dict:
+    if not state_path.exists():
+        return {"last_modified_by_signature": {}}
 
     try:
-        conn = _get_ftp()
-        files = list(_iter_remote_files(conn, max_files=max_files))
-        logger.info("Found %s files in %s", len(files), remote_dir)
-    finally:
-        if ftp is not None:
-            try:
-                ftp.quit()
-            except Exception:
-                pass
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {"last_modified_by_signature": {}}
+        if not isinstance(data.get("last_modified_by_signature"), dict):
+            data["last_modified_by_signature"] = {}
+        return data
+    except Exception:
+        return {"last_modified_by_signature": {}}
 
-    downloaded = 0
-    extracted_count = 0
 
-    def process_file(remote_name: str) -> tuple[int, int]:
-        local_path = output_dir / remote_name
-        marker_path = output_dir / f".{remote_name}.done"
+def _save_state(state_path: Path, state: dict) -> None:
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
-        if marker_path.exists():
-            logger.info("Skipping processed: %s", remote_name)
-            return 0, 0
 
-        downloaded_now = 0
-        if not (local_path.exists() and local_path.stat().st_size > 0):
-            remote_full_path = f"{remote_dir.rstrip('/')}/{remote_name}"
-            if not _download_file_http(remote_full_path, local_path):
-                logger.error("Failed to download %s", remote_name)
-                return 0, 0
-            downloaded_now = 1
+def _marker_path(marker_root: Path, dataset_sig: str, metadata_key: str, etag: str) -> Path:
+    safe_key = metadata_key.replace("/", "__")
+    safe_sig = dataset_sig.replace(",", "__")
+    safe_etag = etag.replace("/", "_")
+    return marker_root / safe_sig / f".{safe_key}.{safe_etag}.done"
 
-        extracted_now = 0
-        extraction_failed = False
-        if remote_name.endswith(".tar.gz"):
-            extracted = _extract_tar_gz(local_path, output_dir, delete_after=True)
-            if extracted is None:
-                extraction_failed = True
-            else:
-                extracted_now += extracted
-        elif remote_name.endswith(".xml.gz"):
-            extracted = _extract_xml_gz(local_path, delete_after=True)
-            if extracted is None:
-                extraction_failed = True
-            else:
-                extracted_now += extracted
 
-        if extraction_failed:
-            logger.warning("Not marking as done due to extraction failure: %s", remote_name)
-            return downloaded_now, extracted_now
+def _download_metadata_json(metadata_key: str) -> dict | None:
+    metadata_url = _s3_key_to_https(metadata_key)
+    try:
+        response = requests.get(metadata_url, timeout=120)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Failed to read metadata %s: %s", metadata_key, exc)
+    return None
 
+
+def _process_metadata_entry(
+    output_dir: Path,
+    datasets: List[str],
+    dataset_sig: str,
+    metadata_key: str,
+    etag: str,
+) -> tuple[int, int]:
+    marker_root = output_dir / MARKER_DIR_NAME
+    marker_path = _marker_path(marker_root, dataset_sig, metadata_key, etag)
+
+    if marker_path.exists():
+        return 0, 0
+
+    metadata = _download_metadata_json(metadata_key)
+    if metadata is None:
+        return 0, 0
+
+    target_datasets = [dataset for dataset in datasets if _metadata_matches_dataset(metadata, dataset)]
+    if not target_datasets:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
         marker_path.touch()
-        return downloaded_now, extracted_now
+        return 0, 0
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_to_file = {executor.submit(process_file, name): name for name in files}
-        for index, future in enumerate(as_completed(future_to_file), start=1):
-            remote_name = future_to_file[future]
-            try:
-                d_count, e_count = future.result()
-                downloaded += d_count
-                extracted_count += e_count
-                logger.info(
-                    "[%s/%s] Completed %s (downloaded=%s, extracted=%s)",
-                    index,
-                    len(files),
-                    remote_name,
-                    d_count,
-                    e_count,
-                )
-            except Exception as exc:
-                logger.error("%s generated an exception: %s", remote_name, exc)
+    xml_url = metadata.get("xml_url")
+    if not isinstance(xml_url, str) or not xml_url:
+        logger.warning("Skipping metadata without xml_url: %s", metadata_key)
+        return 0, 0
 
-    return downloaded, extracted_count
+    try:
+        xml_http_url = _normalize_s3_or_https_url(xml_url)
+    except Exception as exc:
+        logger.warning("Invalid xml_url in %s: %s", metadata_key, exc)
+        return 0, 0
+
+    xml_name = Path(urlparse(xml_http_url).path).name
+    if not xml_name.endswith((".xml", ".nxml")):
+        logger.warning("Skipping non-XML target for %s: %s", metadata_key, xml_name)
+        return 0, 0
+
+    downloaded_now = 0
+
+    for dataset in target_datasets:
+        local_path = output_dir / dataset / xml_name
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if local_path.exists() and local_path.stat().st_size > 0:
+            continue
+
+        if _download_file_http(xml_http_url, local_path):
+            downloaded_now += 1
+        else:
+            logger.error("Failed XML download for %s (%s)", metadata_key, dataset)
+            return downloaded_now, downloaded_now
+
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.touch()
+    return downloaded_now, downloaded_now
+
+
+def _select_cutoff_for_incremental(state: dict, dataset_sig: str, release_mode: ReleaseMode) -> str | None:
+    if release_mode != "incremental":
+        if release_mode == "baseline":
+            logger.warning("--release-mode baseline is not available on PMC Cloud Service; treating as full scan.")
+        return None
+
+    cutoff = state.get("last_modified_by_signature", {}).get(dataset_sig)
+    if cutoff:
+        logger.info("Incremental mode enabled with cutoff last_modified > %s", cutoff)
+    else:
+        logger.info("Incremental mode enabled, but no prior state exists; processing all inventory entries.")
+    return cutoff
+
+
+def _should_include_entry(last_modified: str, cutoff: str | None) -> bool:
+    if cutoff is None:
+        return True
+    return last_modified > cutoff
 
 
 def download_pmc(
     output_dir: Path,
     datasets: List[str] | None = None,
+    release_mode: ReleaseMode = "all",
     max_files: int | None = None,
 ) -> int:
-    """Download requested datasets and return total files downloaded."""
+    """Download requested datasets from PMC Cloud Service and return total files downloaded."""
     selected = datasets or list(REMOTE_DIRS.keys())
     invalid = [value for value in selected if value not in REMOTE_DIRS]
     if invalid:
         raise ValueError(f"Unknown dataset keys: {', '.join(invalid)}")
 
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for dataset in selected:
+        dataset_output = output_dir / dataset
+        dataset_output.mkdir(parents=True, exist_ok=True)
+        (dataset_output / ".source").write_text(dataset, encoding="utf-8")
+
+    dataset_sig = _dataset_signature(selected)
+    state_path = output_dir / STATE_FILE_NAME
+    state = _load_state(state_path)
+    cutoff = _select_cutoff_for_incremental(state, dataset_sig, release_mode)
+
+    if max_files is not None and max_files < 0:
+        raise ValueError("--max-files must be >= 0")
+
     total_downloaded = 0
     total_extracted = 0
+    processed_entries = 0
+    scanned_entries = 0
+    included_entries = 0
+    max_seen_last_modified: str | None = None
+    stopped_by_max_files = False
 
-    for dataset_key in selected:
-        remote_dir = REMOTE_DIRS[dataset_key]
-        dataset_output = output_dir / dataset_key
-        dataset_output.mkdir(parents=True, exist_ok=True)
-        (dataset_output / ".source").write_text(dataset_key, encoding="utf-8")
+    if max_files == 0:
+        logger.info("--max-files is 0; nothing to process.")
+        return 0
 
-        logger.info("=" * 70)
-        logger.info("Downloading %s from %s", dataset_key, remote_dir)
-        logger.info("Destination: %s", dataset_output)
+    for metadata_key, last_modified, etag in _iter_metadata_entries():
+        scanned_entries += 1
+        if max_seen_last_modified is None or last_modified > max_seen_last_modified:
+            max_seen_last_modified = last_modified
 
-        downloaded, extracted = _download_dataset(dataset_output, remote_dir, max_files=max_files)
-        total_downloaded += downloaded
-        total_extracted += extracted
+        if not _should_include_entry(last_modified, cutoff):
+            continue
+
+        included_entries += 1
+
+        if max_files is not None and processed_entries >= max_files:
+            logger.info("Reached --max-files=%s; stopping scan early.", max_files)
+            stopped_by_max_files = True
+            break
+
+        downloaded_now, extracted_now = _process_metadata_entry(
+            output_dir=output_dir,
+            datasets=selected,
+            dataset_sig=dataset_sig,
+            metadata_key=metadata_key,
+            etag=etag,
+        )
+        total_downloaded += downloaded_now
+        total_extracted += extracted_now
+        processed_entries += 1
+
+        if processed_entries % 1000 == 0:
+            logger.info(
+                "Progress: scanned=%s included=%s processed=%s downloaded=%s",
+                scanned_entries,
+                included_entries,
+                processed_entries,
+                total_downloaded,
+            )
+
+    if max_seen_last_modified is not None and release_mode == "incremental" and not stopped_by_max_files:
+        state.setdefault("last_modified_by_signature", {})[dataset_sig] = max_seen_last_modified
+        _save_state(state_path, state)
+        logger.info("Updated incremental state for %s to %s", dataset_sig, max_seen_last_modified)
+    elif release_mode == "incremental" and stopped_by_max_files:
+        logger.info("Skipped incremental state update because run ended early due to --max-files.")
 
     logger.info("=" * 70)
-    logger.info("Unified download complete. Downloaded files: %s", total_downloaded)
-    logger.info("Unified extraction complete. Extracted XML/NXML files: %s", total_extracted)
+    logger.info("PMC Cloud download complete. Scanned metadata rows: %s", scanned_entries)
+    logger.info("Rows included by release mode/cutoff: %s", included_entries)
+    logger.info("Metadata rows processed: %s", processed_entries)
+    logger.info("Downloaded XML files: %s", total_downloaded)
+    logger.info("Extracted-equivalent count: %s", total_extracted)
     return total_downloaded
 
 
@@ -261,7 +454,7 @@ def _parse_datasets(value: str) -> List[str]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download PMC OA + Author Manuscript bulk files from NCBI FTP")
+    parser = argparse.ArgumentParser(description="Download PMC OA + Author Manuscript XML files from PMC Cloud Service")
     parser.add_argument("--output-dir", type=Path, default=IngestionConfig.PMC_XML_DIR)
     parser.add_argument(
         "--datasets",
@@ -269,11 +462,25 @@ def main() -> None:
         default=list(REMOTE_DIRS.keys()),
         help="Comma-separated dataset keys: pmc_oa,author_manuscript",
     )
-    parser.add_argument("--max-files", type=int, default=None, help="Limit files per dataset")
+    parser.add_argument("--max-files", type=int, default=None, help="Stop after processing N eligible metadata rows")
+    parser.add_argument(
+        "--release-mode",
+        choices=RELEASE_MODES,
+        default="all",
+        help=(
+            "all=full scan, incremental=only inventory rows newer than previous run, "
+            "baseline=alias of all (not available in PMC Cloud layout)."
+        ),
+    )
     args = parser.parse_args()
 
     ensure_data_dirs()
-    download_pmc(output_dir=args.output_dir, datasets=args.datasets, max_files=args.max_files)
+    download_pmc(
+        output_dir=args.output_dir,
+        datasets=args.datasets,
+        release_mode=args.release_mode,
+        max_files=args.max_files,
+    )
 
 
 if __name__ == "__main__":

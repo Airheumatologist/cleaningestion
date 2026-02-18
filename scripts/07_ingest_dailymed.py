@@ -577,7 +577,7 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
 
 
 # Checkpoint file for DailyMed ingestion
-CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "dailymed_ingested_ids.txt"
+CHECKPOINT_FILE = IngestionConfig.DAILYMED_CHECKPOINT_FILE
 
 # Namespace for DailyMed checkpoint IDs to prevent collision with PMC/PubMed
 DAILYMED_CHECKPOINT_NAMESPACE = "dailymed"
