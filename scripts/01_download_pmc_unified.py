@@ -66,8 +66,8 @@ def _download_file_http(remote_path: str, local_path: Path, chunk_size: int = 10
         temp_path.unlink(missing_ok=True)
 
 
-def _extract_tar_gz(tar_path: Path, extract_dir: Path, delete_after: bool = True) -> int:
-    """Extract .tar.gz archive and return number of XML/NXML files extracted."""
+def _extract_tar_gz(tar_path: Path, extract_dir: Path, delete_after: bool = True) -> int | None:
+    """Extract .tar.gz archive and return extracted count, or None on failure."""
     extracted = 0
     logger.info("Extracting %s...", tar_path.name)
 
@@ -96,13 +96,13 @@ def _extract_tar_gz(tar_path: Path, extract_dir: Path, delete_after: bool = True
         return extracted
     except Exception as exc:
         logger.error("Failed to extract %s: %s", tar_path.name, exc)
-        return 0
+        return None
     finally:
         shutil.rmtree(tar_subdir, ignore_errors=True)
 
 
-def _extract_xml_gz(gz_path: Path, delete_after: bool = True) -> int:
-    """Extract .xml.gz archive and return 1 if successful else 0."""
+def _extract_xml_gz(gz_path: Path, delete_after: bool = True) -> int | None:
+    """Extract .xml.gz archive and return 1 on success, or None on failure."""
     output_path = gz_path.with_suffix("")
     try:
         logger.info("Extracting %s...", gz_path.name)
@@ -116,8 +116,9 @@ def _extract_xml_gz(gz_path: Path, delete_after: bool = True) -> int:
         logger.info("Extracted to %s", output_path.name)
         return 1
     except Exception as exc:
+        output_path.unlink(missing_ok=True)
         logger.error("Failed to extract %s: %s", gz_path.name, exc)
-        return 0
+        return None
 
 
 def _download_dataset(output_dir: Path, remote_dir: str, max_files: int | None = None) -> tuple[int, int]:
@@ -170,10 +171,23 @@ def _download_dataset(output_dir: Path, remote_dir: str, max_files: int | None =
             downloaded_now = 1
 
         extracted_now = 0
+        extraction_failed = False
         if remote_name.endswith(".tar.gz"):
-            extracted_now += _extract_tar_gz(local_path, output_dir, delete_after=True)
+            extracted = _extract_tar_gz(local_path, output_dir, delete_after=True)
+            if extracted is None:
+                extraction_failed = True
+            else:
+                extracted_now += extracted
         elif remote_name.endswith(".xml.gz"):
-            extracted_now += _extract_xml_gz(local_path, delete_after=True)
+            extracted = _extract_xml_gz(local_path, delete_after=True)
+            if extracted is None:
+                extraction_failed = True
+            else:
+                extracted_now += extracted
+
+        if extraction_failed:
+            logger.warning("Not marking as done due to extraction failure: %s", remote_name)
+            return downloaded_now, extracted_now
 
         marker_path.touch()
         return downloaded_now, extracted_now

@@ -25,20 +25,20 @@ Extracted Fields (Whitelist):
 
 Usage:
     # Full pipeline (download + filter)
-    python 20_download_pubmed_baseline.py --output-dir /data/pubmed_baseline
+    python 20_download_pubmed_baseline.py --output-dir /data/ingestion/pubmed_baseline
 
     # Filter only (if baseline already downloaded)
-    python 20_download_pubmed_baseline.py --output-dir /data/pubmed_baseline --filter-only
+    python 20_download_pubmed_baseline.py --output-dir /data/ingestion/pubmed_baseline --filter-only
     
     # Limit to year range
-    python 20_download_pubmed_baseline.py --output-dir /data/pubmed_baseline --min-year 2020
+    python 20_download_pubmed_baseline.py --output-dir /data/ingestion/pubmed_baseline --min-year 2020
 
 Expected Duration:
     Download: 2-3 hours (31GB compressed)
     Filter: 2-3 hours (~1.8M articles extracted)
 
 Output:
-    /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl
+    /data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 """
 
 import os
@@ -53,7 +53,7 @@ import re
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 import xml.etree.ElementTree as ET
 
 try:
@@ -75,7 +75,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 PUBMED_FTP_BASELINE = "ftp.ncbi.nlm.nih.gov::pubmed/baseline/"
-DEFAULT_OUTPUT_DIR = Path("/data/pubmed_baseline")
+DEFAULT_OUTPUT_DIR = Path(os.getenv("PUBMED_BASELINE_DIR", "/data/ingestion/pubmed_baseline"))
 DEFAULT_MIN_YEAR = 2015
 
 # Target publication types (case-insensitive matching)
@@ -150,7 +150,7 @@ GOV_AFFILIATION_PATTERNS = [
 ]
 
 
-def extract_gov_affiliations(article_elem: ET.Element) -> tuple[bool, list[str]]:
+def extract_gov_affiliations(article_elem: ET.Element) -> Tuple[bool, List[str]]:
     """
     Extract government affiliations from article.
     
@@ -192,7 +192,7 @@ def extract_gov_affiliations(article_elem: ET.Element) -> tuple[bool, list[str]]
     return is_gov, sorted(list(matched_agencies))
 
 
-def extract_agency_name(pattern: str, aff_text: str) -> str | None:
+def extract_agency_name(pattern: str, aff_text: str) -> Optional[str]:
     """Extract standardized agency name from matched pattern."""
     pattern_lower = pattern.lower()
     
@@ -289,6 +289,38 @@ def download_baseline(output_dir: Path) -> int:
     logger.info(f"Destination: {baseline_dir}")
     logger.info("This may take 2-3 hours depending on network speed...")
     logger.info("=" * 70)
+
+    def rsync_source_to_ftp_url(source: str) -> str:
+        """
+        Convert rsync daemon syntax (host::module/path) to ftp://host/module/path.
+        """
+        source = source.strip()
+        if source.startswith(("ftp://", "http://", "https://")):
+            return source if source.endswith("/") else source + "/"
+        if source.startswith("rsync://"):
+            ftp_url = "ftp://" + source[len("rsync://"):]
+            return ftp_url if ftp_url.endswith("/") else ftp_url + "/"
+        if "::" in source:
+            host, path = source.split("::", 1)
+            ftp_url = f"ftp://{host}/{path.lstrip('/')}"
+            return ftp_url if ftp_url.endswith("/") else ftp_url + "/"
+        ftp_url = f"ftp://{source.lstrip('/')}"
+        return ftp_url if ftp_url.endswith("/") else ftp_url + "/"
+
+    def run_wget_fallback() -> bool:
+        fallback_url = rsync_source_to_ftp_url(PUBMED_FTP_BASELINE)
+        logger.info(f"Trying wget fallback from: {fallback_url}")
+        wget_cmd = [
+            "wget", "-r", "-np", "-nd", "-c", "-N",
+            "-A", "*.xml.gz",
+            "-P", str(baseline_dir),
+            fallback_url,
+        ]
+        result = subprocess.run(wget_cmd, check=False)
+        if result.returncode != 0:
+            logger.error(f"wget fallback failed with code {result.returncode}")
+            return False
+        return True
     
     # Use rsync for efficient download with resume capability
     cmd = [
@@ -319,19 +351,14 @@ def download_baseline(output_dir: Path) -> int:
         
         if process.returncode != 0:
             logger.warning(f"rsync exited with code {process.returncode}")
-            # Try wget as fallback
-            logger.info("Trying wget as fallback...")
-            wget_cmd = [
-                "wget", "-r", "-np", "-nd", "-c", "-N",
-                "-A", "*.xml.gz",
-                "-P", str(baseline_dir),
-                f"ftp://{PUBMED_FTP_BASELINE}"
-            ]
-            subprocess.run(wget_cmd, check=False)
+            if not run_wget_fallback():
+                return 0
             
     except FileNotFoundError:
-        logger.error("rsync not found. Please install: sudo apt install rsync")
-        return 0
+        logger.warning("rsync not found; using wget fallback instead")
+        if not run_wget_fallback():
+            logger.error("Download failed. Please install rsync or wget and retry.")
+            return 0
     except Exception as e:
         logger.error(f"Download error: {e}")
         return 0
@@ -960,20 +987,20 @@ def main():
         epilog="""
 Examples:
     # Full pipeline (download + filter)
-    python 20_download_pubmed_baseline.py --output-dir /data/pubmed_baseline
+    python 20_download_pubmed_baseline.py --output-dir /data/ingestion/pubmed_baseline
     
     # Filter only (if already downloaded)
-    python 20_download_pubmed_baseline.py --output-dir /data/pubmed_baseline --filter-only
+    python 20_download_pubmed_baseline.py --output-dir /data/ingestion/pubmed_baseline --filter-only
     
     # Custom year range
-    python 20_download_pubmed_baseline.py --output-dir /data/pubmed_baseline --min-year 2020
+    python 20_download_pubmed_baseline.py --output-dir /data/ingestion/pubmed_baseline --min-year 2020
         """
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
-        help="Output directory (default: /data/pubmed_baseline)"
+        help=f"Output directory (default: {DEFAULT_OUTPUT_DIR})"
     )
     parser.add_argument(
         "--baseline-dir",

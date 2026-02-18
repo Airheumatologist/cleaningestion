@@ -36,6 +36,18 @@ from .retriever_qdrant import QdrantRetriever
 from .reranker import PaperFinderWithReranker
 from .prompts import ELIXIR_SYSTEM_PROMPT
 from .medical_entity_expander import MedicalEntityExpander
+try:
+    from scripts.ingestion_utils import get_evidence_hierarchy_levels
+except Exception:
+    def get_evidence_hierarchy_levels() -> Dict[str, Any]:
+        return {
+            "levels": [
+                {"grade": "A", "level": 1, "label": "Highest evidence", "terms": []},
+                {"grade": "B", "level": 2, "label": "High evidence", "terms": []},
+                {"grade": "C", "level": 3, "label": "Moderate evidence", "terms": []},
+                {"grade": "D", "level": 4, "label": "Lower evidence", "terms": []},
+            ]
+        }
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +109,7 @@ class MedicalRAGPipeline:
             context_threshold=context_threshold
         )
         logger.info("✅ Reranker initialized (DeepInfra Qwen3-Reranker-0.6B)")
+        self.evidence_hierarchy = get_evidence_hierarchy_levels()
         
         logger.info("✅ Pipeline initialized (Elixir direct synthesis)")
     
@@ -330,6 +343,10 @@ class MedicalRAGPipeline:
                 'year': p.get('year'),
                 'doi': p.get('doi', ''),
                 'article_type': p.get('article_type', ''),
+                'evidence_grade': p.get('evidence_grade'),
+                'evidence_level': p.get('evidence_level'),
+                'evidence_term': p.get('evidence_term'),
+                'evidence_source': p.get('evidence_source'),
                 'relevance_score': p.get('relevance_judgement', 0),
                 'abstract': p.get('abstract', ''),
                 'corpus_id': p.get('corpus_id', '')
@@ -370,11 +387,16 @@ class MedicalRAGPipeline:
                         'year': dm.get('year'),
                         'doi': dm.get('doi', ''),
                         'article_type': dm.get('article_type', 'drug_label'),
+                        'evidence_grade': dm.get('evidence_grade'),
+                        'evidence_level': dm.get('evidence_level'),
+                        'evidence_term': dm.get('evidence_term'),
+                        'evidence_source': dm.get('evidence_source'),
                         'relevance_score': 0.95,  # High score to appear near top
                         'abstract': dm.get('abstract', ''),
                         'corpus_id': pmcid,
                         'source': 'dailymed',
                         'set_id': dm.get('set_id', ''),
+                        'dailymed_sections': dm.get('dailymed_sections', {}),
                         # Include all 8 DailyMed sections for intelligent selection
                         'highlights': dm.get('highlights', ''),
                         'indications': dm.get('indications', ''),
@@ -724,20 +746,37 @@ class MedicalRAGPipeline:
             # DailyMed: Intelligent section selection
             if article_type == "drug_label" or row.get("source") == "dailymed":
                 sections = []
+                section_map = row.get("dailymed_sections", {})
+                if not isinstance(section_map, dict):
+                    section_map = {}
+
+                def _safe_text(value: Any) -> str:
+                    import math
+                    if value is None:
+                        return ""
+                    if isinstance(value, float) and math.isnan(value):
+                        return ""
+                    return str(value).strip()
+
+                def _get_dm_section(key: str) -> str:
+                    direct_val = _safe_text(row.get(key, ""))
+                    if direct_val:
+                        return direct_val
+                    return _safe_text(section_map.get(key, ""))
                 
                 # Always include highlights (summary + boxed warning)
-                highlights = row.get('highlights', '')
+                highlights = _get_dm_section("highlights")
                 if highlights:
                     sections.append(f"### Highlights of Prescribing Information\n{highlights[:8000]}")
                 
                 # Always include clinical studies (efficacy data, trial results)
-                clinical_studies = row.get('clinical_studies', '')
+                clinical_studies = _get_dm_section("clinical_studies")
                 if clinical_studies:
                     sections.append(f"### Clinical Studies\n{clinical_studies[:15000]}")
                 
                 # Conditionally include clinical pharmacology
                 if self._needs_clinical_pharmacology(query):
-                    clinical_pharm = row.get('clinical_pharmacology', '')
+                    clinical_pharm = _get_dm_section("clinical_pharmacology")
                     if clinical_pharm:
                         sections.append(f"### Clinical Pharmacology\n{clinical_pharm[:10000]}")
                 
@@ -1143,6 +1182,10 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "year": sanitize(p.get("year")),
             "doi": sanitize(p.get("doi"), ""),
             "article_type": sanitize(p.get("article_type"), ""),
+            "evidence_grade": sanitize(p.get("evidence_grade"), None),
+            "evidence_level": sanitize(p.get("evidence_level"), None),
+            "evidence_term": sanitize(p.get("evidence_term"), None),
+            "evidence_source": sanitize(p.get("evidence_source"), None),
             "relevance_score": sanitize(p.get("relevance_judgement", p.get("relevance_score", 0)), 0),
             "pdf_url": sanitize(p.get("pdf_url")), # Preserve if already present
             "source": source_type,
@@ -1189,6 +1232,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "answer": answer,
                 "sections": [],
                 "sources": [],
+                "evidence_hierarchy": self.evidence_hierarchy,
                 "status": "fallback"
             }
         
@@ -1213,6 +1257,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "answer": answer,
                 "sections": [],
                 "sources": [],
+                "evidence_hierarchy": self.evidence_hierarchy,
                 "status": "fallback"
             }
         
@@ -1240,6 +1285,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "answer": answer,
             "sections": [],  # Direct synthesis - no sections
             "sources": sources_with_pdf,
+            "evidence_hierarchy": self.evidence_hierarchy,
             "retrieval_stats": {
                 "passages_retrieved": len(passages),
                 "papers_after_aggregation": len(papers_df),
@@ -1290,6 +1336,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "report_title": "Clinical Response (No Sources)",
                 "answer": final_answer,
                 "sources": [],
+                "evidence_hierarchy": self.evidence_hierarchy,
                 "abstracts_used": 0
             }
             return
@@ -1319,7 +1366,8 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "step": "reranking",
             "status": "complete",
             "data": {"papers": len(papers_df)},
-            "sources": initial_sources  # Send sources early and in corrected order!
+            "sources": initial_sources,  # Send sources early and in corrected order!
+            "evidence_hierarchy": self.evidence_hierarchy,
         }
         
         if papers_df.empty:
@@ -1339,6 +1387,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "report_title": "Clinical Response (No Sources)",
                 "answer": final_answer,
                 "sources": initial_sources if initial_sources else [],
+                "evidence_hierarchy": self.evidence_hierarchy,
                 "abstracts_used": 0
             }
             return
@@ -1375,7 +1424,8 @@ Please provide a comprehensive clinical response based on your medical knowledge
                                 "step": "pdf_check", 
                                 "status": "complete", 
                                 "data": {"pdf_count": pdf_count},
-                                "sources": pdf_results # UPDATE SOURCES WITH PDFs NOW
+                                "sources": pdf_results, # UPDATE SOURCES WITH PDFs NOW
+                                "evidence_hierarchy": self.evidence_hierarchy,
                             }
                             pdf_yielded = True
                             logger.info(f"   ✅ PDF check yielded early ({pdf_count} PDFs found)")
@@ -1390,7 +1440,13 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 pdf_results = pdf_future.result()
 
         if not pdf_yielded:
-            yield {"step": "pdf_check", "status": "complete", "data": {"pdf_count": sum(1 for s in pdf_results if s.get("pdf_url"))}, "sources": pdf_results}
+            yield {
+                "step": "pdf_check",
+                "status": "complete",
+                "data": {"pdf_count": sum(1 for s in pdf_results if s.get("pdf_url"))},
+                "sources": pdf_results,
+                "evidence_hierarchy": self.evidence_hierarchy,
+            }
         yield {"step": "generation", "status": "complete"}
         
         # NO FILTERING: Show all sources that were provided as context
@@ -1406,6 +1462,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "report_title": "Clinical Response",
             "answer": answer,
             "sources": final_sources,
+            "evidence_hierarchy": self.evidence_hierarchy,
             "abstracts_used": len(used_papers),
             "original_sources_count": len(pdf_results)
         }

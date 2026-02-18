@@ -62,10 +62,10 @@ This creates indexes for:
 ```bash
 # Download PubMed baseline with gov affiliation extraction
 python scripts/20_download_pubmed_baseline.py \
-    --output-dir /data/pubmed_baseline \
+    --output-dir /data/ingestion/pubmed_baseline \
     --min-year 2015
 
-# Output: /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl
+# Output: /data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 # Now includes is_gov_affiliated and gov_agencies fields
 ```
 

@@ -34,8 +34,9 @@ from ingestion_utils import (
     generate_section_id,
     get_section_weight,
     get_chunker as get_shared_chunker,
-    detect_evidence_grade,
+    classify_evidence_metadata,
     get_evidence_level,
+    extract_gov_affiliations_from_pubmed_xml,
 )
 
 # Import enhanced utilities for semantic chunking
@@ -152,11 +153,18 @@ def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
                     break
 
             article_type = infer_article_type(pub_types)
-            evidence_grade = detect_evidence_grade(
+            evidence = classify_evidence_metadata(
                 article_type=article_type,
                 pub_types=pub_types,
                 abstract=abstract,
             )
+            evidence_grade = evidence["grade"]
+            evidence_level = evidence["level_1_4"]
+            evidence_term = evidence["matched_term"]
+            evidence_source = evidence["matched_from"]
+
+            # Extract government affiliations
+            is_gov_affiliated, gov_agencies = extract_gov_affiliations_from_pubmed_xml(elem)
 
             yield {
                 "pmid": pmid,
@@ -168,8 +176,13 @@ def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
                 "article_type": article_type,
                 "publication_type": pub_types[:5],
                 "evidence_grade": evidence_grade,
+                "evidence_level": evidence_level,
+                "evidence_term": evidence_term,
+                "evidence_source": evidence_source,
                 "source": "pubmed_abstract",
                 "has_full_text": False,
+                "is_gov_affiliated": is_gov_affiliated,
+                "gov_agencies": gov_agencies,
             }
 
             elem.clear()
@@ -259,7 +272,13 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 
                 # Evidence
                 "evidence_grade": article.get("evidence_grade", "C"),
-                "evidence_level": get_evidence_level(article.get("evidence_grade", "C")),
+                "evidence_level": article.get("evidence_level", get_evidence_level(article.get("evidence_grade", "C"))),
+                "evidence_term": article.get("evidence_term"),
+                "evidence_source": article.get("evidence_source", "fallback"),
+                
+                # Government Affiliation
+                "is_gov_affiliated": article.get("is_gov_affiliated", False),
+                "gov_agencies": article.get("gov_agencies", []),
                 
                 # Parent-child indexing fields
                 "section_title": f"Abstract (Part {i+1}/{len(text_chunks)})" if len(text_chunks) > 1 else "Abstract",

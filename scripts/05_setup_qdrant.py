@@ -139,6 +139,9 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
         "article_type": models.PayloadSchemaType.KEYWORD,
         "journal": models.PayloadSchemaType.KEYWORD,
         "evidence_grade": models.PayloadSchemaType.KEYWORD,
+        "evidence_level": models.PayloadSchemaType.INTEGER,
+        "evidence_term": models.PayloadSchemaType.KEYWORD,
+        "evidence_source": models.PayloadSchemaType.KEYWORD,
         "country": models.PayloadSchemaType.KEYWORD,
         "doc_id": models.PayloadSchemaType.KEYWORD,
         "chunk_id": models.PayloadSchemaType.KEYWORD,
@@ -146,6 +149,13 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
         # Merged PubMed pipeline - Government affiliation fields
         "is_gov_affiliated": models.PayloadSchemaType.KEYWORD,
         "gov_agencies": models.PayloadSchemaType.KEYWORD,
+        # PMC/PubMed identifiers (frequently queried)
+        "pmcid": models.PayloadSchemaType.KEYWORD,
+        "pmid": models.PayloadSchemaType.KEYWORD,
+        "is_author_manuscript": models.PayloadSchemaType.BOOL,
+        # DailyMed fields (frequently queried)
+        "set_id": models.PayloadSchemaType.KEYWORD,
+        "drug_name": models.PayloadSchemaType.KEYWORD,
     }
 
     for field_name, field_type in indexes.items():

@@ -208,6 +208,8 @@ def create_payload(article: Dict[str, Any], source_type: str) -> Dict[str, Any]:
         "article_type": metadata.get("article_type", "") if metadata else article.get("article_type", "")[:50],
         "evidence_grade": article.get("evidence_grade", ""),
         "evidence_level": article.get("evidence_level"),
+        "evidence_term": article.get("evidence_term"),
+        "evidence_source": article.get("evidence_source"),
         "country": country,
         "table_count": len(tables),
         "has_full_text": content_flags.get("has_full_text") if content_flags else article.get("has_full_text", False),
@@ -279,6 +281,11 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
         "country": country,
         "keywords": keywords,
         "mesh_terms": mesh_terms,
+        "article_type": article_payload.get("article_type", ""),
+        "evidence_grade": article_payload.get("evidence_grade", ""),
+        "evidence_level": article_payload.get("evidence_level"),
+        "evidence_term": article_payload.get("evidence_term"),
+        "evidence_source": article_payload.get("evidence_source"),
         "source": article_payload["source"],
         "source_family": article_payload["source_family"],
         "content_type": article_payload["content_type"],
@@ -476,18 +483,28 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     except Exception as e:
         logger.error("Embedding failed: %s", e)
         return [], []
+
+    sparse_vectors: List[Optional[Any]] = []
+    if sparse_encoder is not None:
+        try:
+            if hasattr(sparse_encoder, "encode_batch"):
+                sparse_vectors = sparse_encoder.encode_batch(all_texts)
+            else:
+                sparse_vectors = [sparse_encoder.encode_document(text) for text in all_texts]
+        except Exception as e:
+            logger.warning("Sparse encoding failed for batch: %s", e)
+            sparse_vectors = [None] * len(all_texts)
     
     # Create points
-    for chunk, vector in zip(all_chunks, vectors):
+    for idx, (chunk, vector) in enumerate(zip(all_chunks, vectors)):
         chunk_id = chunk["chunk_id"]
         all_chunk_ids.append(chunk_id)
         source_type = _normalize_source_type(chunk.get("source"))
         
         # Create sparse vector if enabled
         vector_data: Any = {"dense": vector}
-        if sparse_encoder is not None:
-            sparse_vector = sparse_encoder.encode_document(chunk["text"])
-            vector_data["sparse"] = sparse_vector
+        if sparse_encoder is not None and idx < len(sparse_vectors) and sparse_vectors[idx] is not None:
+            vector_data["sparse"] = sparse_vectors[idx]
         
         # Create payload with FULL metadata (CRITICAL: page_content for retriever)
         payload = {
@@ -508,6 +525,10 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             "country": chunk.get("country", ""),
             "keywords": chunk.get("keywords", []),
             "mesh_terms": chunk.get("mesh_terms", []),
+            "evidence_grade": chunk.get("evidence_grade", ""),
+            "evidence_level": chunk.get("evidence_level"),
+            "evidence_term": chunk.get("evidence_term"),
+            "evidence_source": chunk.get("evidence_source"),
             
             # Section information (PRD-compliant types)
             "section_type": chunk["section_type"],
@@ -529,7 +550,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             ),
             "is_author_manuscript": bool(chunk.get("is_author_manuscript", False)),
             "nihms_id": chunk.get("nihms_id"),
-            "article_type": chunk.get("section_type", "other"),
+            "article_type": chunk.get("article_type", "other"),
             "has_full_text": chunk.get("has_full_text", True),
             "is_open_access": chunk.get("is_open_access"),
             
@@ -564,12 +585,14 @@ def process_batch(
     processed_lock: threading.Lock,
     xml_root: Path,
     sparse_encoder=None,
+    delete_source: bool = False,
 ) -> tuple[int, int]:
     """Process a batch of XML files in a single thread."""
     from scripts.ingestion_utils import parse_pmc_xml
     
     articles: List[Dict[str, Any]] = []
     new_ids: List[str] = []
+    processed_files: List[Path] = []  # Track files for potential deletion
     
     # 1. Parse all files in this batch
     for xml_path in batch_files:
@@ -607,6 +630,7 @@ def process_batch(
             # If we get here, it's a new article
             articles.append(article)
             new_ids.append(namespaced_id)
+            processed_files.append(xml_path)  # Track for potential deletion
         except Exception as e:
             logger.error("Failed to parse %s: %s", xml_path.name, e)
 
@@ -628,6 +652,15 @@ def process_batch(
         append_checkpoint(checkpoint_ids)
         with processed_lock:
             processed_ids.update(checkpoint_ids)
+        
+        # 5. Delete source files if requested (after successful ingestion)
+        if delete_source:
+            for xml_path in processed_files:
+                try:
+                    xml_path.unlink()
+                    logger.debug("Deleted source file: %s", xml_path)
+                except OSError as e:
+                    logger.warning("Failed to delete %s: %s", xml_path, e)
             
         return len(points), len(batch_files) - len(articles) # inserted, skipped
     except Exception as e:
@@ -635,8 +668,11 @@ def process_batch(
         return 0, 0
 
 
-def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provider: EmbeddingProvider) -> None:
+def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_source: bool = False) -> None:
     ensure_data_dirs()
+    
+    if delete_source:
+        logger.warning("Source file deletion enabled: XML files will be deleted after successful ingestion")
     
     # Preload tokenizer once in main thread to avoid race conditions in workers
     logger.info("Preloading tokenizer...")
@@ -712,6 +748,7 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
                     processed_lock,
                     xml_dir,
                     sparse_encoder,
+                    delete_source,
                 ): batch
                 for batch in current_super_batch
             }
@@ -738,10 +775,9 @@ def run_ingestion(xml_dir: Path, articles_file: Optional[Path], embedding_provid
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest PMC into self-hosted Qdrant with improved section/table handling")
-    parser.add_argument("--articles-file", type=Path, default=None, help="Path to pre-extracted JSONL")
     parser.add_argument("--xml-dir", type=Path, default=IngestionConfig.PMC_XML_DIR, help="Directory with .xml/.xml.gz")
     parser.add_argument("--delete-source", action="store_true", help="Delete XML file after successful ingestion")
     args = parser.parse_args()
 
     provider = EmbeddingProvider()
-    run_ingestion(args.xml_dir, args.articles_file, provider)
+    run_ingestion(args.xml_dir, provider, delete_source=args.delete_source)

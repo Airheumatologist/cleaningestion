@@ -24,7 +24,7 @@ Payload Structure:
 - Chunking: chunk_index, total_chunks, parent_section_id
 
 Usage:
-    python 21_ingest_pubmed_abstracts.py --input /data/pubmed_baseline/filtered/pubmed_abstracts.jsonl
+    python 21_ingest_pubmed_abstracts.py --input /data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 """
 
 import argparse
@@ -51,8 +51,7 @@ from ingestion_utils import (
     Chunker as BaseChunker,
     EmbeddingProvider,
     upsert_with_retry,
-    detect_evidence_grade,
-    get_evidence_level,
+    classify_evidence_metadata,
     get_chunker as get_shared_chunker,
     load_checkpoint as load_checkpoint_file,
     append_checkpoint as append_checkpoint_file,
@@ -83,6 +82,37 @@ else:
     BM25SparseEncoder = None  # type: ignore
 
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
+
+# Namespace for PubMed checkpoint IDs to prevent collision with PMC/DailyMed
+PUBMED_CHECKPOINT_NAMESPACE = "pubmed"
+
+
+def _checkpoint_id(pmid: str) -> str:
+    """Generate namespaced checkpoint ID for PubMed abstracts."""
+    return f"{PUBMED_CHECKPOINT_NAMESPACE}:{pmid.strip()}"
+
+
+def _resolve_checkpoint_line(line: str) -> str | None:
+    """Resolve checkpoint line to namespaced ID, handling legacy plain PMIDs."""
+    value = line.strip()
+    if not value:
+        return None
+    
+    # Already namespaced
+    if value.startswith(f"{PUBMED_CHECKPOINT_NAMESPACE}:"):
+        return value
+    
+    # Legacy format (plain PMID) - convert to namespaced
+    return _checkpoint_id(value)
+
+
+def load_checkpoint_namespaced(path: Path) -> set[str]:
+    """Load checkpoint with legacy format support."""
+    return {
+        resolved
+        for line in load_checkpoint_file(path)
+        if (resolved := _resolve_checkpoint_line(line)) is not None
+    }
 
 # Note: Tokenizer is handled by the shared Chunker class from ingestion_utils
 # We use Chunker's token counting for consistency across all ingestion scripts
@@ -162,12 +192,15 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
     else:
         pub_types_flat = pub_types_data if pub_types_data else []
 
-    evidence_grade = detect_evidence_grade(
+    evidence = classify_evidence_metadata(
         article_type=article_type,
         pub_types=pub_types_flat,
         abstract=abstract,
     )
-    evidence_level = get_evidence_level(evidence_grade)
+    evidence_grade = evidence["grade"]
+    evidence_level = evidence["level_1_4"]
+    evidence_term = evidence["matched_term"]
+    evidence_source = evidence["matched_from"]
     
     # Base section ID (for single chunk or parent reference)
     base_section_id = hashlib.sha256(f"{pmid}:Abstract".encode()).hexdigest()[:16]
@@ -221,6 +254,8 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
             # Evidence
             "evidence_grade": evidence_grade,
             "evidence_level": evidence_level,
+            "evidence_term": evidence_term,
+            "evidence_source": evidence_source,
             
             # Classification
             "mesh_terms": mesh_flat,
@@ -307,6 +342,8 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
                 # Evidence
                 "evidence_grade": evidence_grade,
                 "evidence_level": evidence_level,
+                "evidence_term": evidence_term,
+                "evidence_source": evidence_source,
                 
                 # Classification (only in first chunk to save space)
                 "mesh_terms": mesh_flat if i == 0 else [],
@@ -433,15 +470,25 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         logger.error("Embedding failed: %s", e)
         return [], []
 
+    sparse_vectors: List[Optional[Any]] = []
+    if sparse_encoder:
+        try:
+            if hasattr(sparse_encoder, "encode_batch"):
+                sparse_vectors = sparse_encoder.encode_batch(texts_to_embed)
+            else:
+                sparse_vectors = [sparse_encoder.encode_document(text) for text in texts_to_embed]
+        except Exception as e:
+            logger.warning("Sparse encoding failed for batch: %s", e)
+            sparse_vectors = [None] * len(texts_to_embed)
+
     # Create points
-    for meta, vector in zip(text_metas, vectors):
+    for idx, (meta, vector) in enumerate(zip(text_metas, vectors)):
         pmid = meta["pmid"]
         
         # Sparse vector
         vector_data: Any = {"dense": vector}
-        if sparse_encoder:
-            sparse_vector = sparse_encoder.encode_document(meta["text"])
-            vector_data["sparse"] = sparse_vector
+        if sparse_encoder and idx < len(sparse_vectors) and sparse_vectors[idx] is not None:
+            vector_data["sparse"] = sparse_vectors[idx]
             
         # Point ID (deterministic from chunk_id for uniqueness)
         chunk_id = meta["payload"].get("chunk_id", f"{pmid}_abstract")
@@ -467,7 +514,9 @@ def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_p
                                    validate_chunks=validate_chunks, dedup_chunks=dedup_chunks)
         if points:
             upsert_with_retry(client, points)
-            append_checkpoint_file(CHECKPOINT_FILE, ids)
+            # Convert plain PMIDs to namespaced checkpoint IDs
+            checkpoint_ids = [_checkpoint_id(pmid) for pmid in ids]
+            append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
             return len(points)
     except Exception as e:
         logger.error("Batch processing failed: %s", e)
@@ -520,7 +569,7 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
             remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
         )
 
-    processed_ids = load_checkpoint_file(CHECKPOINT_FILE)
+    processed_ids = load_checkpoint_namespaced(CHECKPOINT_FILE)
     logger.info("Loaded checkpoint with %d IDs", len(processed_ids))
     logger.info("Chunking config: size=%d, overlap=%d, chunker=%s, validation=%s, dedup=%s", 
                 IngestionConfig.CHUNK_SIZE_TOKENS, 
@@ -558,7 +607,8 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                     continue
 
                 pmid = str(article.get("pmid"))
-                if pmid in processed_ids:
+                checkpoint_id = _checkpoint_id(pmid)
+                if checkpoint_id in processed_ids:
                     continue
 
                 current_batch.append(article)

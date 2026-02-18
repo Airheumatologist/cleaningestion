@@ -165,6 +165,15 @@ class QdrantRetriever(AbstractRetriever):
         """Stable document ID for paper-level aggregation."""
         return str(payload.get("pmcid") or payload.get("doc_id") or payload.get("pmid") or "")
 
+    def _extract_evidence_metadata(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract normalized evidence metadata from Qdrant payload."""
+        return {
+            "evidence_grade": payload.get("evidence_grade"),
+            "evidence_level": payload.get("evidence_level"),
+            "evidence_term": payload.get("evidence_term"),
+            "evidence_source": payload.get("evidence_source"),
+        }
+
     def _embed_query(self, query: str, use_instruction: bool = True):
         """
         Embed a single query using the configured embedding provider.
@@ -406,6 +415,7 @@ class QdrantRetriever(AbstractRetriever):
                     "article_type": point.payload.get("article_type", ""),
                     "score": point.score,
                     "stype": "vector_search",
+                    **self._extract_evidence_metadata(point.payload),
                     # Government affiliation (merged from gov pipeline)
                     "is_gov_affiliated": point.payload.get("is_gov_affiliated", False),
                     "gov_agencies": point.payload.get("gov_agencies", []),
@@ -581,7 +591,8 @@ class QdrantRetriever(AbstractRetriever):
                     "score": combined_scores[key],
                     "dense_score": dense_scores.get(key, 0),
                     "sparse_score": sparse_scores.get(key, 0),
-                    "stype": "hybrid_search"
+                    "stype": "hybrid_search",
+                    **self._extract_evidence_metadata(point.payload),
                 }
             
             passages.append(passage)
@@ -773,7 +784,8 @@ class QdrantRetriever(AbstractRetriever):
                     "authors": self._parse_authors(point.payload.get("authors")),
                     "article_type": point.payload.get("article_type", ""),
                     "score": combined_scores[key],
-                    "stype": "batch_hybrid_search"
+                    "stype": "batch_hybrid_search",
+                    **self._extract_evidence_metadata(point.payload),
                 }
             all_passages.append(passage)
         
@@ -860,7 +872,8 @@ class QdrantRetriever(AbstractRetriever):
                         "authors": self._parse_authors(point.payload.get("authors")),
                         "article_type": point.payload.get("article_type", ""),
                         "score": point.score,
-                        "stype": "keyword_search"
+                        "stype": "keyword_search",
+                        **self._extract_evidence_metadata(point.payload),
                     }
                 papers.append(paper)
 
@@ -998,7 +1011,10 @@ class QdrantRetriever(AbstractRetriever):
     
     def _fetch_dailymed_by_set_id(self, set_id: str) -> Optional[Dict[str, Any]]:
         """
-        Fetch a DailyMed drug label from Qdrant by its set_id.
+        Fetch and aggregate a full DailyMed drug label from Qdrant by set_id.
+
+        DailyMed ingestion stores section chunks per point, so this method scrolls
+        all points for the set_id and reconstructs section-level fields.
         """
         try:
             filter_by_id = Filter(
@@ -1007,17 +1023,34 @@ class QdrantRetriever(AbstractRetriever):
                     FieldCondition(key="set_id", match=MatchValue(value=set_id)),
                 ]
             )
-            
-            results, _ = self.client.scroll(
-                collection_name=self.collection_name,
-                scroll_filter=filter_by_id,
-                limit=1,
-                with_payload=True
-            )
-            
-            if results:
-                passage = self._transform_dailymed_payload(results[0].payload, 1.0)
+
+            all_payloads: List[Dict[str, Any]] = []
+            next_offset = None
+
+            while True:
+                results, next_offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=filter_by_id,
+                    offset=next_offset,
+                    limit=256,
+                    with_payload=True,
+                )
+
+                if not results:
+                    break
+
+                for point in results:
+                    if point.payload:
+                        all_payloads.append(point.payload)
+
+                if next_offset is None:
+                    break
+
+            if all_payloads:
+                aggregated_payload = self._aggregate_dailymed_payloads(all_payloads)
+                passage = self._transform_dailymed_payload(aggregated_payload, 1.0)
                 passage["stype"] = "dailymed_lookup"
+                passage["retrieved_chunks"] = len(all_payloads)
                 return passage
                 
         except Exception as e:
@@ -1056,15 +1089,29 @@ class QdrantRetriever(AbstractRetriever):
                 query=sparse_query,
                 using="sparse",
                 query_filter=source_filter,
-                limit=limit,
+                limit=max(limit * 8, 40),
                 with_payload=True
             )
             
             passages = []
+            seen_set_ids = set()
             for point in search_results.points:
-                passage = self._transform_dailymed_payload(point.payload, point.score)
-                passage["stype"] = "dailymed_bm25"
-                passages.append(passage)
+                payload = point.payload or {}
+                set_id = payload.get("set_id")
+                if not set_id or set_id in seen_set_ids:
+                    continue
+
+                full_label = self._fetch_dailymed_by_set_id(set_id)
+                if not full_label:
+                    continue
+
+                full_label["score"] = point.score
+                full_label["stype"] = "dailymed_bm25"
+                passages.append(full_label)
+                seen_set_ids.add(set_id)
+
+                if len(passages) >= limit:
+                    break
             
             if passages:
                 logger.info(f"   BM25 found {len(passages)} results for '{drug_name}' (top score: {passages[0]['score']:.3f})")
@@ -1086,22 +1133,38 @@ class QdrantRetriever(AbstractRetriever):
                 ],
                 should=[
                     FieldCondition(key="drug_name", match=MatchText(text=drug_name)),
-                    FieldCondition(key="highlights", match=MatchText(text=drug_name)),
+                    FieldCondition(key="text", match=MatchText(text=drug_name)),
+                    FieldCondition(key="page_content", match=MatchText(text=drug_name)),
+                    FieldCondition(key="section_title", match=MatchText(text=drug_name)),
                 ]
             )
             
             results, _ = self.client.scroll(
                 collection_name=self.collection_name,
                 scroll_filter=keyword_filter,
-                limit=limit,
+                limit=max(limit * 10, 50),
                 with_payload=True
             )
             
             passages = []
+            seen_set_ids = set()
             for point in results:
-                passage = self._transform_dailymed_payload(point.payload, 0.95)
-                passage["stype"] = "dailymed_matchtext"
-                passages.append(passage)
+                payload = point.payload or {}
+                set_id = payload.get("set_id")
+                if not set_id or set_id in seen_set_ids:
+                    continue
+
+                full_label = self._fetch_dailymed_by_set_id(set_id)
+                if not full_label:
+                    continue
+
+                full_label["score"] = 0.95
+                full_label["stype"] = "dailymed_matchtext"
+                passages.append(full_label)
+                seen_set_ids.add(set_id)
+
+                if len(passages) >= limit:
+                    break
             
             if passages:
                 logger.info(f"   MatchText fallback found {len(passages)} results for '{drug_name}'")
@@ -1260,29 +1323,164 @@ class QdrantRetriever(AbstractRetriever):
         
         return scores
     
+    def _aggregate_dailymed_payloads(self, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Aggregate chunk-level DailyMed payloads into one label-level payload.
+        """
+        if not payloads:
+            return {}
+
+        section_keys = [
+            "highlights",
+            "boxed_warning",
+            "indications",
+            "dosage",
+            "contraindications",
+            "warnings",
+            "adverse_reactions",
+            "interactions",
+            "use_in_specific_populations",
+            "clinical_pharmacology",
+            "clinical_studies",
+        ]
+
+        section_buckets: Dict[str, List[Any]] = {k: [] for k in section_keys}
+        set_id = ""
+        drug_name = ""
+        manufacturer = ""
+        title = ""
+        evidence_meta = {}
+
+        for payload in payloads:
+            if not set_id:
+                set_id = str(payload.get("set_id", "")).strip()
+            if not drug_name:
+                drug_name = str(payload.get("drug_name") or payload.get("title") or "").strip()
+            if not manufacturer:
+                manufacturer = str(payload.get("manufacturer", "")).strip()
+            if not title:
+                title = str(payload.get("title", "")).strip()
+
+            for key in ("evidence_grade", "evidence_level", "evidence_term", "evidence_source"):
+                if key not in evidence_meta and payload.get(key) is not None:
+                    evidence_meta[key] = payload.get(key)
+
+            section_type = str(payload.get("section_type", "")).strip().lower()
+            table_type = str(payload.get("table_type", "")).strip().lower()
+            section_key = table_type if section_type == "table" and table_type else section_type
+            chunk_text = str(payload.get("text") or payload.get("page_content") or "").strip()
+            chunk_id = str(payload.get("chunk_id") or "")
+            try:
+                chunk_index = int(payload.get("chunk_index", 0))
+            except Exception:
+                chunk_index = 0
+
+            if section_key in section_buckets and chunk_text:
+                section_buckets[section_key].append((chunk_index, chunk_id, chunk_text))
+
+            # Support old/wide payload format too.
+            for wide_key in section_keys:
+                wide_text = str(payload.get(wide_key, "")).strip()
+                if wide_text:
+                    section_buckets[wide_key].append((0, f"wide:{wide_key}", wide_text))
+
+        section_texts: Dict[str, str] = {}
+        for key, entries in section_buckets.items():
+            if not entries:
+                continue
+
+            entries.sort(key=lambda item: (item[0], item[1]))
+            seen_text = set()
+            ordered_parts = []
+            for _, _, text in entries:
+                norm = text.strip()
+                if not norm or norm in seen_text:
+                    continue
+                seen_text.add(norm)
+                ordered_parts.append(norm)
+
+            if ordered_parts:
+                section_texts[key] = "\n\n".join(ordered_parts)
+
+        # Boxed warning should be included in highlights block when present.
+        boxed_warning = section_texts.get("boxed_warning", "")
+        highlights = section_texts.get("highlights", "")
+        if boxed_warning:
+            if highlights:
+                section_texts["highlights"] = f"{boxed_warning}\n\n{highlights}"
+            else:
+                section_texts["highlights"] = boxed_warning
+
+        merged = {
+            "set_id": set_id,
+            "drug_name": drug_name or title,
+            "title": title or drug_name,
+            "manufacturer": manufacturer,
+            "source": "dailymed",
+            "article_type": "drug_label",
+            "dailymed_sections": section_texts,
+            **evidence_meta,
+        }
+        merged.update(section_texts)
+        return merged
+
     def _transform_dailymed_payload(self, payload: Dict[str, Any], score: float) -> Dict[str, Any]:
         """
-        Transform DailyMed payload to match PMC schema expected by pipeline.
-        
-        Uses all 8 sections when available (40K each):
-        highlights, indications, dosage, contraindications, warnings, 
-        adverse_reactions, clinical_pharmacology, clinical_studies
+        Transform DailyMed payload (chunk-level or label-level) into pipeline schema.
         """
         set_id = payload.get("set_id", "")
         drug_name = payload.get("drug_name", payload.get("title", "Unknown Drug"))
         manufacturer = payload.get("manufacturer", "")
-        
-        # Extract all 8 fields
-        highlights = payload.get("highlights", "")
-        indications = payload.get("indications", "")
-        dosage = payload.get("dosage", "")
-        contraindications = payload.get("contraindications", "")
-        warnings = payload.get("warnings", "")
-        adverse_reactions = payload.get("adverse_reactions", "")
-        clinical_pharmacology = payload.get("clinical_pharmacology", "")
-        clinical_studies = payload.get("clinical_studies", "")
-        
-        # Build comprehensive content from all available sections
+
+        # Build a section map from wide fields or chunk-derived section data.
+        section_map = {}
+        existing_sections = payload.get("dailymed_sections", {})
+        if isinstance(existing_sections, dict):
+            for key, value in existing_sections.items():
+                text_val = str(value).strip()
+                if text_val:
+                    section_map[key] = text_val
+
+        for key in (
+            "highlights",
+            "boxed_warning",
+            "indications",
+            "dosage",
+            "contraindications",
+            "warnings",
+            "adverse_reactions",
+            "interactions",
+            "use_in_specific_populations",
+            "clinical_pharmacology",
+            "clinical_studies",
+        ):
+            text_val = str(payload.get(key, "")).strip()
+            if text_val:
+                section_map[key] = text_val
+
+        section_type = str(payload.get("section_type", "")).strip().lower()
+        table_type = str(payload.get("table_type", "")).strip().lower()
+        section_key = table_type if section_type == "table" and table_type else section_type
+        chunk_text = str(payload.get("text") or payload.get("page_content") or "").strip()
+        if section_key and chunk_text and section_key not in section_map:
+            section_map[section_key] = chunk_text
+
+        if section_map.get("boxed_warning"):
+            if section_map.get("highlights"):
+                section_map["highlights"] = f"{section_map['boxed_warning']}\n\n{section_map['highlights']}"
+            else:
+                section_map["highlights"] = section_map["boxed_warning"]
+
+        highlights = section_map.get("highlights", "")
+        indications = section_map.get("indications", "")
+        dosage = section_map.get("dosage", "")
+        contraindications = section_map.get("contraindications", "")
+        warnings = section_map.get("warnings", "")
+        adverse_reactions = section_map.get("adverse_reactions", "")
+        clinical_pharmacology = section_map.get("clinical_pharmacology", "")
+        clinical_studies = section_map.get("clinical_studies", "")
+
+        # Build comprehensive content from available sections.
         content_parts = []
         
         if drug_name:
@@ -1313,6 +1511,15 @@ class QdrantRetriever(AbstractRetriever):
         
         if clinical_studies:
             content_parts.append(f"\n## Clinical Studies\n{clinical_studies}")
+
+        extra_sections = [
+            ("interactions", "Drug Interactions"),
+            ("use_in_specific_populations", "Use in Specific Populations"),
+        ]
+        for key, title in extra_sections:
+            text_val = section_map.get(key, "")
+            if text_val:
+                content_parts.append(f"\n## {title}\n{text_val}")
         
         final_content = "\n".join(content_parts)
         
@@ -1331,10 +1538,14 @@ class QdrantRetriever(AbstractRetriever):
             "article_type": "drug_label",
             "score": score,
             "stype": "vector_search",
+            "evidence_grade": payload.get("evidence_grade"),
+            "evidence_level": payload.get("evidence_level"),
+            "evidence_term": payload.get("evidence_term"),
+            "evidence_source": payload.get("evidence_source"),
             "source": "dailymed",
             "set_id": set_id,
             "drug_name": drug_name,
-            # All 8 fields
+            "dailymed_sections": section_map,
             "highlights": highlights,
             "indications": indications,
             "dosage": dosage,

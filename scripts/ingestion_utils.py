@@ -147,6 +147,13 @@ EVIDENCE_HIERARCHY = {
     'comment': ('D', 6),
 }
 
+EVIDENCE_GRADE_LABELS = {
+    "A": "Highest evidence",
+    "B": "High evidence",
+    "C": "Moderate evidence",
+    "D": "Lower evidence",
+}
+
 class SectionFilter:
     EXCLUDED_TYPES = {
         "references", "bibliography", "acknowledgments", "funding",
@@ -545,16 +552,9 @@ def extract_tables(root: ET.Element) -> List[Dict[str, Any]]:
     return tables
 
 def classify_evidence_grade(article_type: str, pub_types: List[str]) -> tuple:
-    article_type_lower = article_type.lower().replace("_", "-").replace(" ", "-")
-    pub_types_lower = [pt.lower() for pt in pub_types]
-    
-    for pattern, (grade, level) in EVIDENCE_HIERARCHY.items():
-        if pattern in article_type_lower:
-            return grade, level
-        for pt in pub_types_lower:
-            if pattern in pt:
-                return grade, level
-    return "B", 3
+    """Backward-compatible wrapper returning (grade, normalized_level_1_4)."""
+    result = classify_evidence_metadata(article_type=article_type, pub_types=pub_types, abstract=None)
+    return result["grade"], result["level_1_4"]
 
 def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access: bool = True) -> Optional[Dict[str, Any]]:
     """
@@ -644,7 +644,16 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
 
         # === 7. Evidence Grade (existing functionality) ===
         pub_types = [get_text(s) for s in root.xpath(".//article-categories//subject")]
-        evidence_grade, evidence_level = classify_evidence_grade(article_type, pub_types)
+        abstract_text = _extract_abstract(article_meta)
+        evidence = classify_evidence_metadata(
+            article_type=article_type,
+            pub_types=pub_types,
+            abstract=abstract_text,
+        )
+        evidence_grade = evidence["grade"]
+        evidence_level = evidence["level_1_4"]
+        evidence_term = evidence["matched_term"]
+        evidence_source = evidence["matched_from"]
 
         # === Build Output Structure per PRD Section 3 ===
         output = {
@@ -700,7 +709,7 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
             "doi": identifiers.get("doi"),
             "nihms_id": identifiers.get("nihms_id"),
             "title": article_title,
-            "abstract": _extract_abstract(article_meta),
+            "abstract": abstract_text,
             "full_text": body_text if has_full_text else "",
             "structured_sections": sections,  # Renamed for clarity
             "section_titles": [s["title"] for s in sections],
@@ -720,6 +729,8 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
             "country": country_code or country_name,
             "evidence_grade": evidence_grade,
             "evidence_level": evidence_level,
+            "evidence_term": evidence_term,
+            "evidence_source": evidence_source,
             "article_type": article_type,
             "publication_type_list": pub_types,
             "is_open_access": is_open_access,
@@ -1493,77 +1504,79 @@ def append_checkpoint(checkpoint_file: Path, ids: Iterable[str]) -> None:
                 f.write(f"{id_val}\n")
 
 
-def detect_evidence_grade(article_type: str, pub_types: Optional[List[str]] = None,
-                          abstract: Optional[str] = None) -> str:
+def _build_evidence_result(grade: str, matched_term: Optional[str], matched_from: str) -> Dict[str, Any]:
+    """Build normalized evidence metadata shared by ingestion and serving paths."""
+    return {
+        "grade": grade,
+        "level_1_4": get_evidence_level(grade),
+        "matched_term": matched_term,
+        "matched_from": matched_from,
+    }
+
+
+def classify_evidence_metadata(article_type: str, pub_types: Optional[List[str]] = None,
+                               abstract: Optional[str] = None) -> Dict[str, Any]:
     """
-    Detect evidence grade based on article type, publication types, and abstract content.
-    
-    This function unifies the duplicate detect_evidence_grade() implementations
-    across scripts 06, 07, 12, 21, and 08_monthly_update with different logic.
-    
-    Evidence Grades:
-        A: Highest evidence (guidelines, systematic reviews, meta-analyses)
-        B: High evidence (RCTs, clinical trials)
-        C: Moderate evidence (cohort studies, review articles, research articles)
-        D: Lower evidence (case reports, editorials, letters)
-    
-    Args:
-        article_type: The article type (e.g., 'research-article', 'review-article')
-        pub_types: Optional list of publication types from XML
-        abstract: Optional abstract text for content-based detection
-        
+    Classify evidence with normalized metadata for storage and frontend display.
+
     Returns:
-        Evidence grade as a string ('A', 'B', 'C', or 'D')
+        Dict with keys:
+            - grade: Evidence grade ('A'|'B'|'C'|'D')
+            - level_1_4: Normalized level (1=A, 2=B, 3=C, 4=D)
+            - matched_term: Source term that triggered classification (or None)
+            - matched_from: 'article_type'|'publication_type'|'abstract'|'fallback'
     """
     article_type_lower = (article_type or "").lower().replace("_", "-").replace(" ", "-")
     pub_types_lower = [p.lower() for p in (pub_types or [])]
     abstract_lower = (abstract or "").lower()
-    
+
     # Priority 1: Check EVIDENCE_HIERARCHY for article_type patterns
     for pattern, (grade, _) in EVIDENCE_HIERARCHY.items():
         pattern_normalized = pattern.lower().replace("_", "-")
         if pattern_normalized in article_type_lower:
-            return grade
-    
+            return _build_evidence_result(grade, pattern, "article_type")
+
     # Priority 2: Check publication types
     for pub_type in pub_types_lower:
         for pattern, (grade, _) in EVIDENCE_HIERARCHY.items():
             pattern_normalized = pattern.lower().replace("_", "-")
             if pattern_normalized in pub_type:
-                return grade
-    
+                return _build_evidence_result(grade, pattern, "publication_type")
+
     # Priority 3: Content-based detection from abstract
     if abstract_lower:
-        # Highest evidence (A)
         if any(x in abstract_lower for x in ["systematic review", "meta-analysis", "meta analysis"]):
-            return "A"
+            return _build_evidence_result("A", "systematic review", "abstract")
         if "guideline" in abstract_lower:
-            return "A"
-        
-        # High evidence (B) - RCT indicators
+            return _build_evidence_result("A", "guideline", "abstract")
+
         if any(x in abstract_lower for x in ["randomized controlled trial", "randomised controlled trial"]):
-            return "B"
+            return _build_evidence_result("B", "randomized controlled trial", "abstract")
         if "rct" in abstract_lower:
-            return "B"
+            return _build_evidence_result("B", "rct", "abstract")
         if "randomized trial" in abstract_lower and "phase" in abstract_lower:
-            return "B"
-        
-        # Moderate evidence (C) - cohort study indicators
+            return _build_evidence_result("B", "randomized trial + phase", "abstract")
+
         if any(x in abstract_lower for x in ["cohort study", "prospective study", "observational study"]):
-            return "C"
-    
+            return _build_evidence_result("C", "cohort study", "abstract")
+
     # Priority 4: Article type fallbacks
     if article_type_lower in ("systematic-review", "meta-analysis", "guideline", "practice-guideline"):
-        return "A"
+        return _build_evidence_result("A", article_type_lower or None, "fallback")
     if article_type_lower in ("clinical-trial", "randomized-controlled-trial", "review-article", "review"):
-        return "B"
+        return _build_evidence_result("B", article_type_lower or None, "fallback")
     if article_type_lower in ("research-article", "journal-article", "article"):
-        return "C"
+        return _build_evidence_result("C", article_type_lower or None, "fallback")
     if article_type_lower in ("case-report", "case-series", "editorial", "letter", "news"):
-        return "D"
-    
-    # Default to moderate evidence
-    return "C"
+        return _build_evidence_result("D", article_type_lower or None, "fallback")
+
+    return _build_evidence_result("C", article_type_lower or None, "fallback")
+
+
+def detect_evidence_grade(article_type: str, pub_types: Optional[List[str]] = None,
+                          abstract: Optional[str] = None) -> str:
+    """Backward-compatible wrapper that returns only evidence grade."""
+    return classify_evidence_metadata(article_type=article_type, pub_types=pub_types, abstract=abstract)["grade"]
 
 
 def get_evidence_level(grade: str) -> int:
@@ -1577,3 +1590,176 @@ def get_evidence_level(grade: str) -> int:
         Numeric level (1=A, 2=B, 3=C, 4=D)
     """
     return {"A": 1, "B": 2, "C": 3, "D": 4}.get(grade.upper(), 3)
+
+
+def get_evidence_hierarchy_levels() -> Dict[str, Any]:
+    """
+    Build frontend-facing evidence hierarchy payload from canonical term mapping.
+
+    Returns:
+        {
+            "levels": [
+                {"grade": "A", "level": 1, "label": "...", "terms": [...]},
+                ...
+            ]
+        }
+    """
+    terms_by_grade: Dict[str, List[str]] = {"A": [], "B": [], "C": [], "D": []}
+    for term, (grade, _) in EVIDENCE_HIERARCHY.items():
+        if grade in terms_by_grade and term not in terms_by_grade[grade]:
+            terms_by_grade[grade].append(term)
+
+    levels = []
+    for grade in ("A", "B", "C", "D"):
+        levels.append({
+            "grade": grade,
+            "level": get_evidence_level(grade),
+            "label": EVIDENCE_GRADE_LABELS[grade],
+            "terms": terms_by_grade[grade],
+        })
+
+    return {"levels": levels}
+
+
+# ============================================================================
+# Government Affiliation Extraction
+# ============================================================================
+
+# Government affiliation patterns for detecting US government-authored articles
+GOV_AFFILIATION_PATTERNS = [
+    # NIH and institutes
+    "national institutes of health",
+    "national institute of",
+    "nih,",
+    "(nih)",
+    " nih ",
+    # CDC
+    "centers for disease control",
+    "cdc,",
+    "(cdc)",
+    " cdc ",
+    # FDA
+    "food and drug administration",
+    "fda,",
+    "(fda)",
+    " fda ",
+    # Other federal
+    "veterans affairs",
+    "va medical",
+    "va hospital",
+    "department of health and human services",
+    "hhs,",
+    "walter reed",
+    "uniformed services university",
+    "national library of medicine",
+    "national cancer institute",
+    "national heart, lung, and blood",
+    "national institute of allergy",
+    "national institute of mental health",
+    "national eye institute",
+    "national institute of diabetes",
+    "national institute on aging",
+    "national institute of child health",
+    "national institute of neurological",
+    "national human genome research",
+    "agency for healthcare research and quality",
+    "ahrq",
+    # Location-based
+    "bethesda, md",
+    "bethesda, maryland",
+    "bethesda md",
+    "atlanta, ga",
+    "atlanta, georgia",
+    "silver spring, md",
+    "silver spring, maryland",
+    "rockville, md",
+    "rockville, maryland",
+]
+
+
+def extract_agency_name_from_pattern(pattern: str) -> Optional[str]:
+    """Extract standardized agency name from matched pattern."""
+    pattern_lower = pattern.lower()
+    
+    # Map patterns to standardized agency names
+    agency_map = {
+        "nih": "NIH",
+        "national institutes of health": "NIH",
+        "national institute of": "NIH",
+        "national cancer institute": "NCI",
+        "national heart": "NHLBI",
+        "national institute of allergy": "NIAID",
+        "national institute of mental health": "NIMH",
+        "national eye institute": "NEI",
+        "national institute of diabetes": "NIDDK",
+        "national institute on aging": "NIA",
+        "national institute of child health": "NICHD",
+        "national institute of neurological": "NINDS",
+        "national human genome research": "NHGRI",
+        "national library of medicine": "NLM",
+        "cdc": "CDC",
+        "centers for disease control": "CDC",
+        "fda": "FDA",
+        "food and drug administration": "FDA",
+        "veterans affairs": "VA",
+        "va medical": "VA",
+        "va hospital": "VA",
+        "uniformed services university": "USUHS",
+        "walter reed": "Walter Reed",
+        "ahrq": "AHRQ",
+        "agency for healthcare research": "AHRQ",
+    }
+    
+    for key, agency in agency_map.items():
+        if key in pattern_lower:
+            return agency
+    
+    return None
+
+
+def extract_gov_affiliations_from_pubmed_xml(article_elem: ET.Element) -> tuple[bool, list[str]]:
+    """
+    Extract government affiliations from PubMed XML article element.
+    
+    This function checks Affiliation elements, AffiliationInfo elements (newer format),
+    and GrantList for NIH/government funding indicators.
+    
+    Args:
+        article_elem: The PubmedArticle XML element from ElementTree parsing
+        
+    Returns:
+        Tuple of (is_gov_affiliated, list_of_matched_agencies)
+    """
+    matched_agencies: set[str] = set()
+    
+    # Check all affiliation elements
+    for aff in article_elem.findall(".//Affiliation"):
+        if aff.text:
+            aff_text = aff.text.lower()
+            for pattern in GOV_AFFILIATION_PATTERNS:
+                if pattern.lower() in aff_text:
+                    # Extract agency name from matched pattern
+                    agency = extract_agency_name_from_pattern(pattern)
+                    if agency:
+                        matched_agencies.add(agency)
+    
+    # Check AffiliationInfo elements (newer format)
+    for aff_info in article_elem.findall(".//AffiliationInfo/Affiliation"):
+        if aff_info.text:
+            aff_text = aff_info.text.lower()
+            for pattern in GOV_AFFILIATION_PATTERNS:
+                if pattern.lower() in aff_text:
+                    agency = extract_agency_name_from_pattern(pattern)
+                    if agency:
+                        matched_agencies.add(agency)
+    
+    # Check grant list for NIH/government grants
+    for grant in article_elem.findall(".//Grant"):
+        agency = grant.find("Agency")
+        if agency is not None and agency.text:
+            agency_lower = agency.text.lower()
+            if any(g in agency_lower for g in ["nih", "national institutes", "cdc", "fda", "va ", "veterans", "ahrq"]):
+                matched_agencies.add(agency.text.strip())
+    
+    is_gov = len(matched_agencies) > 0
+    return is_gov, sorted(list(matched_agencies))

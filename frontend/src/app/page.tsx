@@ -3,6 +3,17 @@
 import React, { useState, useEffect, useRef } from 'react';
 
 // Types for medical RAG
+interface EvidenceLevel {
+  grade: 'A' | 'B' | 'C' | 'D';
+  level: 1 | 2 | 3 | 4;
+  label: string;
+  terms: string[];
+}
+
+interface EvidenceHierarchy {
+  levels: EvidenceLevel[];
+}
+
 interface Source {
   pmcid: string;
   title: string;
@@ -14,12 +25,17 @@ interface Source {
   article_type?: string;
   dailymed_url?: string;  // DailyMed drug label URL
   source?: string;  // 'dailymed' or 'pmc'
+  evidence_grade?: 'A' | 'B' | 'C' | 'D';
+  evidence_level?: 1 | 2 | 3 | 4;
+  evidence_term?: string;
+  evidence_source?: 'article_type' | 'publication_type' | 'abstract' | 'fallback';
 }
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
   sources?: Source[];
+  evidenceHierarchy?: EvidenceHierarchy;
   steps?: { title: string; status: 'pending' | 'loading' | 'complete' }[];
   activeTab?: 'answer' | 'drugs' | 'references';
 }
@@ -33,6 +49,13 @@ const CITATION_COLORS = [
   '#f59e0b', // amber
   '#ec4899', // pink
 ];
+
+const EVIDENCE_COLORS: Record<string, string> = {
+  A: '#16a34a',
+  B: '#2563eb',
+  C: '#d97706',
+  D: '#dc2626',
+};
 
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -88,6 +111,7 @@ export default function Home() {
 
       let currentAnswer = '';
       let currentSources: Source[] = [];
+      let currentEvidenceHierarchy: EvidenceHierarchy | undefined = undefined;
       let buffer = '';
 
       while (true) {
@@ -106,6 +130,9 @@ export default function Home() {
 
             try {
               const data = JSON.parse(dataStr);
+              if (data.evidence_hierarchy?.levels) {
+                currentEvidenceHierarchy = data.evidence_hierarchy;
+              }
 
               if (data.step === 'query_expansion' && data.status === 'running') {
                 setMessages(prev => {
@@ -136,14 +163,15 @@ export default function Home() {
                 setMessages(prev => {
                   const newMessages = [...prev];
                   const lastIdx = newMessages.length - 1;
-                  if (newMessages[lastIdx]?.steps) {
-                    newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                      i <= 2 ? { ...s, status: i === 2 ? 'complete' : s.status } : s
-                    );
-                    newMessages[lastIdx].sources = currentSources;
-                  }
-                  return newMessages;
-                });
+                    if (newMessages[lastIdx]?.steps) {
+                      newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
+                        i <= 2 ? { ...s, status: i === 2 ? 'complete' : s.status } : s
+                      );
+                      newMessages[lastIdx].sources = currentSources;
+                      if (currentEvidenceHierarchy) newMessages[lastIdx].evidenceHierarchy = currentEvidenceHierarchy;
+                    }
+                    return newMessages;
+                  });
               } else if (data.step === 'generation' && data.status === 'running') {
                 if (data.token) {
                   currentAnswer += data.token;
@@ -189,14 +217,15 @@ export default function Home() {
                 setMessages(prev => {
                   const newMessages = [...prev];
                   const lastIdx = newMessages.length - 1;
-                  if (newMessages[lastIdx]?.steps) {
-                    newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                      i === 3 ? { ...s, status: 'complete' } : s
-                    );
-                    newMessages[lastIdx].sources = currentSources;
-                  }
-                  return newMessages;
-                });
+                    if (newMessages[lastIdx]?.steps) {
+                      newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
+                        i === 3 ? { ...s, status: 'complete' } : s
+                      );
+                      newMessages[lastIdx].sources = currentSources;
+                      if (currentEvidenceHierarchy) newMessages[lastIdx].evidenceHierarchy = currentEvidenceHierarchy;
+                    }
+                    return newMessages;
+                  });
               } else if (data.step === 'generation' && data.status === 'complete') {
                 setMessages(prev => {
                   const newMessages = [...prev];
@@ -221,6 +250,7 @@ export default function Home() {
                     ...newMessages[lastIdx],
                     content: currentAnswer,
                     sources: currentSources,
+                    evidenceHierarchy: currentEvidenceHierarchy || newMessages[lastIdx].evidenceHierarchy,
                     steps: newMessages[lastIdx].steps?.map(s => ({ ...s, status: 'complete' }))
                   };
                   return newMessages;
@@ -321,6 +351,7 @@ export default function Home() {
                     s.source === 'dailymed' || s.pmcid?.startsWith('dailymed_')
                   ) || [];
                   const allSources = msg.sources || [];
+                  const evidenceHierarchy = msg.evidenceHierarchy;
 
                   // Get current active tab for this message (default to 'answer')
                   const activeTab = msg.activeTab || 'answer';
@@ -480,6 +511,35 @@ export default function Home() {
                           {/* REFERENCES TAB */}
                           {activeTab === 'references' && allSources.length > 0 && (
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+                              {evidenceHierarchy?.levels?.length ? (
+                                <div style={{ padding: '0.75rem', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }}>
+                                  <div style={{ fontSize: '0.8rem', color: '#475569', marginBottom: '0.5rem', fontWeight: 600 }}>
+                                    Evidence Hierarchy
+                                  </div>
+                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+                                    {evidenceHierarchy.levels.map((lvl) => (
+                                      <span
+                                        key={lvl.grade}
+                                        style={{
+                                          display: 'inline-flex',
+                                          alignItems: 'center',
+                                          gap: '0.35rem',
+                                          fontSize: '0.75rem',
+                                          border: `1px solid ${EVIDENCE_COLORS[lvl.grade] || '#64748b'}`,
+                                          color: EVIDENCE_COLORS[lvl.grade] || '#64748b',
+                                          borderRadius: '999px',
+                                          padding: '0.2rem 0.55rem',
+                                          background: 'white'
+                                        }}
+                                        title={lvl.terms.join(', ')}
+                                      >
+                                        {lvl.grade} · L{lvl.level}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              ) : null}
+
                               {allSources.map((source, sIdx) => (
                                 <div key={sIdx} style={{ display: 'flex', gap: '1rem', position: 'relative' }}>
                                   {/* Number badge */}
@@ -547,6 +607,38 @@ export default function Home() {
 
                                     {/* Badge row */}
                                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginTop: '0.5rem' }}>
+                                      {source.evidence_grade && (
+                                        <span
+                                          style={{
+                                            display: 'inline-flex',
+                                            alignItems: 'center',
+                                            gap: '0.35rem',
+                                            color: EVIDENCE_COLORS[source.evidence_grade] || '#64748b',
+                                            border: `1px solid ${EVIDENCE_COLORS[source.evidence_grade] || '#64748b'}`,
+                                            borderRadius: '999px',
+                                            padding: '0.15rem 0.5rem',
+                                            fontSize: '0.75rem',
+                                            fontWeight: 600,
+                                            background: 'white'
+                                          }}
+                                          title={source.evidence_source ? `Matched from ${source.evidence_source}` : 'Evidence grade'}
+                                        >
+                                          {source.evidence_grade}
+                                          {source.evidence_level ? ` · L${source.evidence_level}` : ''}
+                                        </span>
+                                      )}
+
+                                      {source.evidence_term && (
+                                        <span style={{
+                                          display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
+                                          color: '#475569',
+                                          fontSize: '0.78rem',
+                                          fontWeight: 500
+                                        }}>
+                                          🧪 {source.evidence_term}
+                                        </span>
+                                      )}
+
                                       {source.article_type && (
                                         <span style={{
                                           display: 'inline-flex', alignItems: 'center', gap: '0.35rem',

@@ -675,6 +675,16 @@ class PaperFinderWithReranker:
             normalized = re.sub(r'[^\w\s]', '', title.lower())
             normalized = re.sub(r'\s+', ' ', normalized).strip()
             return normalized
+
+        def normalized_evidence_level(value: Any) -> Optional[int]:
+            """Normalize evidence level to int in range 1..4, else None."""
+            try:
+                if value is None:
+                    return None
+                level = int(value)
+                return level if 1 <= level <= 4 else None
+            except (TypeError, ValueError):
+                return None
         
         for snippet in snippets_list:
             # Get identifiers
@@ -716,6 +726,19 @@ class PaperFinderWithReranker:
                         "section_title": snippet.get("section_title", "abstract"),
                         "char_start_offset": snippet.get("char_offset", 0),
                     })
+
+                    existing_level = normalized_evidence_level(paper_snippets[duplicate_of].get("evidence_level"))
+                    new_level = normalized_evidence_level(snippet.get("evidence_level"))
+                    if new_level is not None and (existing_level is None or new_level < existing_level):
+                        paper_snippets[duplicate_of]["evidence_grade"] = snippet.get("evidence_grade")
+                        paper_snippets[duplicate_of]["evidence_level"] = new_level
+                        paper_snippets[duplicate_of]["evidence_term"] = snippet.get("evidence_term")
+                        paper_snippets[duplicate_of]["evidence_source"] = snippet.get("evidence_source")
+                    else:
+                        if not paper_snippets[duplicate_of].get("evidence_term") and snippet.get("evidence_term"):
+                            paper_snippets[duplicate_of]["evidence_term"] = snippet.get("evidence_term")
+                        if not paper_snippets[duplicate_of].get("evidence_source") and snippet.get("evidence_source"):
+                            paper_snippets[duplicate_of]["evidence_source"] = snippet.get("evidence_source")
                 continue
             
             # Not a duplicate - create new entry
@@ -731,6 +754,10 @@ class PaperFinderWithReranker:
                     "year": snippet.get("year"),
                     "authors": snippet.get("authors", []),
                     "article_type": snippet.get("article_type", "other"),
+                    "evidence_grade": snippet.get("evidence_grade"),
+                    "evidence_level": normalized_evidence_level(snippet.get("evidence_level")),
+                    "evidence_term": snippet.get("evidence_term"),
+                    "evidence_source": snippet.get("evidence_source"),
                     "sentences": [],
                     "relevance_judgement": -1,
                     "citation_count": snippet.get("citation_count", 0),

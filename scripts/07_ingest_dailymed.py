@@ -415,6 +415,9 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
                 "manufacturer": manufacturer,
                 "active_ingredients": active_ingredients,
                 "source": "dailymed",
+                # Chunking metadata for consistency
+                "chunk_index": j,
+                "total_chunks": len(section_chunks),
                 # Parent-child ready fields
                 "full_section_text": full_section_text,
                 "section_id": section_id,
@@ -445,6 +448,9 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
                     "manufacturer": manufacturer,
                     "active_ingredients": active_ingredients,
                     "source": "dailymed",
+                    # Chunking metadata for consistency
+                    "chunk_index": j,
+                    "total_chunks": len(table_chunks),
                     # Parent-child ready fields
                     "full_section_text": table_full_text,
                     "section_id": table_section_id,
@@ -552,7 +558,7 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
             vector = {"dense": embeddings[i]}
             
             if sparse_encoder and i < len(sparse_vectors) and sparse_vectors[i]:
-                vector["sparse"] = sparse_vectors[i].model_dump()
+                vector["sparse"] = sparse_vectors[i]
             
             # Add timestamp
             chunk["ingestion_timestamp"] = time.time()
@@ -573,6 +579,37 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
 # Checkpoint file for DailyMed ingestion
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "dailymed_ingested_ids.txt"
 
+# Namespace for DailyMed checkpoint IDs to prevent collision with PMC/PubMed
+DAILYMED_CHECKPOINT_NAMESPACE = "dailymed"
+
+
+def _checkpoint_id(set_id: str) -> str:
+    """Generate namespaced checkpoint ID for DailyMed labels."""
+    return f"{DAILYMED_CHECKPOINT_NAMESPACE}:{set_id.strip()}"
+
+
+def _resolve_checkpoint_line(line: str) -> str | None:
+    """Resolve checkpoint line to namespaced ID, handling legacy plain set_ids."""
+    value = line.strip()
+    if not value:
+        return None
+    
+    # Already namespaced
+    if value.startswith(f"{DAILYMED_CHECKPOINT_NAMESPACE}:"):
+        return value
+    
+    # Legacy format (plain set_id) - convert to namespaced
+    return _checkpoint_id(value)
+
+
+def load_checkpoint_namespaced(path: Path) -> set[str]:
+    """Load checkpoint with legacy format support."""
+    return {
+        resolved
+        for line in load_checkpoint_file(path)
+        if (resolved := _resolve_checkpoint_line(line)) is not None
+    }
+
 def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker: Any) -> Tuple[int, int]:
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
@@ -587,7 +624,8 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
             # Fast skip: check filename (stem) against checkpoint
             # parse_spl_xml uses stem if set_id is missing, so this is a safe heuristic
             stem_id = xml_file.stem
-            if stem_id in processed_ids:
+            stem_checkpoint_id = _checkpoint_id(stem_id)
+            if stem_checkpoint_id in processed_ids:
                 skipped += 1
                 continue
 
@@ -598,14 +636,16 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
             set_id = drug.get("set_id")
             if not set_id:
                 continue
-                
+            
+            set_id_checkpoint = _checkpoint_id(set_id)
+            
             # Double check exact ID
-            if set_id != stem_id and set_id in processed_ids:
+            if set_id != stem_id and set_id_checkpoint in processed_ids:
                 skipped += 1
                 continue
             
             drugs.append(drug)
-            new_ids.append(set_id)
+            new_ids.append(set_id_checkpoint)
             
         except Exception as e:
             logger.warning("Failed to parse %s: %s", xml_file, e)
@@ -629,6 +669,7 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
             upsert_with_retry(client, points)
             
             # Update checkpoints
+            # new_ids are already namespaced via _checkpoint_id() above
             append_checkpoint_file(CHECKPOINT_FILE, new_ids)
             with processed_lock:
                 processed_ids.update(new_ids)
@@ -645,6 +686,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     
     # Preload tokenizer (uses SemanticChunker if available)
     logger.info("Preloading tokenizer...")
+    chunker: Optional[Any] = None
     try:
         chunker = get_shared_chunker(
             chunker_class=CHUNKER_CLASS,
@@ -676,7 +718,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
          logger.error("Failed to connect to collection: %s", e)
          return
 
-    processed_ids = load_checkpoint_file(CHECKPOINT_FILE)
+    processed_ids = load_checkpoint_namespaced(CHECKPOINT_FILE)
     processed_lock = threading.Lock()
     logger.info("DailyMed checkpoint size=%s", len(processed_ids))
 
@@ -695,12 +737,13 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE
     MAX_WORKERS = IngestionConfig.MAX_WORKERS  # Standardized to use config value (default: 8)
     
-    # Use shared chunker instance for consistency with other ingestion scripts
-    chunker = get_shared_chunker(
-        chunker_class=CHUNKER_CLASS,
-        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
-    )
+    # If preload failed, initialize chunker once here.
+    if chunker is None:
+        chunker = get_shared_chunker(
+            chunker_class=CHUNKER_CLASS,
+            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
+        )
     
     file_batches = [xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(xml_files), THREAD_BATCH_SIZE)]
     total_batches = len(file_batches)

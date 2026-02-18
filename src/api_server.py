@@ -112,6 +112,7 @@ class ChatResponse(BaseModel):
     answer: str
     sections: list
     sources: list
+    evidence_hierarchy: dict = {}
     full_text_articles: list = []  # Articles that received full text (not just abstracts)
     retrieval_stats: dict
     status: str
