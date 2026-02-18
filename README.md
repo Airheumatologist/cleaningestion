@@ -1,6 +1,10 @@
 # Elixir AI - Medical RAG Pipeline
 
-**Internal Team Documentation** | Private Repository
+⚠️ **INTERNAL USE ONLY — PRIVATE REPOSITORY** ⚠️
+
+This repository is **private and restricted to the internal team only**. Do not share, distribute, or expose to external parties. If you need access, contact the team lead.
+
+---
 
 A production-grade **Medical RAG (Retrieval-Augmented Generation) Pipeline** designed for clinical decision support. Elixir AI provides comprehensive, evidence-based medical answers grounded in peer-reviewed literature from PubMed Central (PMC), DailyMed drug labels, and authoritative medical sources.
 
@@ -106,7 +110,6 @@ RAG-pipeline/
 │   ├── 06_ingest_pmc.py                    # Ingest unified PMC XML sources to Qdrant
 │   ├── 07_ingest_dailymed.py               # Ingest DailyMed XML to Qdrant
 │   ├── 08_monthly_update.py                # Incremental updates
-│   ├── 09_smoke_test.py                    # Validation tests
 │   ├── 20_download_pubmed_baseline.py      # Download PubMed abstracts (includes gov affiliation)
 │   ├── 21_ingest_pubmed_abstracts.py       # Ingest PubMed to Qdrant
 │   ├── config_ingestion.py                 # Ingestion config
@@ -565,9 +568,6 @@ python src/reranker.py
 
 # Test query preprocessing
 python src/query_preprocessor.py
-
-# Run smoke tests
-python scripts/09_smoke_test.py
 ```
 
 ---

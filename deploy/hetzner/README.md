@@ -103,15 +103,7 @@ python scripts/06_ingest_pmc.py --xml-dir /data/ingestion/pmc_xml
 python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
 ```
 
-## 8) Smoke test
-
-```bash
-python scripts/09_smoke_test.py
-```
-
-All 5 checks should pass: collection exists, dense config (1024/cosine), sparse config (IDF), payload indexes, hybrid roundtrip.
-
-## 9) Install cron jobs
+## 8) Install cron jobs
 
 ```bash
 sudo cp deploy/hetzner/cron/medical-rag-update.cron /etc/cron.d/medical-rag-update
@@ -120,7 +112,7 @@ sudo cp deploy/hetzner/cron/qdrant-health.cron /etc/cron.d/qdrant-health
 sudo chmod 644 /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-backup /etc/cron.d/qdrant-health
 ```
 
-## 10) Firewall allowlist
+## 9) Firewall allowlist
 
 ```bash
 # Allow SSH
@@ -137,7 +129,7 @@ ufw enable
 ufw status
 ```
 
-## 11) API key rotation
+## 10) API key rotation
 
 ```bash
 # Generate new key
@@ -154,13 +146,12 @@ sed -i "s/QDRANT_API_KEY=.*/QDRANT_API_KEY=${NEW_KEY}/" /opt/RAG-pipeline/.env
 # Update all external client .env files with the new key
 ```
 
-## 12) Acceptance checks
+## 11) Acceptance checks
 
 | Check | Command |
 |---|---|
 | Collection has sparse config | `curl -s -H "api-key: $QDRANT_API_KEY" localhost:6333/collections/rag_pipeline \| grep idf` |
 | Points have dense + sparse vectors | `curl -s -H "api-key: $QDRANT_API_KEY" "localhost:6333/collections/rag_pipeline/points/scroll?limit=1&with_vectors=true"` |
-| Smoke test passes | `python scripts/09_smoke_test.py` |
 | Cron installed | `ls /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-backup /etc/cron.d/qdrant-health` |
 | Firewall active | `ufw status` |
 | Monthly update runs | `tail -f /var/log/rag-update.log` |
