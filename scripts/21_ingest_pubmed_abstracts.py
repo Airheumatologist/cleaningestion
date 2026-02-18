@@ -48,7 +48,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
-from ingestion_utils import Chunker as BaseChunker, EmbeddingProvider, upsert_with_retry
+from ingestion_utils import Chunker as BaseChunker, EmbeddingProvider, upsert_with_retry, EVIDENCE_HIERARCHY
 
 # Import enhanced utilities for semantic chunking and validation
 try:
@@ -56,6 +56,7 @@ try:
     ENHANCED_UTILS_AVAILABLE = True
     logger.info("Using SemanticChunker for improved chunking")
 except ImportError:
+    ContentDeduplicator = None  # type: ignore
     ENHANCED_UTILS_AVAILABLE = False
     logger.warning("Enhanced utils not available")
 
@@ -71,43 +72,14 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
 
-# Evidence grades mapping based on article_type (aligned with ingestion_utils.EVIDENCE_HIERARCHY)
-EVIDENCE_GRADES = {
-    # Tier 1: Highest evidence (A)
-    "meta-analysis": "A",
-    "meta_analysis": "A",
-    "systematic-review": "A",
-    "systematic_review": "A",
-    "practice-guideline": "A",
-    "practice_guideline": "A",
-    "guideline": "A",
-    # Phase 2 additions - Clinical Trials (all Tier 1)
-    "randomized-controlled-trial": "A",
-    "randomized_controlled_trial": "A",
-    "clinical-trial": "A",
-    "clinical_trial": "A",
-    "clinical-trial-phase-i": "A",
-    "clinical_trial_phase_i": "A",
-    "clinical-trial-phase-ii": "A",
-    "clinical_trial_phase_ii": "A",
-    "clinical-trial-phase-iii": "A",
-    "clinical_trial_phase_iii": "A",
-    "clinical-trial-phase-iv": "A",
-    "clinical_trial_phase_iv": "A",
-    "controlled-clinical-trial": "A",
-    "controlled_clinical_trial": "A",
-    "multicenter-study": "A",
-    "multicenter_study": "A",
-    # Tier 2: Moderate evidence (B)
-    "review": "B",
-    "review-article": "B",
-    "review_article": "B",
-    "cohort-study": "B",
-    "cohort_study": "B",
-    # Tier 3: Lower evidence (C)
-    "case-report": "C",
-    "case_report": "C",
-}
+# Evidence grades mapping derived from shared EVIDENCE_HIERARCHY
+def _get_evidence_grade(article_type: str) -> str:
+    """Get evidence grade from shared EVIDENCE_HIERARCHY."""
+    article_type_lower = article_type.lower().replace("_", "-")
+    for pattern, (grade, _) in EVIDENCE_HIERARCHY.items():
+        if pattern in article_type_lower:
+            return grade
+    return "C"  # Default grade
 
 # Note: Tokenizer is handled by the shared Chunker class from ingestion_utils
 # We use Chunker's token counting for consistency across all ingestion scripts
@@ -116,14 +88,7 @@ EVIDENCE_GRADES = {
 def count_tokens(text: str) -> int:
     """Count tokens using the shared Chunker's tokenizer."""
     chunker = _get_chunker()
-    if chunker and hasattr(chunker, 'tokenizer') and chunker.tokenizer is not None:
-        try:
-            tokens = chunker.tokenizer.encode(text, add_special_tokens=False)
-            return len(tokens)
-        except Exception:
-            pass
-    # Fallback: approximate with word count (1 token ≈ 0.75 words)
-    return int(len(text.split()) / 0.75)
+    return chunker.count_tokens(text)
 
 
 # Initialize shared Chunker instance (uses SemanticChunker if available)
@@ -168,7 +133,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
         List of payload dictionaries (one per chunk)
     """
     article_type = article.get("article_type", "review")
-    evidence_grade = EVIDENCE_GRADES.get(article_type, "C")
+    evidence_grade = _get_evidence_grade(article_type)
     
     pmid = article.get("pmid")
     title = article.get("title", "")
@@ -373,7 +338,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
 
 
 def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[Any], 
-                 validate_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
+                 validate_chunks: bool = True, dedup_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
     """
     Build Qdrant points from article batch with token-based chunking.
     
@@ -384,6 +349,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         embedding_provider: Provider for generating embeddings
         sparse_encoder: Optional sparse encoder for hybrid search
         validate_chunks: Whether to validate chunk quality before ingestion
+        dedup_chunks: Whether to deduplicate chunks within batch
     """
     points: List[PointStruct] = []
     processed_pmids: List[str] = []
@@ -391,6 +357,11 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     text_metas: List[Dict[str, Any]] = []
     total_validated = 0
     total_rejected = 0
+
+    # Initialize deduplicator if enabled
+    dedup = None
+    if dedup_chunks and ContentDeduplicator is not None:
+        dedup = ContentDeduplicator()
 
     for article in batch:
         pmid = article.get("pmid")
@@ -421,6 +392,18 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                     logger.debug("Skipping invalid chunk %s: %s", payload.get("chunk_id"), issues)
                     total_rejected += 1
             payloads = valid_payloads
+        
+        # Deduplicate chunks if enabled
+        if dedup:
+            unique_payloads = []
+            for payload in payloads:
+                metadata = {
+                    "doc_id": payload.get("doc_id", ""),
+                    "chunk_id": payload.get("chunk_id", "")
+                }
+                if not dedup.is_duplicate(payload["page_content"], metadata):
+                    unique_payloads.append(payload)
+            payloads = unique_payloads
         
         for payload in payloads:
             text = payload["page_content"]
@@ -469,13 +452,14 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
 
 
 def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, 
-                  sparse_encoder: Optional[Any], validate_chunks: bool = True) -> int:
+                  sparse_encoder: Optional[Any], validate_chunks: bool = True, dedup_chunks: bool = True) -> int:
     """Process a single batch in a worker thread."""
     if not batch:
         return 0
     
     try:
-        points, ids = build_points(batch, embedding_provider, sparse_encoder, validate_chunks=validate_chunks)
+        points, ids = build_points(batch, embedding_provider, sparse_encoder, 
+                                   validate_chunks=validate_chunks, dedup_chunks=dedup_chunks)
         if points:
             upsert_with_retry(client, points)
             append_checkpoint(ids)
@@ -530,11 +514,12 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
     processed_ids = load_checkpoint()
     logger.info("Loaded checkpoint with %d IDs", len(processed_ids))
     chunker_class = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
-    logger.info("Chunking config: size=%d, overlap=%d, chunker=%s, validation=%s", 
+    logger.info("Chunking config: size=%d, overlap=%d, chunker=%s, validation=%s, dedup=%s", 
                 IngestionConfig.CHUNK_SIZE_TOKENS, 
                 IngestionConfig.CHUNK_OVERLAP_TOKENS,
                 chunker_class.__name__,
-                ENHANCED_UTILS_AVAILABLE)
+                ENHANCED_UTILS_AVAILABLE,
+                ContentDeduplicator is not None)
 
     current_batch: List[Dict[str, Any]] = []
     total_processed = 0

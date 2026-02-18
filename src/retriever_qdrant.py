@@ -153,9 +153,12 @@ class QdrantRetriever(AbstractRetriever):
                     self.drug_setid_lookup = json.load(f)
                 logger.info(f"✅ Loaded drug lookup with {len(self.drug_setid_lookup)} drugs")
             else:
-                logger.warning(f"Drug lookup file not found: {lookup_path}")
+                logger.info(f"ℹ️ Drug lookup file not found, will use lazy cache + BM25 fallback")
         except Exception as e:
-            logger.warning(f"Failed to load drug lookup: {e}")
+            logger.info(f"ℹ️ Drug lookup not loaded, will use lazy cache + BM25 fallback: {e}")
+        
+        # Lazy in-memory cache for drug lookups (built on-demand)
+        self._drug_lookup_cache: Dict[str, str] = {}
         
         logger.info(
             "Initialized QdrantRetriever: %s (Embedding: %s, Sparse Mode: %s)",
@@ -938,60 +941,80 @@ class QdrantRetriever(AbstractRetriever):
 
     def search_dailymed_by_drug(self, drug_names: List[str], limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Search DailyMed drug labels using pre-built lookup table.
+        Search DailyMed drug labels using optimized lookup with lazy cache + BM25.
         
         Strategy:
-        1. Look up drug names in the drug_setid_lookup (O(1) instant)
-        2. Fetch ONE article per drug (first set_id) - avoids duplicate manufacturers
-        3. Deduplicate by set_id - if user asks for "voclosporin" AND "lupkynis",
-           only one article is returned since they share the same set_id
-        4. Fallback to keyword search for drugs not in lookup
+        1. Check lazy in-memory cache (O(1) instant for repeated queries)
+        2. Check pre-built lookup table (O(1) if JSON file exists)
+        3. Fallback to BM25 sparse vector search (better than MatchText)
+        4. Cache results in memory for future queries
+        5. Deduplicate by set_id - handles brand/generic overlap
         """
         if not drug_names:
             return []
         
         all_results = []
         seen_set_ids = set()  # Dedup by set_id (handles brand/generic overlap)
+        cache_hits = 0
+        lookup_hits = 0
+        bm25_hits = 0
         
         for drug_name in drug_names[:5]:  # Allow up to 5 drugs
             drug_lower = drug_name.lower().strip()
             
-            # Step 1: Try lookup table (instant, O(1))
+            # Step 1: Check lazy cache first (fastest, in-memory)
+            if drug_lower in self._drug_lookup_cache:
+                set_id = self._drug_lookup_cache[drug_lower]
+                if set_id in seen_set_ids:
+                    logger.info(f"   💊 '{drug_name}' → already have set_id (cached)")
+                    continue
+                
+                result = self._fetch_dailymed_by_set_id(set_id)
+                if result:
+                    seen_set_ids.add(set_id)
+                    all_results.append(result)
+                    cache_hits += 1
+                    continue
+            
+            # Step 2: Try pre-built lookup table (if JSON file exists)
             if drug_lower in self.drug_setid_lookup:
                 lookup_data = self.drug_setid_lookup[drug_lower]
                 set_ids = lookup_data.get("set_ids", [])
                 
                 if set_ids:
-                    # Only take FIRST set_id (one article per drug)
                     first_set_id = set_ids[0]
                     
-                    # Skip if we already have this set_id (handles brand/generic overlap)
                     if first_set_id in seen_set_ids:
                         logger.info(f"   💊 '{drug_name}' → already have set_id (brand/generic overlap)")
                         continue
                     
-                    logger.info(f"   💊 Lookup hit: '{drug_name}' → 1 set_id (out of {len(set_ids)} available)")
+                    # Add to lazy cache for future queries
+                    self._drug_lookup_cache[drug_lower] = first_set_id
                     
-                    # Fetch from Qdrant by set_id
                     result = self._fetch_dailymed_by_set_id(first_set_id)
                     if result:
                         seen_set_ids.add(first_set_id)
                         all_results.append(result)
-                    continue  # Got result from lookup, skip to next drug
+                        lookup_hits += 1
+                    continue
             
-            # Step 2: Fallback to keyword search (limit to 1 result per drug)
-            logger.info(f"   💊 Lookup miss for '{drug_name}', trying keyword search")
-            keyword_results = self._keyword_search_dailymed(drug_name, limit=1)
+            # Step 3: Fallback to BM25 sparse vector search
+            logger.info(f"   💊 Cache miss for '{drug_name}', using BM25 sparse search")
+            bm25_results = self._bm25_search_dailymed(drug_name, limit=3)
             
-            for result in keyword_results:
+            for result in bm25_results:
                 set_id = result.get("set_id")
                 if set_id and set_id not in seen_set_ids:
                     seen_set_ids.add(set_id)
                     all_results.append(result)
-                    break  # Only take first result
+                    # Cache this result for future queries
+                    self._drug_lookup_cache[drug_lower] = set_id
+                    bm25_hits += 1
+                    break  # Only take first (best BM25 match)
         
         if all_results:
-            logger.info(f"   ✅ Found {len(all_results)} DailyMed articles (1 per drug)")
+            logger.info(f"   ✅ Found {len(all_results)} DailyMed articles "
+                       f"(cache: {cache_hits}, lookup: {lookup_hits}, BM25: {bm25_hits})")
         
         return all_results
     
@@ -1024,9 +1047,59 @@ class QdrantRetriever(AbstractRetriever):
         
         return None
     
-    def _keyword_search_dailymed(self, drug_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+    def _bm25_search_dailymed(self, drug_name: str, limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Fallback: Keyword search using MatchText on drug_name OR highlights fields.
+        Fallback: BM25 sparse vector search for drug name matching.
+        
+        Uses the BM25 sparse encoder to perform better keyword matching than
+        simple MatchText, handling term frequency and partial matches.
+        """
+        if self.bm25_sparse_encoder is None:
+            logger.warning("   BM25 encoder not available, cannot search DailyMed")
+            return []
+        
+        try:
+            # Build sparse query vector using BM25
+            sparse_query = self.bm25_sparse_encoder.encode_query(drug_name)
+            
+            # Skip if query resulted in empty sparse vector
+            if not sparse_query.indices:
+                logger.info(f"   Empty BM25 vector for '{drug_name}', using fallback")
+                return self._matchtext_search_dailymed(drug_name, limit)
+            
+            # Filter to DailyMed source only
+            source_filter = Filter(
+                must=[FieldCondition(key="source", match=MatchValue(value="dailymed"))]
+            )
+            
+            # Query using sparse vector
+            search_results = self.client.query_points(
+                collection_name=self.collection_name,
+                query=sparse_query,
+                using="sparse",
+                query_filter=source_filter,
+                limit=limit,
+                with_payload=True
+            )
+            
+            passages = []
+            for point in search_results.points:
+                passage = self._transform_dailymed_payload(point.payload, point.score)
+                passage["stype"] = "dailymed_bm25"
+                passages.append(passage)
+            
+            if passages:
+                logger.info(f"   BM25 found {len(passages)} results for '{drug_name}' (top score: {passages[0]['score']:.3f})")
+            
+            return passages
+            
+        except Exception as e:
+            logger.warning(f"   BM25 search failed for '{drug_name}': {e}, trying MatchText fallback")
+            return self._matchtext_search_dailymed(drug_name, limit)
+    
+    def _matchtext_search_dailymed(self, drug_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Last-resort fallback: MatchText search when BM25 fails.
         """
         try:
             keyword_filter = Filter(
@@ -1049,15 +1122,15 @@ class QdrantRetriever(AbstractRetriever):
             passages = []
             for point in results:
                 passage = self._transform_dailymed_payload(point.payload, 0.95)
-                passage["stype"] = "dailymed_keyword"
+                passage["stype"] = "dailymed_matchtext"
                 passages.append(passage)
             
             if passages:
-                logger.info(f"   Keyword fallback found {len(passages)} results for '{drug_name}'")
+                logger.info(f"   MatchText fallback found {len(passages)} results for '{drug_name}'")
             return passages
             
         except Exception as e:
-            logger.warning(f"   Keyword search failed for '{drug_name}': {e}")
+            logger.warning(f"   MatchText fallback failed for '{drug_name}': {e}")
             return []
 
     

@@ -217,6 +217,21 @@ class Chunker:
                 logger.warning(f"Failed to load tokenizer (Qwen/Qwen3-Embedding-0.6B): {e}")
                 self.tokenizer = None
             
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in text using the loaded tokenizer."""
+        if not text:
+            return 0
+        
+        if self.tokenizer is not None:
+            try:
+                tokens = self.tokenizer.encode(text, add_special_tokens=False)
+                return len(tokens)
+            except Exception:
+                pass  # Fall through to approximation
+        
+        # Fallback: approximate with word count (1 token ≈ 0.75 words)
+        return int(len(text.split()) / 0.75)
+    
     def chunk_text(self, text: str) -> List[Dict[str, Any]]:
         if not text:
             return []

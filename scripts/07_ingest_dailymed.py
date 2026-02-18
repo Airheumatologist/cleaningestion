@@ -8,7 +8,7 @@ import logging
 import sys
 import time
 import uuid
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -526,7 +526,6 @@ CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "dailymed_ingested_ids.txt"
 # Checkpoint file for DailyMed ingestion
 
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Lock for file operations (checkpointing)
 checkpoint_lock = threading.Lock()
@@ -544,20 +543,13 @@ def append_checkpoint(ids: Iterable[str]) -> None:
                 f.write(f"{value}\n")
 
 
-def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker=None) -> Tuple[int, int]:
+def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker: Chunker) -> Tuple[int, int]:
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
     skipped = 0
     
     drugs = []
     new_ids = []
-    
-    # Create chunker if not provided (uses SemanticChunker if available)
-    if chunker is None:
-        chunker = Chunker(
-            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
-        )
     
     # 1. Parse and filter
     for xml_file in batch_files:
@@ -668,6 +660,12 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
     THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE
     MAX_WORKERS = IngestionConfig.MAX_WORKERS  # Standardized to use config value (default: 8)
     
+    # Create shared chunker instance (SemanticChunker if available)
+    chunker = Chunker(
+        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+    )
+    
     file_batches = [xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(xml_files), THREAD_BATCH_SIZE)]
     total_batches = len(file_batches)
     
@@ -683,7 +681,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider) -> None:
             current_super_batch = file_batches[i : i + SUPER_BATCH_SIZE]
             
             future_to_batch = {
-                executor.submit(process_batch, client, batch, embedding_provider, sparse_encoder, processed_ids, processed_lock): batch 
+                executor.submit(process_batch, client, batch, embedding_provider, sparse_encoder, processed_ids, processed_lock, chunker): batch 
                 for batch in current_super_batch
             }
             

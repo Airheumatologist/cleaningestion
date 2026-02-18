@@ -19,7 +19,12 @@ from config_ingestion import IngestionConfig, ensure_data_dirs
 from ingestion_utils import SectionFilter, EmbeddingProvider, upsert_with_retry
 from ingestion_utils import Chunker as BaseChunker  # Fallback
 
+# Initialize logging FIRST before any imports that might use logger
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
 # Import enhanced utilities if available
+ENHANCED_UTILS_AVAILABLE = False
 try:
     from ingestion_utils_enhanced import (
         SemanticChunker, QualityValidator, 
@@ -27,19 +32,29 @@ try:
     )
     ENHANCED_UTILS_AVAILABLE = True
     Chunker = SemanticChunker  # Use semantic chunking by default
-    logger.info("Using SemanticChunker for improved chunking")
 except ImportError:
-    ENHANCED_UTILS_AVAILABLE = False
     Chunker = BaseChunker  # Fallback to base chunker
-    logger.warning("Enhanced ingestion utils not available, using base Chunker")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+# Log chunker selection after imports are complete
+if ENHANCED_UTILS_AVAILABLE:
+    logger.info("Using SemanticChunker for improved chunking")
+else:
+    logger.warning("Enhanced ingestion utils not available, using base Chunker")
 
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_ingested_ids.txt"
 
+# Singleton chunker instance for reuse across batches
+_chunker_instance: Optional[Chunker] = None
 
-
+def _get_chunker() -> Chunker:
+    """Get or initialize the shared Chunker instance."""
+    global _chunker_instance
+    if _chunker_instance is None:
+        _chunker_instance = Chunker(
+            chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
+            overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
+        )
+    return _chunker_instance
 
 
 import sys
@@ -293,11 +308,8 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         validate_chunks: Whether to validate chunk quality before ingestion
         dedup_chunks: Whether to deduplicate chunks within batch
     """
-    # Use SemanticChunker if available, otherwise fallback to base Chunker
-    chunker = Chunker(
-        chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
-        overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS
-    )
+    # Use shared chunker instance for efficiency
+    chunker = _get_chunker()
     
     points: List[PointStruct] = []
     all_chunk_ids: List[str] = []

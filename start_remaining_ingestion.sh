@@ -103,7 +103,7 @@ fi
 
 if [ -z "$SKIP_DAILYMED" ]; then
     # Check checkpoint
-    CHECKPOINT_FILE="$DATA_DIR/dailymed_checkpoint.txt"
+    CHECKPOINT_FILE="$DATA_DIR/dailymed_ingested_ids.txt"
     if [ -f "$CHECKPOINT_FILE" ]; then
         INGESTED_COUNT=$(wc -l < "$CHECKPOINT_FILE")
         echo "   Checkpoint: $INGESTED_COUNT labels already ingested"

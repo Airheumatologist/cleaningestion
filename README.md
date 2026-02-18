@@ -1,249 +1,82 @@
-# Medical RAG Pipeline
+# Elixir AI - Medical RAG Pipeline
 
-Production-ready Retrieval-Augmented Generation (RAG) pipeline for medical literature, featuring 1.2M+ PubMed Central articles and 51K+ DailyMed drug labels with advanced preprocessing, reranking, and synthesis.
+**Internal Team Documentation** | Private Repository
 
-## ✨ Recent Updates (December 2024)
+A production-grade **Medical RAG (Retrieval-Augmented Generation) Pipeline** designed for clinical decision support. Elixir AI provides comprehensive, evidence-based medical answers grounded in peer-reviewed literature from PubMed Central (PMC), DailyMed drug labels, and authoritative medical sources.
 
-### 🖥️ Next.js Frontend with Real-Time Streaming
-- **Elixir AI Chat Interface** - Modern React-based frontend with glassmorphism design
-- **Real-time SSE Streaming** - See pipeline progress (Query Analysis → Retrieval → Reranking → PDF Check → Synthesis)
-- **Embedded PDF Viewer** - Split-screen PDF viewing with clickable references
-- **AMA-Style Citations** - Formatted with DOI links, journal names, and authors
-
-### 🔬 Unified Deep Research Mode
-- Removed "fast search" option for consistent, comprehensive responses
-- All queries now use the full ELIXIR System Prompt with multi-step generation
-- Improved context building with top 5 full-text articles + 100 abstracts
-
-### 📊 Optimized Reranking & Retrieval
-- **Lower Pre-Filter Threshold** (0.10) for better recall
-- **Post-Cohere Relevance Filter** (0.30) to eliminate low-quality results
-- **Parallel PMC + DailyMed Retrieval** for reduced latency
-- **DailyMed Bypass** - Drug labels always included when drug names mentioned
-
-### 💊 DailyMed Ingestion Improvements
-- Memory-efficient `lxml` iterative parsing for large XML files
-- Per-file timeouts to skip problematic files
-- Optimized Qdrant upsert with reduced batch sizes
-- Complete 51K+ drug label corpus
-
-### 📝 Citation & Context Enhancements
-- Full-text context for top 5 high-value articles (12K chars each)
-- All reranked sources displayed (no filtering of cited articles)
-- NaN-safe JSON serialization for API stability
-- Fixed in-text citation numbering
+---
 
 ## 🏗️ Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           Medical RAG Pipeline                                   │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
-│  │ 1. QUERY     │───▶│ 2. RETRIEVAL │───▶│ 3. RERANKING │───▶│ 4. SYNTHESIS │  │
-│  │ PREPROCESSING│    │              │    │              │    │              │  │
-│  └──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘  │
-│         │                   │                   │                   │           │
-│         ▼                   ▼                   ▼                   ▼           │
-│  • Medical Entity    • Qdrant Vector    • Cohere Rerank    • OpenRouter LLM    │
-│    Expansion (MeSH)    Search (1024-d)   • Evidence Boost    • ELIXIR Prompt   │
-│  • Query Decompose   • Metadata Filter  • Entity Matching   • Full-text Cite  │
-│  • Filter Extract    • Hybrid Scoring   • Paper Aggregate   • PDF Check       │
-│                                                                                  │
-│  Frontend Layer:                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐│
-│  │ Next.js Frontend (Elixir AI) - Real-time SSE streaming, PDF viewer         ││
-│  └─────────────────────────────────────────────────────────────────────────────┘│
-│                                                                                  │
-│  Data Layer:                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐│
-│  │ Qdrant Cloud (1.29M documents, Binary Quantization, 4 Shards)               ││
-│  │ • PMC Open Access: 1.24M full-text articles                                 ││
-│  │ • DailyMed: 51K FDA drug labels                                             ││
-│  └─────────────────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              ELIXIR AI ARCHITECTURE                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────┐      ┌──────────────┐      ┌──────────────────────────┐   │
+│  │   Next.js    │      │   FastAPI    │      │    DeepInfra API         │   │
+│  │   Frontend   │◄────►│   Backend    │◄────►│  • Embeddings            │   │
+│  │  (Port 3000) │  SSE │  (Port 8000) │      │  • Reranking             │   │
+│  └──────────────┘      └──────┬───────┘      │  • LLM Inference         │   │
+│                               │              └──────────────────────────┘   │
+│                               │                                              │
+│                               ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                     RAG PIPELINE (src/rag_pipeline.py)               │    │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │    │
+│  │  │   Query     │→ │  Hybrid     │→ │   Reranker  │→ │    LLM      │ │    │
+│  │  │Preprocessing│  │  Retrieval  │  │   (Qwen3)   │  │  Synthesis  │ │    │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘ │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                               │                                              │
+│                               ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │              QDRANT VECTOR DATABASE (Self-Hosted on Hetzner)         │    │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │    │
+│  │  │                   COLLECTION: rag_pipeline                   │   │    │
+│  │  │  • Dense Vectors:    Qwen3-Embedding-0.6B (1024-d)          │   │    │
+│  │  │  • Sparse Vectors:   BM25 (Hybrid Search)                   │   │    │
+│  │  │  • Quantization:     Scalar (int8, 75% memory reduction)    │   │    │
+│  │  │  • Payload:          Medical metadata + Full text           │   │    │
+│  │  └─────────────────────────────────────────────────────────────┘   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 📊 Pipeline Components
-
-| Component | Technology | Description |
-|-----------|------------|-------------|
-| **Vector Database** | Qdrant Cloud | 1.29M documents, Cloud Inference, Binary Quantization |
-| **Embeddings** | mixedbread-ai/mxbai-embed-large-v1 | 1024-dimensional dense vectors |
-| **Reranking** | Cohere rerank-v4.0-pro | Neural reranking with YAML formatting |
-| **LLM** | OpenRouter (Nvidia Nemotron) | Response synthesis with citations |
-| **Entity Expansion** | MeSH (Medical Subject Headings) | Medical acronym expansion |
+**Data Flow:**
+1. User query → Next.js frontend
+2. FastAPI backend receives query
+3. Query preprocessing (LLM decomposition, typo correction)
+4. Hybrid retrieval from Qdrant (dense + sparse vectors)
+5. Reranking with evidence hierarchy (DeepInfra Qwen3-Reranker)
+6. Context building (intelligent section selection)
+7. LLM synthesis (DeepInfra Nemotron/DeepSeek)
+8. Streaming response to frontend
 
 ---
 
-## 🔄 RAG Pipeline Stages
+## 🚀 Key Features
 
-### Stage 1: Query Preprocessing
+### 1. **Multi-Stage Retrieval Pipeline**
+- **Query Preprocessing**: LLM-based query decomposition with typo correction, entity extraction, and intent detection
+- **Hybrid Search**: Dense (semantic) + Sparse (BM25) vector search for optimal recall
+- **Batch Query Optimization**: Reduces HTTP calls from 6+ to 1 for multi-query retrieval
+- **Evidence Hierarchy Boosting**: Prioritizes guidelines, systematic reviews, and RCTs over case reports
 
-**Location:** `src/query_preprocessor.py`, `src/medical_entity_expander.py`
+### 2. **Advanced Reranking**
+- **Strict Qwen3 Reranking**: Uses `Qwen/Qwen3-Reranker-0.6B` via DeepInfra
+- **Medical Entity Matching**: Post-reranking filtering based on medical condition matching
+- **Evidence Tier System**: 3.0x boost for guidelines, 1.5x for trials, 0.2x penalty for case reports
 
-```python
-# Example: "What are the 2023 ACR/EULAR APS classification criteria?"
-# 
-# Output:
-# - Rewritten: "ACR EULAR Antiphospholipid Syndrome APS classification criteria"
-# - Keyword: "APS antiphospholipid syndrome classification criteria ACR EULAR"
-# - Filters: {"year": "2023-2025", "field_of_study": "Medicine"}
-```
+### 3. **Intelligent Context Building**
+- **Smart Section Selection**: For DailyMed drug labels, selects relevant sections based on query intent
+- **Citation Cleaning**: Strips internal citations to prevent LLM confusion
+- **Priority Journal Boost**: +15% for high-impact journals (NEJM, Lancet, JAMA, etc.)
 
-**Features:**
-- **Medical Entity Expansion** using MeSH dictionary (10K+ acronyms)
-  - `APS` → `Antiphospholipid Syndrome`
-  - `COPD` → `Chronic Obstructive Pulmonary Disease`
-  - `HFpEF` → `Heart Failure with Preserved Ejection Fraction`
-  - MeSH cache included: `data/mesh/mesh_cache.json` (350K+ entries)
-  
-- **LLM Query Decomposition** extracts:
-  - Year range (`"latest"` → 2022-2025)
-  - Journal filters (`"from NEJM"` → filter by venue)
-  - Rewritten query for semantic search
-  - Keyword query for hybrid matching
-
-```python
-from src.query_preprocessor import QueryPreprocessor
-
-preprocessor = QueryPreprocessor()
-result = preprocessor.decompose_query("latest treatments for heart failure")
-
-# Result:
-# rewritten_query: "treatments for heart failure HFpEF HFrEF"
-# keyword_query: "heart failure treatment therapy HFpEF HFrEF"
-# search_filters: {"year": "2022-2025", "field_of_study": "Medicine"}
-```
-
----
-
-### Stage 2: Retrieval
-
-**Location:** `src/retriever_qdrant.py`
-
-**Features:**
-- **Vector Search** with Qdrant Cloud Inference (no local GPU needed)
-- **Metadata Filtering** on indexed fields:
-  - `year` (integer range)
-  - `source` (pmc, dailymed)
-  - `article_type` (systematic_review, clinical_trial, etc.)
-  - `journal` (keyword match)
-  - `country` (keyword match)
-  - `evidence_grade` (A, B, C, D)
-  
-- **Hybrid Scoring** combines:
-  - Dense vector similarity (70% weight)
-  - Keyword/BM25 matching (30% weight)
-
-```python
-from src.retriever_qdrant import QdrantRetriever
-
-retriever = QdrantRetriever(n_retrieval=100)
-passages = retriever.retrieve_passages(
-    query="COPD management guidelines",
-    year="2022-2025",
-    article_type="guideline,systematic_review"
-)
-# Returns: 100 relevant passages with metadata
-```
-
----
-
-### Stage 3: Reranking & Post-Processing
-
-**Location:** `src/reranker.py`
-
-**Reranking Pipeline:**
-
-1. **Cohere Neural Reranking** (rerank-v4.0-pro)
-   - Documents formatted as YAML for optimal performance
-   - Returns semantic relevance scores (0.0 - 1.0)
-
-2. **Evidence Hierarchy Boosting**
-   ```python
-   EVIDENCE_HIERARCHY = {
-       "systematic_review": 1.25,    # Highest evidence
-       "meta_analysis": 1.25,
-       "guideline": 1.30,
-       "clinical_trial": 1.20,
-       "randomized_controlled_trial": 1.20,
-       "review_article": 1.10,
-       "cohort_study": 1.05,
-       "research_article": 1.00,
-       "case_report": 0.90,
-       "letter": 0.85,
-       "editorial": 0.85,
-   }
-   ```
-
-3. **Entity Matching Boost**
-   - Papers containing query medical entities get score boost
-   - Prevents irrelevant results (e.g., IgG4-RD when querying APS)
-
-4. **Recency Boost**
-   - 2024-2025: 1.05x multiplier
-   - 2022-2023: 1.02x multiplier
-
-5. **High-Impact Journal Boost** (1.08x)
-   - NEJM, Lancet, JAMA, BMJ, Nature Medicine, Annals of Internal Medicine
-
-6. **Paper Aggregation**
-   - Multiple passages from same paper → single paper entry
-   - Uses max score across passages
-
-```python
-from src.reranker import PaperFinderWithReranker
-
-reranker = PaperFinderWithReranker(context_threshold=0.3)
-reranked = reranker.rerank("COPD management", passages)
-papers_df = reranker.aggregate_into_dataframe(reranked)
-```
-
----
-
-### Stage 4: LLM Synthesis
-
-**Location:** `src/rag_pipeline.py`, `src/prompts.py`
-
-**Features:**
-- **ELIXIR System Prompt** for medical education responses
-- **Priority Journal Handling** (NEJM, Lancet, JAMA get full text)
-- **Context Building:**
-  - Top 5 articles: Full text (12K chars each)
-  - Next 100 articles: Abstract only (800 chars each)
-- **Structured Output:**
-  - Markdown formatting with headers
-  - Tables for staging/classification systems
-  - Inline citations [1], [2], [3]...
-  - Evidence-based recommendations
-
-```python
-from src.rag_pipeline import MedicalRAGPipeline
-
-pipeline = MedicalRAGPipeline()
-result = pipeline.answer("management of COPD")
-
-# Returns:
-# {
-#   "answer": "## Overview\n\nCOPD management...[1][2]\n\n## Treatment...",
-#   "sources": [{"pmcid": "PMC123", "title": "...", "pdf_url": "..."}],
-#   "full_text_articles": [{"source_num": 1, "title": "..."}],
-#   "status": "success"
-# }
-```
-
----
-
-### Stage 5: PDF Availability Check
-
-**Location:** `src/rag_pipeline.py`
-
-- **Europe PMC API** integration
-- Parallel PDF availability check (10 concurrent)
-- Returns open-access PDF URLs when available
-- Format: `https://europepmc.org/articles/PMC123?pdf=render`
+### 4. **Streaming Response**
+- Real-time SSE (Server-Sent Events) streaming for progressive answer generation
+- Step-by-step progress indicators (Query Analysis → Retrieval → Reranking → PDF Check → Synthesis)
 
 ---
 
@@ -251,355 +84,486 @@ result = pipeline.answer("management of COPD")
 
 ```
 RAG-pipeline/
-├── README.md                        # This file
-├── requirements.txt                 # Python dependencies
-├── env.example                      # Environment template
-├── .gitignore
+├── src/                                    # Core pipeline modules
+│   ├── api_server.py                       # FastAPI REST API
+│   ├── rag_pipeline.py                     # Main RAG orchestration
+│   ├── retriever_qdrant.py                 # Qdrant hybrid retriever
+│   ├── reranker.py                         # Reranking with evidence hierarchy
+│   ├── query_preprocessor.py               # LLM query decomposition
+│   ├── config.py                           # Central configuration
+│   ├── prompts.py                          # LLM system prompts
+│   ├── medical_qdrant_client.py            # Qdrant client wrapper
+│   ├── medical_entity_expander.py          # MeSH acronym expansion
+│   ├── bm25_sparse.py                      # BM25 sparse encoder
+│   ├── splade_encoder.py                   # SPLADE sparse encoder (backup)
+│   └── specialty_journals.py               # Journal priority lists
 │
-├── docs/
-│   └── PRD-Pipeline.md             # Detailed PRD (2000+ lines)
+├── scripts/                                # Data ingestion pipeline
+│   ├── 01_download_pmc.py                  # Download PMC OA articles
+│   ├── 02_extract_pmc.py                   # Extract XML content
+│   ├── 03_download_dailymed.py             # Download FDA drug labels
+│   ├── 04_process_dailymed.py              # Process drug label XML
+│   ├── 05_setup_qdrant.py                  # Initialize Qdrant collection
+│   ├── 06_ingest_pmc.py                    # Ingest PMC to Qdrant
+│   ├── 07_ingest_dailymed.py               # Ingest DailyMed to Qdrant
+│   ├── 08_monthly_update.py                # Incremental updates
+│   ├── 09_smoke_test.py                    # Validation tests
+│   ├── 10_download_gov_abstracts.py        # Download ClinicalTrials.gov/FDA
+│   ├── 11_download_author_manuscripts.py   # Download PMC Author Manuscripts
+│   ├── 14_ingest_author_manuscripts.py     # Ingest Author Manuscripts
+│   ├── 15_ingest_gov_abstracts.py          # Ingest Gov Abstracts
+│   ├── 20_download_pubmed_baseline.py      # Download PubMed abstracts
+│   ├── 21_ingest_pubmed_abstracts.py       # Ingest PubMed to Qdrant
+│   ├── 22_add_fulltext_to_pmc.py           # Add full text to existing points
+│   ├── config_ingestion.py                 # Ingestion config
+│   ├── ingestion_utils.py                  # Core ingestion utilities
+│   └── ingestion_utils_enhanced.py         # Enhanced chunking/validation
 │
-├── data/                            # Data files
-│   └── mesh/
-│       └── mesh_cache.json         # MeSH medical abbreviation cache (350K+ entries)
+├── frontend/                               # Next.js React frontend
+│   ├── src/app/
+│   │   ├── page.tsx                        # Main chat interface
+│   │   ├── layout.tsx                      # App layout
+│   │   └── globals.css                     # Global styles
+│   ├── package.json                        # Frontend dependencies
+│   └── next.config.ts                      # Next.js configuration
 │
-├── frontend/                        # Next.js Frontend (Elixir AI)
-│   ├── src/
-│   │   └── app/
-│   │       ├── page.tsx            # Main chat UI with streaming
-│   │       ├── globals.css         # Global styles (glassmorphism)
-│   │       └── layout.tsx          # App layout
-│   ├── package.json
-│   └── next.config.ts
+├── deploy/                                 # Deployment configurations
+│   └── hetzner_setup.md                    # Self-hosted Qdrant guide
 │
-├── scripts/                         # Data ingestion scripts
-│   ├── 01_download_pmc.py          # PMC S3 download
-│   ├── 02_extract_pmc.py           # PMC XML extraction
-│   ├── 03_download_dailymed.py     # DailyMed download
-│   ├── 04_process_dailymed.py      # DailyMed processing
-│   ├── 05_setup_qdrant.py          # Qdrant collection setup
-│   ├── 06_ingest_pmc.py            # PMC ingestion
-│   ├── 07_ingest_dailymed.py       # DailyMed ingestion
-│   ├── 08_monthly_update.py        # Monthly updates
-│   └── ingestion/
-│       └── 11_ingest_dailymed_cloud.py  # Optimized DailyMed ingestion
-│
-└── src/                             # RAG pipeline source
-    ├── config.py                   # Configuration & env vars
-    ├── query_preprocessor.py       # Query decomposition
-    ├── medical_entity_expander.py  # MeSH acronym expansion
-    ├── retriever_qdrant.py         # Qdrant vector search
-    ├── reranker.py                 # Cohere reranking
-    ├── rag_pipeline.py             # Main pipeline orchestrator
-    ├── prompts.py                  # ELIXIR system prompt
-    ├── specialty_journals.py       # High-impact journal list
-    ├── api_server.py               # FastAPI server with SSE streaming
-    └── splade_encoder.py           # SPLADE sparse encoder (optional)
+├── requirements.txt                        # Python dependencies
+├── .env                                    # Environment configuration
+└── README.md                               # This file
 ```
 
 ---
 
-## 🚀 Quick Start
+## 🔧 Core Components Deep Dive
 
-### 1. Setup Environment
+### 1. Query Preprocessing (`src/query_preprocessor.py`)
+
+Uses LLM to decompose queries into structured components:
+
+```python
+class DecomposedQuery(BaseModel):
+    earliest_search_year: str      # Publication year filter
+    latest_search_year: str
+    venues: str                     # Journal filters
+    rewritten_query: str           # Optimized for semantic search
+    rewritten_query_for_keyword_search: str  # For keyword matching
+    drug_names: List[str]          # Extracted medications
+    medical_conditions: List[str]  # Extracted conditions
+    corrected_query: str           # Typo-corrected query
+    corrected_medical_conditions: List[str]  # Corrected conditions
+```
+
+**Features:**
+- Medical acronym expansion (MeSH-based)
+- Drug name extraction with brand/generic mapping (e.g., "golimumab" → ["golimumab", "SIMPONI", "SIMPONI ARIA"])
+- Typo detection and correction (e.g., "NUEROBROCELLOSIS" → "neurobrucellosis")
+- Query variation generation for multi-query retrieval (treatment, diagnosis, guidelines angles)
+
+### 2. Hybrid Retriever (`src/retriever_qdrant.py`)
+
+Implements batched hybrid search with RRF (Reciprocal Rank Fusion):
+
+```python
+# Dense + Sparse vectors combined
+dense_weight = 0.7    # Semantic similarity (Qwen3 embeddings)
+sparse_weight = 0.3   # BM25 lexical matching
+
+# Batch query reduces HTTP calls from 6+ to 1
+batch_results = client.query_batch_points(
+    collection_name=collection_name,
+    requests=batch_requests  # All queries in one call
+)
+```
+
+**Key Methods:**
+- `batch_hybrid_search()` - Main retrieval method, batches all query variations
+- `search_dailymed_by_drug()` - Parallel drug label lookup by drug names
+- `_build_filter()` - Metadata filtering (year, venue, article_type)
+
+### 3. Reranker with Evidence Hierarchy (`src/reranker.py`)
+
+Multi-factor scoring system:
+
+```python
+# Evidence tier multipliers (defined in reranker.py)
+TIER_1_BOOST = 3.00   # Guidelines, systematic reviews, meta-analyses
+TIER_2_BOOST = 1.50   # RCTs, clinical trials, review articles  
+TIER_3_BOOST = 1.00   # Standard research
+TIER_4_PENALTY = 0.20 # Case reports, letters, editorials (suppressed)
+
+# Additional multipliers
+RECENCY_MULT = 1.10   # Recent papers (last 2 years, non-case-reports only)
+JOURNAL_MULT = 1.15   # High-impact journals (NEJM, Lancet, etc.)
+```
+
+**Pipeline:**
+1. DeepInfra reranking (`Qwen/Qwen3-Reranker-0.6B`) → raw relevance scores
+2. Entity matching score (30% weight) → medical condition overlap
+3. Combined score = 0.7 * rerank_score + 0.3 * entity_score
+4. Evidence tier multiplier application
+5. DOI/title-based deduplication
+6. Paper-level aggregation (max score per paper)
+
+### 4. Context Builder (`src/rag_pipeline.py`)
+
+Intelligent context assembly in `_get_papers_for_context()`:
+
+**For PMC Articles:**
+- Abstract only (1200 char limit)
+- Priority journal ordering (NEJM, Lancet, JAMA first)
+- Article type badges
+
+**For DailyMed Drug Labels:**
+```python
+# Always include
+- Highlights of Prescribing Information (8000 chars)
+- Clinical Studies section (15000 chars)
+
+# Conditional (if query mentions mechanisms, PK/PD)
+- Clinical Pharmacology section (10000 chars)
+```
+
+**Features:**
+- Citation cleaning (`_clean_source_text()`) - removes `[1]`, `[2-5]` patterns
+- Smart recency (preserves seminal older guidelines)
+
+### 5. LLM Synthesis (`src/rag_pipeline.py`)
+
+**System Prompt**: `ELIXIR_SYSTEM_PROMPT` (in `src/prompts.py`)
+- Clinical decision support persona for physicians
+- Extracts specific details: staging systems, medication protocols, trial results
+- Markdown tables for comparisons
+- Inline citations `[1]`, `[2]` strictly enforced
+- No general disclaimers (peer-to-peer professional communication)
+
+**Model:**
+- Uses `openai/gpt-oss-20b` via DeepInfra
+- Fallback logic disabled (Strict configuration)
+
+---
+
+## 🛠️ Setup & Development
+
+### Prerequisites
+
+- Python 3.11+
+- Node.js 18+ (for frontend)
+- Docker (for local Qdrant testing)
+- DeepInfra API key (ask team lead)
+
+### 1. Clone & Install
 
 ```bash
-git clone https://github.com/Airheumatologist/RAG-pipeline.git
 cd RAG-pipeline
 
-# Create environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
+```
 
-# Configure environment
+### 2. Configure Environment
+
+```bash
 cp env.example .env
-# Edit .env with your API keys
 ```
 
-### 2. Required API Keys
+Edit `.env` with team credentials:
+
+```env
+# =============================================================================
+# QDRANT (Self-Hosted on Private Server - Hetzner)
+# =============================================================================
+QDRANT_URL=http://65.109.112.253:6333
+QDRANT_API_KEY=<ask-team-lead>
+QDRANT_COLLECTION=rag_pipeline
+
+# =============================================================================
+# DEEPINFRA API (Team Account)
+# =============================================================================
+DEEPINFRA_API_KEY=<ask-team-lead>
+DEEPINFRA_MODEL=openai/gpt-oss-20b
+DEEPINFRA_BASE_URL=https://api.deepinfra.com/v1/openai
+
+# Embedding Model
+EMBEDDING_PROVIDER=deepinfra
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B-batch
+
+# Reranker Model  
+RERANKER_PROVIDER=deepinfra
+RERANKER_MODEL=Qwen/Qwen3-Reranker-0.6B
+
+# =============================================================================
+# CHUNKING (Optimized for Qwen3 32K context)
+# =============================================================================
+CHUNK_SIZE_TOKENS=2048
+CHUNK_OVERLAP_TOKENS=256
+
+# =============================================================================
+# SEARCH CONFIGURATION
+# =============================================================================
+USE_HYBRID_SEARCH=true
+SPARSE_RETRIEVAL_MODE=bm25
+RETRIEVAL_CHUNK_LIMIT=400
+RERANK_TOP_CHUNKS=100
+FINAL_TOP_ARTICLES=50
+```
+
+### 3. Local Development (without full dataset)
 
 ```bash
-# .env file
-QDRANT_URL=http://your-hetzner-server-ip:6333
-QDRANT_API_KEY=your_self_hosted_qdrant_api_key
-EMBEDDING_PROVIDER=local  # or qdrant_cloud_inference
-COHERE_API_KEY=your_cohere_api_key
-```
+# Start local Qdrant for testing
+docker run -d \
+  --name qdrant-local \
+  -p 6333:6333 \
+  -v $(pwd)/qdrant_storage:/qdrant/storage \
+  qdrant/qdrant:v1.12.0
 
-### 3. Run the Pipeline
+# Update .env for local testing
+QDRANT_URL=http://localhost:6333
+QDRANT_API_KEY=""  # No auth for local
 
-```python
-from src.rag_pipeline import MedicalRAGPipeline
+# Run backend
+uvicorn src.api_server:app --host 0.0.0.0 --port 8000 --reload
 
-# Initialize
-pipeline = MedicalRAGPipeline()
-
-# Query
-result = pipeline.answer("What are the latest treatments for type 2 diabetes?")
-
-# Access results
-print(result["answer"])  # Markdown-formatted response
-print(result["sources"]) # List of source articles with PDF URLs
-```
-
-### 4. Run API Server
-
-```bash
-python -m src.api_server
-# Server runs at http://localhost:8000
-
-# API Endpoints:
-# POST /api/chat/stream - Streaming query with SSE progress updates
-# GET /api/health - Health check
-```
-
-### 5. Run Frontend (Elixir AI)
-
-```bash
+# Run frontend (new terminal)
 cd frontend
 npm install
 npm run dev
-# Frontend runs at http://localhost:3000
 ```
 
-The frontend connects to the backend at `http://localhost:8000` and provides:
-- Real-time streaming of pipeline progress
-- Expandable references with clickable DOI links
-- Split-screen PDF viewer for source articles
-- Modern glassmorphism UI design
+Access at `http://localhost:3000`
 
-### 6. Hetzner Deployment Assets
+### 4. Production Data Ingestion
 
-Self-hosted production assets are in:
-
-- `deploy/hetzner/docker-compose.yml`
-- `deploy/hetzner/qdrant-production.yaml`
-- `deploy/hetzner/cron/*.cron`
-- `deploy/hetzner/backup.sh`
-- `deploy/hetzner/healthcheck.sh`
-
-Follow `deploy/hetzner/README.md` for server bootstrap and cron installation.
-
----
-
-## 📋 Metadata Schema
-
-### PMC Articles (Qdrant Payload)
-
-```json
-{
-  "pmcid": "PMC12345678",
-  "pmid": "12345678",
-  "doi": "10.1000/example",
-  "title": "Article Title (300 chars max)",
-  "abstract": "Abstract (1000 chars max)",
-  "full_text": "Full article text (10K chars max)",
-  
-  "year": 2024,
-  "journal": "Nature Medicine",
-  "article_type": "systematic_review",
-  "publication_type": ["Systematic Review", "Meta-Analysis"],
-  
-  "evidence_grade": "A",
-  "evidence_level": 1,
-  "country": "USA",
-  "institutions": ["Harvard Medical School", "NIH"],
-  
-  "keywords": ["diabetes", "treatment"],
-  "mesh_terms": ["Diabetes Mellitus", "Drug Therapy"],
-  
-  "authors": ["Smith, John", "Doe, Jane"],
-  "first_author": "Smith, John",
-  "author_count": 5,
-  
-  "has_full_text": true,
-  "has_methods": true,
-  "has_results": true,
-  "table_count": 3,
-  "figure_count": 5,
-  
-  "source": "pmc"
-}
-```
-
-### DailyMed Drugs (Qdrant Payload)
-
-```json
-{
-  "set_id": "uuid",
-  "drug_name": "Metformin Hydrochloride",
-  "title": "FDA Label Title",
-  "active_ingredients": ["METFORMIN HYDROCHLORIDE"],
-  "manufacturer": "Generic Pharma Inc",
-  
-  "indications": "Treatment of type 2 diabetes...",
-  "contraindications": "Renal impairment...",
-  "warnings": "Lactic acidosis risk...",
-  "adverse_reactions": "Nausea, diarrhea...",
-  "dosage": "500mg twice daily...",
-  
-  "source": "dailymed",
-  "article_type": "drug_label"
-}
-```
-
----
-
-## ⚙️ Configuration Options
-
-### Pipeline Settings (`src/config.py`)
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `TOP_K_RESULTS` | 5 | Documents to retrieve |
-| `SCORE_THRESHOLD` | 0.3 | Minimum similarity score |
-| `BULK_RETRIEVAL_LIMIT` | 200 | Max candidates before reranking |
-| `RERANK_TOP_K` | 20 | Final articles after reranking |
-| `FULL_TEXT_COUNT` | 10 | Articles with full text in output |
-| `DENSE_WEIGHT` | 0.7 | Dense vector weight in hybrid search |
-| `SPARSE_WEIGHT` | 0.3 | Sparse vector weight in hybrid search |
-
-### Evidence Hierarchy for Reranking
-
-| Grade | Article Types | Boost |
-|-------|---------------|-------|
-| **A** | Meta-analysis, Systematic Review, Guidelines | 1.25-1.30x |
-| **B** | RCT, Clinical Trial | 1.20x |
-| **C** | Review, Cohort Study | 1.05-1.10x |
-| **D** | Case Report, Case Series | 0.90-0.92x |
-| **E** | Editorial, Letter, Comment | 0.80-0.85x |
-
----
-
-## 🔧 Data Ingestion (Self-Hosted)
-
-See these docs:
-
-- [PRD-Migration-Hetzner-Qdrant-v3.md](PRD-Migration-Hetzner-Qdrant-v3.md) for the self-hosted migration plan
-- [deploy/hetzner/README.md](deploy/hetzner/README.md) for deployment/runbook steps
-
-### Quick Commands
+Use the provided bash scripts for a streamlined workflow:
 
 ```bash
-# On your Hetzner host or ingestion worker
+# 1. Complete Ingestion (Downloads + Ingests all datasets)
+./scripts/run_complete_ingestion.sh
 
-# 1. Download PMC OA bulk files (no AWS dependency)
-python scripts/01_download_pmc.py --output-dir /data/ingestion/pmc_xml
+# OR 2. Background Ingestion (Run in background with logs)
+./scripts/run_ingestion_background.sh
+```
 
-# 2. Extract to JSONL (supports .xml and .xml.gz)
-python scripts/02_extract_pmc.py --xml-dir /data/ingestion/pmc_xml --output /data/ingestion/pmc_articles.jsonl
+**Manual Breakdown (if running step-by-step):**
 
-# 3. Download DailyMed (30 mins)
-python scripts/03_download_dailymed.py --output-dir /data/ingestion/dailymed/xml
+```bash
+# Setup collection
+python scripts/05_setup_qdrant.py --recreate
 
-# 4. Setup self-hosted Qdrant collection
-python scripts/05_setup_qdrant.py --collection-name medical_rag
+# 1. PMC Articles
+python scripts/01_download_pmc.py --years 2020-2025
+python scripts/02_extract_pmc.py
+python scripts/06_ingest_pmc.py
+python scripts/22_add_fulltext_to_pmc.py
 
-# 5. Ingest PMC
-python scripts/06_ingest_pmc.py --articles-file /data/ingestion/pmc_articles.jsonl
+# 2. DailyMed Drug Labels
+python scripts/03_download_dailymed.py
+python scripts/04_process_dailymed.py
+python scripts/07_ingest_dailymed.py
 
-# 6. Ingest DailyMed
-python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
+# 3. PubMed Abstracts
+python scripts/20_download_pubmed_baseline.py
+python scripts/21_ingest_pubmed_abstracts.py
 
-# 7. Monthly updates (cron-safe, tracks processed update files)
-python scripts/08_monthly_update.py
+# 4. Author Manuscripts & Government Abstracts
+python scripts/11_download_author_manuscripts.py
+python scripts/14_ingest_author_manuscripts.py
+python scripts/10_download_gov_abstracts.py
+python scripts/15_ingest_gov_abstracts.py
 ```
 
 ---
 
-## 🧪 Testing
+## 🔌 API Endpoints
 
-```python
-# Test preprocessing
-from src.query_preprocessor import QueryPreprocessor
-preprocessor = QueryPreprocessor()
-result = preprocessor.decompose_query("COPD management guidelines 2024")
-print(f"Rewritten: {result.rewritten_query}")
-print(f"Filters: {result.search_filters}")
+### Chat Endpoint (Streaming) - PRIMARY
 
-# Test retrieval
-from src.retriever_qdrant import QdrantRetriever
-retriever = QdrantRetriever(n_retrieval=10)
-passages = retriever.retrieve_passages("COPD treatment")
-print(f"Retrieved: {len(passages)} passages")
+```bash
+curl -X POST http://localhost:8000/api/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What are the latest treatments for rheumatoid arthritis?", "stream": true}'
+```
 
-# Test reranking
-from src.reranker import PaperFinderWithReranker
-reranker = PaperFinderWithReranker()
-reranked = reranker.rerank("COPD treatment", passages)
-print(f"Top score: {reranked[0].get('boosted_score', 0):.3f}")
+**Response:** Server-Sent Events (SSE)
 
-# Test full pipeline
-from src.rag_pipeline import MedicalRAGPipeline
-pipeline = MedicalRAGPipeline()
-result = pipeline.answer("management of COPD")
-print(f"Answer length: {len(result['answer'])} chars")
-print(f"Sources: {len(result['sources'])} articles")
+```
+data: {"step": "query_expansion", "status": "running"}
+data: {"step": "retrieval", "status": "running", "retrieved_count": 400}
+data: {"step": "reranking", "status": "complete", "sources": [...]}
+data: {"step": "generation", "status": "running", "token": "The latest treatments..."}
+data: {"step": "complete", "status": "success", "answer": "...", "sources": [...]}
+data: [DONE]
+```
+
+### Non-Streaming Chat
+
+```bash
+curl -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Management of IgG4-related disease"}'
+```
+
+### Query Decomposition (Debug)
+
+```bash
+curl -X POST http://localhost:8000/api/query/decompose \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Systematic reviews on SGLT2 inhibitors from 2020"}'
 ```
 
 ---
 
-## 📈 Performance Benchmarks
+## 📊 Configuration Reference
 
-| Operation | Duration | Throughput |
-|-----------|----------|------------|
-| Query preprocessing | ~500ms | - |
-| Vector retrieval (100 docs) | ~200ms | - |
-| Cohere reranking (100 docs) | ~1-2s | - |
-| LLM synthesis | ~5-15s | - |
-| PDF check (parallel) | ~2-5s | 10 concurrent |
-| **Total E2E latency** | **~10-25s** | - |
+### Embedding Models (via DeepInfra)
 
-### Ingestion Benchmarks
+| Model | Dimension | Context | Use Case |
+|-------|-----------|---------|----------|
+| Qwen/Qwen3-Embedding-0.6B-batch | 1024 | 32K | **Strict Default** |
 
-| Operation | Duration | Throughput |
-|-----------|----------|------------|
-| PMC S3 Download | 4-8 hours | ~25 GB/hour |
-| PMC Extraction | 3-4 hours | ~300 files/sec |
-| DailyMed Download | 30 mins | - |
-| Qdrant Ingestion | 75 mins | 238 articles/sec |
+### Reranker Models (via DeepInfra)
+
+| Model | Max Tokens | Notes |
+|-------|------------|-------|
+| Qwen/Qwen3-Reranker-0.6B | 32K | **Strict Default** |
+
+### LLM Models (via DeepInfra)
+
+| Model | Use Case |
+|-------|----------|
+| openai/gpt-oss-20b | **Primary generation** (No fallback) |
+
+---
+
+## 🧪 Testing & Debugging
+
+```bash
+# Validate configuration
+python src/config.py
+
+# Test Qdrant connection
+python src/medical_qdrant_client.py
+
+# Test reranker
+python src/reranker.py
+
+# Test query preprocessing
+python src/query_preprocessor.py
+
+# Run smoke tests
+python scripts/09_smoke_test.py
+```
+
+---
+
+## 🚢 Deployment
+
+### Production Server (Hetzner)
+
+Qdrant is self-hosted on Hetzner AX52 (64GB RAM, AMD Ryzen 7000).
+
+See `deploy/hetzner_setup.md` for:
+- Server provisioning
+- Docker setup
+- Qdrant configuration
+- Firewall rules
+
+### Backend Deployment
+
+```bash
+# Production with multiple workers
+uvicorn src.api_server:app \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --workers 4 \
+  --proxy-headers
+```
+
+### Frontend Deployment
+
+```bash
+cd frontend
+npm run build
+npm start  # Production mode
+```
+
+---
+
+## ⚡ Performance Optimization
+
+### 1. Chunking Strategy
+- **Size**: 2048 tokens (optimal for Qwen3 with 32K context)
+- **Overlap**: 256 tokens (12.5% for continuity)
+- **Filtering**: Conservative profile for clinical backmatter
+
+### 2. Vector Quantization
+- **Type**: Scalar (int8)
+- **Memory Reduction**: 75% (4x)
+- **Accuracy Loss**: <1%
+- **Rescore**: Enabled for query-time accuracy recovery
+
+### 3. Batch Query Optimization
+- Reduces HTTP calls from 6+ to 1 per user query
+- Parallel DailyMed search in background thread
+- Pre-computed sparse vectors for all query variations
+
+### 4. Retrieval Limits
+- **Initial Retrieval**: 400 chunks
+- **Rerank Input**: 200 chunks (2 per article max)
+- **Rerank Output**: 100 chunks
+- **Final Articles**: 50 papers
 
 ---
 
 ## 🔒 Security Notes
 
-- API keys stored in `.env` (gitignored)
-- Qdrant API key required for vector operations
-- Cohere API key required for reranking
-- OpenRouter API key required for LLM synthesis
-- No PHI (Protected Health Information) stored
+- **Qdrant**: Protected by API key, firewall restricted to team IPs
+- **DeepInfra**: API key stored in environment variables only
+- **CORS**: Configured for specific origins in `src/api_server.py`
+- **No PII**: Pipeline processes only public medical literature
 
 ---
 
-## 📚 Documentation
+## 🐛 Common Issues
 
-- [PRD-Pipeline.md](docs/PRD-Pipeline.md) - Complete Production Requirements Document
-  - Detailed architecture
-  - Step-by-step implementation
-  - Performance optimizations
-  - Cost estimates
-  - Lessons learned
+### Qdrant Connection Timeout
+```
+# Increase timeout in src/config.py
+QDRANT_TIMEOUT = 180  # seconds
+```
 
----
+### DeepInfra Rate Limiting
+- Batch size is set to 64 for embeddings
+- Retries enabled with exponential backoff
 
-## 📄 License
-
-MIT License
-
----
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Submit a pull request
+### Out of Memory During Ingestion
+- Reduce `BATCH_SIZE` in `scripts/config_ingestion.py`
+- Use `MAX_WORKERS=4` instead of 8
 
 ---
 
-**Maintained by:** Medical AI Team  
-**Version:** 1.0.0  
-**Last Updated:** December 2024
+## 📞 Team Contacts
+
+- **Infrastructure/Deployment**: See team wiki
+- **Data Ingestion Issues**: Check `CHANGES_SUMMARY.md` for recent fixes
+- **API Issues**: Review `src/api_server.py` logs
+
+---
+
+## 📝 Recent Changes
+
+See `CHANGES_SUMMARY.md` for:
+- Token range fixes in QualityValidator
+- Author manuscripts logic bug fixes
+- SemanticChunker tokenizer integration
+
+---
+
+**Internal Use Only** | Do not distribute outside the organization
