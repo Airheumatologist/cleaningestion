@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Set
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.config import QDRANT_URL, QDRANT_API_KEY, COLLECTION_NAME
+from config_ingestion import IngestionConfig
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
@@ -201,19 +201,19 @@ def main():
     parser.add_argument(
         "--collection",
         type=str,
-        default=COLLECTION_NAME,
-        help=f"Qdrant collection name (default: {COLLECTION_NAME})"
+        default=IngestionConfig.COLLECTION_NAME,
+        help=f"Qdrant collection name (default: {IngestionConfig.COLLECTION_NAME})"
     )
     parser.add_argument(
         "--qdrant-url",
         type=str,
-        default=QDRANT_URL,
-        help=f"Qdrant URL (default: {QDRANT_URL})"
+        default=IngestionConfig.QDRANT_URL,
+        help=f"Qdrant URL (default: {IngestionConfig.QDRANT_URL})"
     )
     parser.add_argument(
         "--qdrant-api-key",
         type=str,
-        default=QDRANT_API_KEY,
+        default=IngestionConfig.QDRANT_API_KEY,
         help="Qdrant API key (optional)"
     )
     

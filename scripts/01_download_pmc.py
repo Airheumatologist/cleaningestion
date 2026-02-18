@@ -13,11 +13,19 @@ from config_ingestion import IngestionConfig, ensure_data_dirs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+DEPRECATION_MESSAGE = (
+    "scripts/01_download_pmc.py is deprecated. "
+    "Use scripts/01_download_pmc_unified.py instead."
+)
+
 LEGACY_REMOTE_DIR_TO_DATASET = {
     "/pub/pmc/oa_bulk/oa_comm/xml/": "pmc_oa",
     "/pub/pmc/manuscript/xml/": "author_manuscript",
 }
 DEFAULT_REMOTE_DIR = "/pub/pmc/oa_bulk/oa_comm/xml/"
+
+if __name__ != "__main__":
+    raise ImportError(DEPRECATION_MESSAGE)
 
 
 def _load_unified_module():
@@ -36,11 +44,20 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=IngestionConfig.PMC_XML_DIR)
     parser.add_argument("--remote-dir", type=str, default=DEFAULT_REMOTE_DIR)
     parser.add_argument("--max-files", type=int, default=None)
+    parser.add_argument(
+        "--acknowledge-deprecated-wrapper",
+        action="store_true",
+        help="Required to run this deprecated compatibility wrapper.",
+    )
     args = parser.parse_args()
 
-    logger.warning(
-        "scripts/01_download_pmc.py is deprecated. Use scripts/01_download_pmc_unified.py instead."
-    )
+    if not args.acknowledge_deprecated_wrapper:
+        parser.error(
+            f"{DEPRECATION_MESSAGE} "
+            "Run scripts/01_download_pmc_unified.py directly for standard usage."
+        )
+
+    logger.warning(DEPRECATION_MESSAGE)
 
     dataset = LEGACY_REMOTE_DIR_TO_DATASET.get(args.remote_dir)
     if dataset is None:

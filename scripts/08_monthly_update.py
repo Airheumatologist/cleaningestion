@@ -38,6 +38,10 @@ from ingestion_utils import (
     get_evidence_level,
     extract_gov_affiliations_from_pubmed_xml,
 )
+from pubmed_publication_filters import (
+    is_target_article,
+    map_publication_type,
+)
 
 # Import enhanced utilities for semantic chunking
 try:
@@ -56,34 +60,12 @@ logger = logging.getLogger(__name__)
 PUBMED_FTP_HOST = "ftp.ncbi.nlm.nih.gov"
 PUBMED_UPDATE_DIR = "/pubmed/updatefiles/"
 PROCESSED_TRACKER = IngestionConfig.DATA_DIR / "processed_updates.json"
+CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
 UPDATE_DOWNLOAD_DIR = IngestionConfig.DATA_DIR / "pubmed_updatefiles"
+PUBMED_CHECKPOINT_NAMESPACE = "pubmed"
 
-# PubMed filtering constants (must match 20_download_pubmed_baseline.py)
+# PubMed filtering constants
 DEFAULT_MIN_YEAR = 2015
-
-TARGET_PUBLICATION_TYPES = {
-    # TIER_1 types (1.80x boost in reranker) - Highest evidence
-    "practice guideline": "practice_guideline",
-    "meta-analysis": "meta_analysis",
-    "systematic review": "systematic_review",
-    # TIER_1 Clinical Trials (Phase 2 addition)
-    "randomized controlled trial": "randomized_controlled_trial",
-    "clinical trial": "clinical_trial",
-    "clinical trial, phase i": "clinical_trial_phase_i",
-    "clinical trial, phase ii": "clinical_trial_phase_ii",
-    "clinical trial, phase iii": "clinical_trial_phase_iii",
-    "clinical trial, phase iv": "clinical_trial_phase_iv",
-    "controlled clinical trial": "controlled_clinical_trial",
-    "multicenter study": "multicenter_study",
-    # TIER_2 types (1.25x boost in reranker)
-    "review": "review",
-}
-
-
-def is_target_article(pub_types: List[str]) -> bool:
-    """Check if article has any target publication type."""
-    pub_types_lower = [pt.lower().strip() for pt in pub_types]
-    return any(target in pub_types_lower for target in TARGET_PUBLICATION_TYPES.keys())
 
 def load_processed_files() -> Set[str]:
     if not PROCESSED_TRACKER.exists():
@@ -97,6 +79,37 @@ def load_processed_files() -> Set[str]:
 def save_processed_files(processed: Set[str]) -> None:
     PROCESSED_TRACKER.parent.mkdir(parents=True, exist_ok=True)
     PROCESSED_TRACKER.write_text(json.dumps(sorted(processed), indent=2), encoding="utf-8")
+
+
+def _resolve_checkpoint_pmid(line: str) -> Optional[str]:
+    """Resolve checkpoint line to PMID, handling namespaced and legacy formats."""
+    value = line.strip()
+    if not value:
+        return None
+
+    # Namespaced format (current baseline ingestion)
+    if ":" in value:
+        namespace, pmid = value.split(":", 1)
+        if namespace != PUBMED_CHECKPOINT_NAMESPACE:
+            return None
+        value = pmid
+
+    value = value.strip()
+    return value if value else None
+
+
+def load_baseline_pmids(path: Path) -> Set[str]:
+    """Load baseline PubMed checkpoint PMIDs for cross-pipeline deduplication."""
+    if not path.exists():
+        return set()
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:
+        logger.warning("Failed to load baseline checkpoint %s: %s", path, exc)
+        return set()
+
+    return {pmid for line in lines if (pmid := _resolve_checkpoint_pmid(line)) is not None}
 
 
 def list_pubmed_update_files(max_files: Optional[int]) -> List[str]:
@@ -124,21 +137,6 @@ def download_pubmed_file(file_name: str, output_dir: Path) -> Path:
         ftp.retrbinary(f"RETR {file_name}", f.write, blocksize=1024 * 1024)
     ftp.quit()
     return local_path
-
-
-def infer_article_type(pub_types: List[str]) -> str:
-    lowered = [p.lower() for p in pub_types]
-    if any("guideline" in p for p in lowered):
-        return "guideline"
-    if any("meta-analysis" in p or "systematic review" in p for p in lowered):
-        return "systematic_review"
-    if any("clinical trial" in p or "randomized" in p for p in lowered):
-        return "clinical_trial"
-    if any("review" in p for p in lowered):
-        return "review_article"
-    if any("case report" in p for p in lowered):
-        return "case_report"
-    return "research_article"
 
 
 def parse_pubmed_update_xml(
@@ -208,7 +206,10 @@ def parse_pubmed_update_xml(
                     doi = article_id.text.strip()
                     break
 
-            article_type = infer_article_type(pub_types)
+            article_type = map_publication_type(pub_types)
+            if not article_type:
+                elem.clear()
+                continue
             evidence = classify_evidence_metadata(
                 article_type=article_type,
                 pub_types=pub_types,
@@ -393,6 +394,9 @@ def ingest_pubmed_updates(
     min_year: int = DEFAULT_MIN_YEAR
 ) -> int:
     processed = load_processed_files()
+    baseline_pmids = load_baseline_pmids(CHECKPOINT_FILE)
+    logger.info("Loaded baseline PubMed checkpoint IDs=%d from %s", len(baseline_pmids), CHECKPOINT_FILE)
+
     all_files = list_pubmed_update_files(max_files=max_files)
     new_files = [f for f in all_files if f not in processed]
 
@@ -426,7 +430,14 @@ def ingest_pubmed_updates(
         local_file = download_pubmed_file(file_name, UPDATE_DOWNLOAD_DIR)
 
         batch: List[Dict[str, Any]] = []
+        file_inserted = 0
+        skipped_from_baseline = 0
         for article in parse_pubmed_update_xml(local_file, min_year=min_year):
+            pmid = str(article.get("pmid") or "").strip()
+            if pmid in baseline_pmids:
+                skipped_from_baseline += 1
+                continue
+
             batch.append(article)
             if len(batch) < IngestionConfig.BATCH_SIZE:
                 continue
@@ -435,6 +446,7 @@ def ingest_pubmed_updates(
             if points:
                 upsert_with_retry(client, points)
                 inserted += len(points)
+                file_inserted += len(points)
                 time.sleep(0.5)  # Throttle: allow RocksDB compaction
             batch.clear()
 
@@ -444,10 +456,12 @@ def ingest_pubmed_updates(
             if points:
                 upsert_with_retry(client, points)
                 inserted += len(points)
+                file_inserted += len(points)
 
         processed.add(file_name)
         save_processed_files(processed)
         local_file.unlink(missing_ok=True)
+        logger.info("Completed file: %s inserted=%d skipped_baseline=%d", file_name, file_inserted, skipped_from_baseline)
 
     return inserted
 
@@ -455,17 +469,20 @@ def ingest_pubmed_updates(
 def run_dailymed_refresh() -> None:
     """Run DailyMed incremental update using weekly updates."""
     logger.info("Starting DailyMed incremental refresh (weekly updates)")
+    set_id_manifest = IngestionConfig.DAILYMED_XML_DIR / "dailymed_last_update_set_ids.txt"
     # Download last 4 weeks of updates to catch any missed changes
     subprocess.run([
         sys.executable, "scripts/03_download_dailymed.py", 
         "--output-dir", str(IngestionConfig.DAILYMED_XML_DIR),
         "--update-type", "weekly",
-        "--weeks-back", "4"
+        "--weeks-back", "4",
+        "--set-id-manifest", str(set_id_manifest),
     ], check=True)
     # Clear checkpoint entries for updated labels so they get re-ingested
     subprocess.run([
         sys.executable, "scripts/04_prepare_dailymed_updates.py",
-        "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR)
+        "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR),
+        "--set-id-manifest", str(set_id_manifest),
     ], check=True)
     # Ingest - updated labels will now be processed
     subprocess.run([

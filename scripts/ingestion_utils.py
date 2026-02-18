@@ -61,37 +61,32 @@ ISO_COUNTRY_CODES = {
 }
 
 class EmbeddingProvider:
-    """Support for local, Cohere, and cloud inference embeddings."""
+    """Support for DeepInfra embeddings."""
     
     def __init__(self) -> None:
         self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
         self.model = IngestionConfig.EMBEDDING_MODEL
-        self.local_encoder = None
         self.openai_client = None
 
-        if self.provider == "deepinfra":
-            from openai import OpenAI
-            api_key = os.getenv("DEEPINFRA_API_KEY")
-            if not api_key:
-                raise ValueError("DEEPINFRA_API_KEY not set - required for deepinfra embedding provider")
-            self.openai_client = OpenAI(
-                api_key=api_key,
-                base_url="https://api.deepinfra.com/v1/openai"
+        if self.provider != "deepinfra":
+            raise ValueError(
+                f"Unsupported embedding provider '{self.provider}'. "
+                "Only 'deepinfra' is supported."
             )
-            logger.info("✅ DeepInfra embedding provider initialized (model: %s)", self.model)
-        elif self.provider == "local":
-            from sentence_transformers import SentenceTransformer
-            logger.info("Loading local embedding model: %s", self.model)
-            self.local_encoder = SentenceTransformer(self.model)
+
+        from openai import OpenAI
+
+        api_key = os.getenv("DEEPINFRA_API_KEY")
+        if not api_key:
+            raise ValueError("DEEPINFRA_API_KEY not set - required for deepinfra embedding provider")
+        self.openai_client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepinfra.com/v1/openai"
+        )
+        logger.info("✅ DeepInfra embedding provider initialized (model: %s)", self.model)
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
-        if self.provider == "deepinfra":
-            return self._embed_deepinfra(texts)
-        elif self.local_encoder is not None:
-            vectors = self.local_encoder.encode(texts, normalize_embeddings=True, batch_size=IngestionConfig.EMBEDDING_BATCH_SIZE)
-            return [v.tolist() for v in vectors]
-        else:
-            raise RuntimeError("No embedding provider available")
+        return self._embed_deepinfra(texts)
 
     def _embed_deepinfra(self, texts: List[str]) -> List[List[float]]:
         """Embed using DeepInfra OpenAI-compatible API with sub-batching."""

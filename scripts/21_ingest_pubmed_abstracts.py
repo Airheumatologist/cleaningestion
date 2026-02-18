@@ -6,7 +6,7 @@ Ingests high-value PubMed abstracts (Reviews, Meta-Analyses, Practice Guidelines
 matching the shared architecture of PMC/DailyMed ingestion.
 
 Features:
-- Embedding: Uses centralized EmbeddingProvider (Cohere/Local)
+- Embedding: Uses centralized EmbeddingProvider (DeepInfra)
 - Sparse: BM25 (if enabled in config)
 - Chunking: Token-based chunking (splits when content exceeds CHUNK_SIZE_TOKENS)
 - Deduplication: PMID-based UUIDs

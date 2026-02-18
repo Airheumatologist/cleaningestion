@@ -24,12 +24,9 @@ class IngestionConfig:
     QDRANT_GRPC_URL = os.getenv("QDRANT_GRPC_URL", "localhost:6334")
     COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", os.getenv("COLLECTION_NAME", "rag_pipeline"))
 
-    # Embedding provider: "deepinfra" (default) or "local"
-    # Note: Qdrant Cloud Inference has been removed - DeepInfra is the only API provider
+    # Embedding provider: DeepInfra only
     EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra")
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B-batch")
-    QDRANT_INFERENCE_URL = os.getenv("QDRANT_INFERENCE_URL", "")
-    QDRANT_INFERENCE_KEY = os.getenv("QDRANT_INFERENCE_KEY", "")
 
     # Data paths
     DATA_DIR = Path(os.getenv("DATA_DIR", "/data/ingestion"))
@@ -45,7 +42,6 @@ class IngestionConfig:
     MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.getenv("PARALLEL_WORKERS", "8")))
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
     USE_GRPC = _as_bool(os.getenv("USE_GRPC"), default=True)
-    CLOUD_INFERENCE = _as_bool(os.getenv("QDRANT_CLOUD_INFERENCE"), default=False)
 
     # V4 Migration: Chunking & Filtering
     EMBED_FILTER_ENABLED = _as_bool(os.getenv("EMBED_FILTER_ENABLED"), default=True)
@@ -71,10 +67,8 @@ class IngestionConfig:
     SCALAR_QUANTILE = float(os.getenv("SCALAR_QUANTILE", "0.99"))  # Clip outliers at 1st/99th percentile
     QUANTIZATION_ALWAYS_RAM = _as_bool(os.getenv("QUANTIZATION_ALWAYS_RAM"), default=True)
 
-    # Vector dimensions for different embedding providers
-    # This ensures collection is created with the correct vector size
+    # Vector dimensions by provider (DeepInfra only)
     EMBEDDING_DIMENSIONS = {
-        "local": 1024,   # mixedbread-ai/mxbai-embed-large-v1
         "deepinfra": 1024,  # Qwen/Qwen3-Embedding-0.6B-batch
     }
 

@@ -55,6 +55,11 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Set, Tuple
 import xml.etree.ElementTree as ET
+from pubmed_publication_filters import (
+    TARGET_PUBLICATION_TYPES,
+    is_target_article,
+    map_publication_type,
+)
 
 try:
     from tqdm import tqdm
@@ -63,14 +68,6 @@ except ImportError:
     os.system("pip3 install tqdm --quiet")
     from tqdm import tqdm
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('pubmed_baseline_download.log')
-    ]
-)
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -78,25 +75,20 @@ PUBMED_FTP_BASELINE = "ftp.ncbi.nlm.nih.gov::pubmed/baseline/"
 DEFAULT_OUTPUT_DIR = Path(os.getenv("PUBMED_BASELINE_DIR", "/data/ingestion/pubmed_baseline"))
 DEFAULT_MIN_YEAR = 2015
 
-# Target publication types (case-insensitive matching)
-# These are mapped to article_type values compatible with reranker.py tiers
-TARGET_PUBLICATION_TYPES = {
-    # TIER_1 types (1.80x boost in reranker) - Highest evidence
-    "practice guideline": "practice_guideline",
-    "meta-analysis": "meta_analysis",
-    "systematic review": "systematic_review",
-    # TIER_1 Clinical Trials (Phase 2 addition)
-    "randomized controlled trial": "randomized_controlled_trial",
-    "clinical trial": "clinical_trial",
-    "clinical trial, phase i": "clinical_trial_phase_i",
-    "clinical trial, phase ii": "clinical_trial_phase_ii",
-    "clinical trial, phase iii": "clinical_trial_phase_iii",
-    "clinical trial, phase iv": "clinical_trial_phase_iv",
-    "controlled clinical trial": "controlled_clinical_trial",
-    "multicenter study": "multicenter_study",
-    # TIER_2 types (1.25x boost in reranker)
-    "review": "review",
-}
+
+def configure_logging(output_dir: Path) -> None:
+    """Configure logging to console and an output-dir-local log file."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_file = output_dir / "pubmed_baseline_download.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file, encoding='utf-8')
+        ],
+        force=True,
+    )
 
 # Government affiliation patterns for detecting US government-authored articles
 GOV_AFFILIATION_PATTERNS = [
@@ -366,62 +358,6 @@ def download_baseline(output_dir: Path) -> int:
     file_count = len(list(baseline_dir.glob("*.xml.gz")))
     logger.info(f"✅ Downloaded {file_count} baseline files")
     return file_count
-
-
-def map_publication_type(pub_types: List[str]) -> str:
-    """
-    Map PubMed publication types to reranker-compatible article_type.
-    
-    Priority order ensures highest-value type is returned:
-    1. Practice Guideline (TIER_1)
-    2. Meta-Analysis (TIER_1)
-    3. Systematic Review (TIER_1)
-    4. Randomized Controlled Trial (TIER_1)
-    5. Clinical Trial Phase III (TIER_1)
-    6. Clinical Trial Phase II (TIER_1)
-    7. Clinical Trial Phase IV (TIER_1)
-    8. Clinical Trial Phase I (TIER_1)
-    9. Controlled Clinical Trial (TIER_1)
-    10. Clinical Trial (general) (TIER_1)
-    11. Multicenter Study (TIER_1)
-    12. Review (TIER_2)
-    """
-    pub_types_lower = [pt.lower().strip() for pt in pub_types]
-    
-    # Check in priority order (highest evidence first)
-    if "practice guideline" in pub_types_lower:
-        return "practice_guideline"
-    if "meta-analysis" in pub_types_lower:
-        return "meta_analysis"
-    if "systematic review" in pub_types_lower:
-        return "systematic_review"
-    # Phase 2 additions - Clinical Trials (TIER_1)
-    if "randomized controlled trial" in pub_types_lower:
-        return "randomized_controlled_trial"
-    if "clinical trial, phase iii" in pub_types_lower:
-        return "clinical_trial_phase_iii"
-    if "clinical trial, phase ii" in pub_types_lower:
-        return "clinical_trial_phase_ii"
-    if "clinical trial, phase iv" in pub_types_lower:
-        return "clinical_trial_phase_iv"
-    if "clinical trial, phase i" in pub_types_lower:
-        return "clinical_trial_phase_i"
-    if "controlled clinical trial" in pub_types_lower:
-        return "controlled_clinical_trial"
-    if "clinical trial" in pub_types_lower:
-        return "clinical_trial"
-    if "multicenter study" in pub_types_lower:
-        return "multicenter_study"
-    if "review" in pub_types_lower:
-        return "review"
-    
-    return None  # Not a target type
-
-
-def is_target_article(pub_types: List[str]) -> bool:
-    """Check if article has any target publication type."""
-    pub_types_lower = [pt.lower().strip() for pt in pub_types]
-    return any(target in pub_types_lower for target in TARGET_PUBLICATION_TYPES.keys())
 
 
 def parse_pubmed_date(pub_date_elem: ET.Element) -> Dict[str, Any]:
@@ -1034,6 +970,7 @@ Examples:
     args = parser.parse_args()
     
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    configure_logging(args.output_dir)
     
     start_time = time.time()
     

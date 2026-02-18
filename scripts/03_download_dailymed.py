@@ -26,7 +26,6 @@ Expected Duration: 30-60 minutes for full, 2-5 minutes for weekly updates
 
 import os
 import io
-import re
 import sys
 import zipfile
 import logging
@@ -34,7 +33,7 @@ import argparse
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Optional, Set
 
 # Setup logging BEFORE any imports that might fail
 logging.basicConfig(
@@ -61,6 +60,15 @@ except Exception as e:
 
 # DailyMed bulk download configuration
 DAILYMED_PUBLIC_RELEASE_BASE = "https://dailymed-data.nlm.nih.gov/public-release-files"
+
+
+def _fallback_dailymed_xml_dir() -> Path:
+    """
+    Mirror config_ingestion default path construction when config import is unavailable.
+    """
+    default_data_dir = Path(os.getenv("DATA_DIR", "/data/ingestion"))
+    default_xml_dir = default_data_dir / "dailymed" / "xml"
+    return Path(os.getenv("DAILYMED_XML_DIR", str(default_xml_dir)))
 
 # Human prescription drug labels (6 ZIP parts)
 HUMAN_RX_ZIPS = [
@@ -96,7 +104,7 @@ def get_weekly_update_filename(weeks_ago: int = 0) -> Optional[str]:
     Weeks start on Monday and end on Friday (based on observed patterns).
     
     Args:
-        weeks_ago: Number of weeks ago (0 = current week, 1 = last week, etc.)
+        weeks_ago: Number of weeks ago (0 = most recently completed week, 1 = week before, etc.)
     
     Returns:
         Filename string or None if date would be invalid
@@ -163,11 +171,26 @@ def get_daily_update_filename(days_ago: int = 0) -> Optional[str]:
     date_str = target_date.strftime("%m%d%Y")
     return f"dm_spl_daily_update_{date_str}.zip"
 
+
+def _set_id_from_xml_name(xml_name: str) -> str:
+    """Derive normalized set_id from XML filename."""
+    return Path(xml_name).stem.strip().lower()
+
+
+def write_set_id_manifest(set_ids: Set[str], manifest_path: Path) -> None:
+    """Persist updated set_ids for downstream checkpoint preparation."""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    lines = [f"{set_id}\n" for set_id in sorted(set_ids)]
+    with open(temp_path, "w", encoding="utf-8") as handle:
+        handle.writelines(lines)
+    os.replace(temp_path, manifest_path)
+
 # Default output dir - uses centralized config if available, otherwise fallback
 if HAS_CONFIG:
     DEFAULT_OUTPUT_DIR = IngestionConfig.DAILYMED_XML_DIR
 else:
-    DEFAULT_OUTPUT_DIR = Path(os.getenv("DAILYMED_XML_DIR", "/data/ingestion/dailymed/xml"))
+    DEFAULT_OUTPUT_DIR = _fallback_dailymed_xml_dir()
 
 
 def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 1024):
@@ -200,7 +223,7 @@ def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 102
         return False
 
 
-def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = False) -> int:
+def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = False) -> tuple[int, Set[str]]:
     """
     Extract XML files from a DailyMed ZIP.
     
@@ -208,12 +231,14 @@ def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = Fal
     - outer.zip → contains many inner.zip files
     - inner.zip → contains the actual XML file
     
-    Returns number of XML files extracted.
+    Returns:
+        Tuple of (number of XML files extracted, set_ids extracted)
     """
     logger.info(f"Extracting: {zip_path.name}")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     extracted_count = 0
+    extracted_set_ids: Set[str] = set()
     
     with zipfile.ZipFile(zip_path, "r") as zf:
         # Check for direct XML files first
@@ -232,6 +257,7 @@ def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = Fal
                 with zf.open(name) as src, open(dest_path, "wb") as dst:
                     dst.write(src.read())
                 extracted_count += 1
+                extracted_set_ids.add(_set_id_from_xml_name(target_name))
         else:
             # Nested ZIPs (standard DailyMed format)
             nested_zips = [m for m in zf.namelist() if m.lower().endswith(".zip")]
@@ -260,13 +286,14 @@ def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = Fal
                                 with nested_zf.open(xml_name) as xml_src, open(dest_path, "wb") as dst:
                                     dst.write(xml_src.read())
                                 extracted_count += 1
+                                extracted_set_ids.add(_set_id_from_xml_name(target_name))
                                 
                 except Exception as e:
                     logger.debug(f"Error processing {nested_zip_name}: {e}")
                     continue
     
     logger.info(f"✅ Extracted {extracted_count:,} XML files from {zip_path.name}")
-    return extracted_count
+    return extracted_count, extracted_set_ids
 
 
 def download_dailymed(
@@ -275,7 +302,8 @@ def download_dailymed(
     refresh: bool = False,
     update_type: Optional[str] = None,
     weeks_back: int = 1,
-    days_back: int = 7
+    days_back: int = 7,
+    set_id_manifest: Optional[Path] = None
 ):
     """
     Download and extract DailyMed drug labels.
@@ -285,8 +313,9 @@ def download_dailymed(
         include_otc: Also download OTC (over-the-counter) drugs (full refresh only)
         refresh: If True, re-download and re-extract all files (full release)
         update_type: Type of update - 'daily', 'weekly', 'monthly', or None for full release
-        weeks_back: Number of weeks to go back for weekly updates (default: 1 = last week)
+        weeks_back: Number of weekly files to download, starting from most recent completed week
         days_back: Number of days to go back for daily updates (default: 7 = last 7 days)
+        set_id_manifest: Path to persist updated set_ids for incremental re-ingestion
     """
     logger.info("=" * 70)
     logger.info("💊 DailyMed Drug Labels Download")
@@ -332,6 +361,7 @@ def download_dailymed(
     
     total_extracted = 0
     downloaded_count = 0
+    updated_set_ids: Set[str] = set()
     
     for zip_name in zip_files:
         zip_url = f"{DAILYMED_PUBLIC_RELEASE_BASE}/{zip_name}"
@@ -353,8 +383,9 @@ def download_dailymed(
         # Extract XML files
         # For incremental updates, always overwrite existing XMLs to get latest versions
         extract_refresh = True if update_type else refresh
-        extracted = extract_nested_zip_xml(local_zip, output_dir, refresh=extract_refresh)
+        extracted, extracted_ids = extract_nested_zip_xml(local_zip, output_dir, refresh=extract_refresh)
         total_extracted += extracted
+        updated_set_ids.update(extracted_ids)
         
         # For incremental updates, clean up ZIP files after extraction to save space
         if update_type in ("daily", "weekly", "monthly"):
@@ -363,6 +394,12 @@ def download_dailymed(
     
     # Count total XML files
     xml_count = len(list(output_dir.glob("*.xml")))
+
+    manifest_path = set_id_manifest
+    if update_type:
+        if manifest_path is None:
+            manifest_path = output_dir / "dailymed_last_update_set_ids.txt"
+        write_set_id_manifest(updated_set_ids, manifest_path)
     
     logger.info("\n" + "=" * 70)
     logger.info("✅ DailyMed Download Complete!")
@@ -370,6 +407,9 @@ def download_dailymed(
     logger.info(f"   Downloaded files: {downloaded_count}")
     logger.info(f"   Total XML files extracted this run: {total_extracted:,}")
     logger.info(f"   Total XML files in directory: {xml_count:,}")
+    if update_type and manifest_path is not None:
+        logger.info(f"   Updated set_ids in manifest: {len(updated_set_ids):,}")
+        logger.info(f"   Manifest: {manifest_path}")
     logger.info(f"   Location: {output_dir}")
 
 
@@ -421,13 +461,19 @@ Examples:
         "--weeks-back",
         type=int,
         default=1,
-        help="Number of weeks to download for weekly updates (default: 1)"
+        help="Number of weekly files to download for weekly updates (default: 1)"
     )
     parser.add_argument(
         "--days-back",
         type=int,
         default=7,
         help="Number of days to download for daily updates (default: 7)"
+    )
+    parser.add_argument(
+        "--set-id-manifest",
+        type=Path,
+        default=None,
+        help="Optional path to write updated set_ids (incremental modes only)"
     )
     
     args = parser.parse_args()
@@ -437,10 +483,10 @@ Examples:
         args.refresh,
         args.update_type,
         args.weeks_back,
-        args.days_back
+        args.days_back,
+        args.set_id_manifest
     )
 
 
 if __name__ == "__main__":
     main()
-

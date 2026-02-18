@@ -104,7 +104,7 @@ RAG-pipeline/
 │
 ├── scripts/                                # Data ingestion pipeline
 │   ├── 01_download_pmc_unified.py          # Download PMC OA + Author Manuscripts from NCBI FTP
-│   ├── 01_download_pmc.py                  # Compatibility wrapper (deprecated)
+│   ├── 01_download_pmc.py                  # Deprecated compatibility wrapper (disabled by default)
 │   ├── 03_download_dailymed.py             # Download FDA drug labels
 │   ├── 05_setup_qdrant.py                  # Initialize Qdrant collection
 │   ├── 06_ingest_pmc.py                    # Ingest unified PMC XML sources to Qdrant
