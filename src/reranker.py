@@ -14,8 +14,10 @@ from anyascii import anyascii
 import requests
 from .config import (
     RERANKER_MODEL,
-    DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL
+    DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
+    DEEPINFRA_RETRY_COUNT, DEEPINFRA_RETRY_DELAY
 )
+from .retry_utils import retry_with_exponential_backoff
 
 # Try to import medical entity expander for entity matching
 try:
@@ -302,6 +304,8 @@ class DeepInfraReranker(AbstractReranker):
         self.api_key = DEEPINFRA_API_KEY
         # DeepInfra uses a specific rerank endpoint, not standard OpenAI
         self.api_url = "https://api.deepinfra.com/v1/rerank"
+        self.retry_count = DEEPINFRA_RETRY_COUNT
+        self.retry_delay = DEEPINFRA_RETRY_DELAY
         logger.info(f"✅ DeepInfra Reranker initialized with {self.model}")
 
     def get_scores(self, query: str, documents: List[str], top_n: Optional[int] = None) -> List[float]:
@@ -329,8 +333,18 @@ class DeepInfraReranker(AbstractReranker):
                 "Content-Type": "application/json"
             }
             
-            response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
-            response.raise_for_status()
+            def _post_rerank() -> requests.Response:
+                response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
+                response.raise_for_status()
+                return response
+
+            response = retry_with_exponential_backoff(
+                _post_rerank,
+                max_attempts=self.retry_count + 1,
+                base_delay=float(self.retry_delay),
+                operation_name="DeepInfra rerank API call",
+                logger=logger,
+            )
             results = response.json().get("results", [])
             
             # Create score array indexed by original position
@@ -396,16 +410,16 @@ class PaperFinderWithReranker:
         self,
         query: str,
         retrieved_ctxs: List[Dict[str, Any]],
-        pre_filter_threshold: float = 0.15,  # Lowered: hybrid RRF scores are normalized to 0.3-1.0
+        pre_filter_threshold: float = 0.0,  # Disabled by default: retrieval score scales vary by retrieval mode
         relevance_threshold: float = 0.1  # Minimum relevance score (filters truly irrelevant)
     ) -> List[Dict[str, Any]]:
         """
         Rerank passages using DeepInfra Qwen3-Reranker + evidence hierarchy boosts.
         
         Threshold Strategy:
-        1. pre_filter_threshold (0.15): Filters by retrieval score BEFORE reranking
-           - Reduces API costs by removing obviously low-quality candidates
-           - Set lower than post-rerank threshold to preserve recall
+        1. pre_filter_threshold (0.0 default): Optional filter by retrieval score BEFORE reranking
+           - Can reduce API costs when retrieval score scale is stable
+           - Disabled by default to avoid score-scale coupling across retrieval modes
         
         2. relevance_threshold (0.1): Filters by reranker score AFTER reranking
            - Scores are 0-1 normalized; <0.1 indicates very low relevance

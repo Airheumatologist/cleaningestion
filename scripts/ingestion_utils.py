@@ -751,6 +751,55 @@ def upsert_with_retry(client: QdrantClient, points: List[PointStruct]) -> None:
             
             time.sleep(wait_for)
 
+
+def validate_qdrant_collection_schema(
+    client: QdrantClient,
+    collection_name: Optional[str] = None,
+    require_sparse: Optional[bool] = None,
+) -> None:
+    """
+    Validate collection schema before ingestion writes any points.
+
+    Expected schema:
+    - Named dense vector key: "dense"
+    - Optional sparse vector key: "sparse" when BM25 sparse is enabled
+    """
+    target_collection = collection_name or IngestionConfig.COLLECTION_NAME
+    sparse_required = (
+        require_sparse
+        if require_sparse is not None
+        else (IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25")
+    )
+
+    info = client.get_collection(target_collection)
+    params = info.config.params
+    vectors_config = params.vectors
+
+    if not isinstance(vectors_config, dict) or "dense" not in vectors_config:
+        raise RuntimeError(
+            "Qdrant schema mismatch: expected named dense vector key 'dense'. "
+            "Run scripts/05_setup_qdrant.py --recreate before ingestion."
+        )
+
+    dense_cfg = vectors_config["dense"]
+    expected_size = IngestionConfig.get_vector_size()
+    if dense_cfg.size != expected_size:
+        raise RuntimeError(
+            f"Qdrant dense vector size mismatch: expected {expected_size}, got {dense_cfg.size}."
+        )
+
+    sparse_vectors_config = params.sparse_vectors or {}
+    if sparse_required and (not isinstance(sparse_vectors_config, dict) or "sparse" not in sparse_vectors_config):
+        raise RuntimeError(
+            "Qdrant schema mismatch: expected sparse vector key 'sparse' for BM25 hybrid ingestion."
+        )
+
+    logger.info(
+        "Qdrant schema preflight passed (dense=%s, sparse=%s)",
+        "present",
+        "present" if sparse_required else "not-required",
+    )
+
 import hashlib
 
 def generate_section_id(doc_id: str, section_title: str) -> str:

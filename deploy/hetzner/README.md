@@ -55,6 +55,9 @@ CHUNK_SIZE_TOKENS=384
 CHUNK_OVERLAP_TOKENS=64
 
 DATA_DIR=/data/ingestion
+
+# Replace with your deployed frontend URL(s)
+CORS_ALLOWED_ORIGINS=https://app.example.com
 ```
 
 ## 4) Start Qdrant

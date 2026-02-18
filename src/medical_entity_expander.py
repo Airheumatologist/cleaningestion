@@ -11,18 +11,26 @@ Example:
 """
 
 import logging
+import os
 import re
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Dict, List, Optional, Set, Tuple
 import requests
 
 logger = logging.getLogger(__name__)
 
-# MeSH download URLs
-MESH_DESC_URL = "https://nlmpubs.nlm.nih.gov/projects/mesh/MESH_FILES/xmlmesh/desc2025.xml"
-MESH_SUPP_URL = "https://nlmpubs.nlm.nih.gov/projects/mesh/MESH_FILES/xmlmesh/supp2025.xml"
-MESH_DOWNLOAD_PAGE = "https://www.nlm.nih.gov/databases/download/mesh.html"
+# MeSH download locations
+MESH_XML_BASE_URL = os.getenv(
+    "MESH_XML_BASE_URL",
+    "https://nlmpubs.nlm.nih.gov/projects/mesh/MESH_FILES/xmlmesh",
+)
+MESH_DOWNLOAD_PAGE = os.getenv(
+    "MESH_DOWNLOAD_PAGE",
+    "https://www.nlm.nih.gov/databases/download/mesh.html",
+)
 
 # Default data directory
 DEFAULT_DATA_DIR = Path(__file__).parent.parent / "data" / "mesh"
@@ -58,10 +66,15 @@ class MedicalEntityExpander:
         self.acronym_dict: Dict[str, List[str]] = {}  # {"APS": ["Antiphospholipid Syndrome", ...]}
         self.synonym_dict: Dict[str, List[str]] = {}  # {"Antiphospholipid Syndrome": ["APS", "APLS", ...]}
         self.full_term_dict: Dict[str, str] = {}  # {"APS": "Antiphospholipid Syndrome"} (primary mapping)
+
+        # Resolve MeSH source URLs (env override > discovered latest > fallback year)
+        self.mesh_desc_url, self.mesh_supp_url = self._resolve_mesh_urls()
         
         # File paths
-        self.desc_xml_path = self.data_dir / "desc2025.xml"
-        self.supp_xml_path = self.data_dir / "supp2025.xml"
+        desc_name = Path(urlparse(self.mesh_desc_url).path).name or "desc.xml"
+        supp_name = Path(urlparse(self.mesh_supp_url).path).name or "supp.xml"
+        self.desc_xml_path = self.data_dir / desc_name
+        self.supp_xml_path = self.data_dir / supp_name
         self.cache_path = self.data_dir / "mesh_cache.json"
         
         # Load or build dictionaries
@@ -79,30 +92,137 @@ class MedicalEntityExpander:
         
         logger.info(f"Loaded {len(self.acronym_dict)} acronym mappings and {len(self.synonym_dict)} synonym groups")
     
+    def _resolve_mesh_urls(self) -> Tuple[str, str]:
+        """Resolve MeSH descriptor/supplementary URLs with env overrides and discovery."""
+        env_desc = os.getenv("MESH_DESC_URL", "").strip()
+        env_supp = os.getenv("MESH_SUPP_URL", "").strip()
+        if env_desc and env_supp:
+            return env_desc, env_supp
+
+        mesh_year = os.getenv("MESH_YEAR", "").strip()
+        if mesh_year:
+            return (
+                f"{MESH_XML_BASE_URL}/desc{mesh_year}.xml",
+                f"{MESH_XML_BASE_URL}/supp{mesh_year}.xml",
+            )
+
+        discovered_desc, discovered_supp = self._discover_mesh_urls()
+        if discovered_desc and discovered_supp:
+            return discovered_desc, discovered_supp
+
+        fallback_year = datetime.now().year - 1
+        logger.warning(
+            "Could not discover latest MeSH URLs from %s, falling back to year %s",
+            MESH_DOWNLOAD_PAGE,
+            fallback_year,
+        )
+        return (
+            f"{MESH_XML_BASE_URL}/desc{fallback_year}.xml",
+            f"{MESH_XML_BASE_URL}/supp{fallback_year}.xml",
+        )
+
+    def _discover_mesh_urls(self) -> Tuple[Optional[str], Optional[str]]:
+        """Discover latest MeSH XML file names from the NLM MeSH download page."""
+        try:
+            response = requests.get(MESH_DOWNLOAD_PAGE, timeout=60)
+            response.raise_for_status()
+            html = response.text
+            desc_matches = re.findall(r"desc(\d{4})\.xml", html, flags=re.IGNORECASE)
+            supp_matches = re.findall(r"supp(\d{4})\.xml", html, flags=re.IGNORECASE)
+            desc_year = max((int(y) for y in desc_matches), default=None)
+            supp_year = max((int(y) for y in supp_matches), default=None)
+            if desc_year and supp_year:
+                return (
+                    f"{MESH_XML_BASE_URL}/desc{desc_year}.xml",
+                    f"{MESH_XML_BASE_URL}/supp{supp_year}.xml",
+                )
+        except Exception as exc:
+            logger.warning("MeSH URL discovery failed: %s", exc)
+        return None, None
+
     def _ensure_mesh_files(self):
-        """Download MeSH XML files if they don't exist."""
-        if not self.desc_xml_path.exists():
-            logger.info(f"Downloading MeSH descriptors from {MESH_DESC_URL}...")
-            self._download_file(MESH_DESC_URL, self.desc_xml_path)
-        else:
-            logger.info(f"MeSH descriptors file exists: {self.desc_xml_path}")
-        
-        if not self.supp_xml_path.exists():
-            logger.info(f"Downloading MeSH supplementary concepts from {MESH_SUPP_URL}...")
-            self._download_file(MESH_SUPP_URL, self.supp_xml_path)
-        else:
-            logger.info(f"MeSH supplementary concepts file exists: {self.supp_xml_path}")
-    
-    def _download_file(self, url: str, dest_path: Path):
-        """Download a file from URL to destination path."""
+        """Ensure both MeSH XML files exist and are valid XML with expected root tags."""
+        self._ensure_valid_mesh_file(
+            self.desc_xml_path,
+            self.mesh_desc_url,
+            expected_root_tag="DescriptorRecordSet",
+        )
+        self._ensure_valid_mesh_file(
+            self.supp_xml_path,
+            self.mesh_supp_url,
+            expected_root_tag="SupplementalRecordSet",
+        )
+
+    def _ensure_valid_mesh_file(self, local_path: Path, source_url: str, expected_root_tag: str) -> None:
+        """Validate local cache and download/retry once when invalid or missing."""
+        if local_path.exists():
+            if self._is_valid_mesh_xml(local_path, expected_root_tag):
+                logger.info("MeSH file exists and validated: %s", local_path)
+                return
+            logger.warning("Invalid cached MeSH file detected, removing: %s", local_path)
+            try:
+                local_path.unlink()
+            except FileNotFoundError:
+                pass
+
+        for attempt in range(2):
+            try:
+                logger.info("Downloading MeSH file from %s...", source_url)
+                self._download_file(source_url, local_path, expected_root_tag)
+                return
+            except Exception as exc:
+                try:
+                    local_path.unlink()
+                except FileNotFoundError:
+                    pass
+                if attempt == 0:
+                    logger.warning("Download validation failed for %s, retrying once: %s", local_path.name, exc)
+                    continue
+                raise RuntimeError(
+                    f"Unable to download valid MeSH XML file '{local_path.name}' from {source_url}. "
+                    f"See {MESH_DOWNLOAD_PAGE} for updated URLs."
+                ) from exc
+
+    def _is_valid_mesh_xml(self, path: Path, expected_root_tag: str) -> bool:
+        """Check XML parseability and expected root tag."""
+        try:
+            for _, elem in ET.iterparse(path, events=("start",)):
+                root_tag = elem.tag.split("}", 1)[-1] if isinstance(elem.tag, str) else str(elem.tag)
+                if root_tag != expected_root_tag:
+                    logger.error(
+                        "Invalid MeSH XML root in %s: expected '%s', got '%s'",
+                        path,
+                        expected_root_tag,
+                        root_tag,
+                    )
+                    return False
+                return True
+            logger.error("MeSH XML file is empty: %s", path)
+            return False
+        except ET.ParseError as exc:
+            logger.error("Invalid XML in %s: %s", path, exc)
+            return False
+        except Exception as exc:
+            logger.error("Failed validating MeSH file %s: %s", path, exc)
+            return False
+
+    def _download_file(self, url: str, dest_path: Path, expected_root_tag: str):
+        """Download a file from URL, validate XML content, then atomically replace target."""
+        tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
         try:
             response = requests.get(url, stream=True, timeout=300)
             response.raise_for_status()
-            
+
+            content_type = response.headers.get("content-type", "").lower()
+            if "xml" not in content_type:
+                raise ValueError(
+                    f"Non-XML content type '{content_type or 'unknown'}' received from {url}"
+                )
+
             total_size = int(response.headers.get('content-length', 0))
             downloaded = 0
             
-            with open(dest_path, 'wb') as f:
+            with open(tmp_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
@@ -112,20 +232,37 @@ class MedicalEntityExpander:
                             if downloaded % (1024 * 1024) == 0:  # Log every MB
                                 logger.info(f"Downloaded {downloaded / (1024*1024):.1f} MB ({percent:.1f}%)")
             
-            logger.info(f"✅ Downloaded {dest_path.name} ({downloaded / (1024*1024):.1f} MB)")
+            if not self._is_valid_mesh_xml(tmp_path, expected_root_tag):
+                raise ValueError(
+                    f"Downloaded file {tmp_path.name} is not a valid MeSH XML ({expected_root_tag})"
+                )
+            tmp_path.replace(dest_path)
+            logger.info(f"✅ Downloaded and validated {dest_path.name} ({downloaded / (1024*1024):.1f} MB)")
         except Exception as e:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
             logger.error(f"Failed to download {url}: {e}")
             raise
     
     def _load_mesh_data(self):
         """Parse MeSH XML files and build lookup dictionaries."""
+        if not self.desc_xml_path.exists() or not self.supp_xml_path.exists():
+            raise FileNotFoundError(
+                "MeSH XML files are missing. "
+                f"Expected: {self.desc_xml_path} and {self.supp_xml_path}"
+            )
+        if not self._is_valid_mesh_xml(self.desc_xml_path, "DescriptorRecordSet"):
+            raise ValueError(f"Descriptor MeSH XML is invalid: {self.desc_xml_path}")
+        if not self._is_valid_mesh_xml(self.supp_xml_path, "SupplementalRecordSet"):
+            raise ValueError(f"Supplementary MeSH XML is invalid: {self.supp_xml_path}")
+
         # Parse descriptors (main terms)
-        if self.desc_xml_path.exists():
-            self._parse_descriptors(self.desc_xml_path)
+        self._parse_descriptors(self.desc_xml_path)
         
         # Parse supplementary concepts (drugs, chemicals)
-        if self.supp_xml_path.exists():
-            self._parse_supplementary(self.supp_xml_path)
+        self._parse_supplementary(self.supp_xml_path)
         
         # Post-process: identify primary mappings for acronyms
         self._build_primary_mappings()
@@ -232,7 +369,7 @@ class MedicalEntityExpander:
                         if term not in self.acronym_dict:
                             self.acronym_dict[term] = []
                         if preferred_term not in self.acronym_dict[term]:
-                            self.acronym_dict[preferred_term].append(preferred_term)
+                            self.acronym_dict[term].append(preferred_term)
                 
                 count += 1
                 if count % 1000 == 0:
@@ -473,4 +610,3 @@ if __name__ == "__main__":
                 expansions = expander.expand_acronym(clean)
                 if expansions:
                     print(f"   '{clean}' → {expansions[0]}")
-

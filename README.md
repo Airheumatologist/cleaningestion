@@ -307,6 +307,8 @@ CHUNK_OVERLAP_TOKENS=256
 USE_HYBRID_SEARCH=true
 SPARSE_RETRIEVAL_MODE=bm25
 RETRIEVAL_CHUNK_LIMIT=400
+MAX_CHUNKS_PER_ARTICLE_PRE_RERANK=3
+RERANK_INPUT_CHUNK_LIMIT=200
 RERANK_TOP_CHUNKS=100
 FINAL_TOP_ARTICLES=50
 
@@ -631,9 +633,9 @@ npm start  # Production mode
 
 ### 4. Retrieval Limits
 - **Initial Retrieval**: 400 chunks
-- **Rerank Input**: 200 chunks (2 per article max)
-- **Rerank Output**: 100 chunks
-- **Final Articles**: 50 papers
+- **Rerank Input**: up to 200 chunks (3 per article max; typically 150-200 with ~50-70 unique articles)
+- **Rerank Output**: up to 100 chunks (can be lower after relevance filtering)
+- **Passed to LLM Context**: up to 50 papers (article-level context blocks)
 
 ---
 
@@ -641,7 +643,7 @@ npm start  # Production mode
 
 - **Qdrant**: Protected by API key, firewall restricted to team IPs
 - **DeepInfra**: API key stored in environment variables only
-- **CORS**: Configured for specific origins in `src/api_server.py`
+- **CORS**: Configure allowed frontend origins via `CORS_ALLOWED_ORIGINS` in `.env`
 - **No PII**: Pipeline processes only public medical literature
 
 ---

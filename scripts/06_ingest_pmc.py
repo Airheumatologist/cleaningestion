@@ -21,6 +21,7 @@ from ingestion_utils import (
     SectionFilter,
     EmbeddingProvider,
     upsert_with_retry,
+    validate_qdrant_collection_schema,
     get_chunker as get_shared_chunker,
     load_checkpoint as load_checkpoint_file,
     append_checkpoint as append_checkpoint_file,
@@ -711,8 +712,10 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
     try:
         info = client.get_collection(IngestionConfig.COLLECTION_NAME)
         logger.info("Connected to %s (points=%s)", IngestionConfig.COLLECTION_NAME, info.points_count)
-    except Exception:
-        logger.warning("Collection %s not found or not accessible", IngestionConfig.COLLECTION_NAME)
+        validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
+    except Exception as e:
+        logger.error("Failed Qdrant schema preflight for %s: %s", IngestionConfig.COLLECTION_NAME, e)
+        return
 
     processed_ids = load_checkpoint()
     processed_lock = threading.Lock()

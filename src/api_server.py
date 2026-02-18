@@ -20,6 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from .config import CORS_ALLOWED_ORIGINS
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -148,7 +150,7 @@ app = FastAPI(
 # CORS for Next.js frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -253,15 +255,6 @@ async def chat_stream(request: ChatRequest):
         except Exception as e:
             logger.error(f"Consumer error: {e}", exc_info=True)
             yield f"data: {json.dumps({'step': 'error', 'message': str(e)})}\n\n"
-
-        except Exception as e:
-            logger.error(f"Streaming error: {e}", exc_info=True)
-            error_event = json.dumps({
-                "step": "error",
-                "status": "error",
-                "message": str(e)
-            })
-            yield f"data: {error_event}\n\n"
 
     return StreamingResponse(
         event_generator(),

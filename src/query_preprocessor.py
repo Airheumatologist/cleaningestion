@@ -11,12 +11,18 @@ Adapts ScholarQA's query decomposition approach to:
 import json
 import logging
 import re
+from datetime import datetime
 from typing import List, Dict, Any, Optional, NamedTuple, Union
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
-from .config import DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, LLM_MODEL, LLM_TEMPERATURE, LLM_TOP_P, QUERY_EXPANSION_COUNT
+from .config import (
+    DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
+    DEEPINFRA_RETRY_COUNT, DEEPINFRA_RETRY_DELAY,
+    LLM_MODEL, LLM_TEMPERATURE, LLM_TOP_P, QUERY_EXPANSION_COUNT
+)
 from .medical_entity_expander import MedicalEntityExpander
+from .retry_utils import retry_with_exponential_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +77,7 @@ CRITICAL: Preserve all medical condition names, disease names, and medical acron
 Do NOT remove or abbreviate disease names - they are essential for accurate retrieval.
 
 Components to extract:
-1. Publication years: If "recent" → 2022-2025. If "last 5 years" → 2020-2025. Leave blank if unspecified.
+1. Publication years: If "recent" → last 3 years ending in current year. If "last 5 years" → current year-4 through current year. Leave blank if unspecified.
 2. Venues: Journal names mentioned (e.g., "NEJM", "Lancet", "JAMA"). Leave blank if none.
 3. Authors: Author names mentioned. Leave as empty array if none.
 4. Field of study: Map to one of: Medicine, Biology, Chemistry, Pharmacology, Psychology, Nursing, Public Health. 
@@ -107,7 +113,7 @@ Components to extract:
 10. Corrected query: If typos were detected, provide the fully corrected query. Leave empty if no typos.
 11. Corrected medical conditions: List the corrected spellings of conditions (for entity matching).
 
-Current year is 2025.
+Current year is __CURRENT_YEAR__.
 </task>
 
 <examples>
@@ -258,6 +264,8 @@ class QueryPreprocessor:
         )
         self.model = model
         self.expansion_count = QUERY_EXPANSION_COUNT
+        self.retry_count = DEEPINFRA_RETRY_COUNT
+        self.retry_delay = DEEPINFRA_RETRY_DELAY
         self.use_entity_expansion = use_entity_expansion
         self._entity_expander = None
         
@@ -297,14 +305,12 @@ class QueryPreprocessor:
             filters["year"] = f"{decomposed.earliest_search_year}-{decomposed.latest_search_year}"
         if decomposed.venues:
             filters["venue"] = decomposed.venues
-        if decomposed.field_of_study:
-            filters["field_of_study"] = decomposed.field_of_study
-        if decomposed.authors:
-            authors = decomposed.authors if isinstance(decomposed.authors, list) else [decomposed.authors]
-            if authors and authors[0]:
-                filters["authors"] = authors
         
         return filters
+
+    def _get_query_decomposer_prompt(self) -> str:
+        """Render the query decomposer prompt with current year at runtime."""
+        return QUERY_DECOMPOSER_PROMPT.replace("__CURRENT_YEAR__", str(datetime.now().year))
     
     def _extract_condition(self, query: str, decomposed: Optional[DecomposedQuery] = None) -> str:
         """Extract the medical condition/disease from a query or decomposed data."""
@@ -377,6 +383,21 @@ class QueryPreprocessor:
         
         return variations
 
+    def _chat_completion_with_retry(self, messages: List[Dict[str, str]], operation_name: str):
+        """Execute DeepInfra chat completion with exponential-backoff retry."""
+        return retry_with_exponential_backoff(
+            lambda: self.openai_client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=LLM_TEMPERATURE,
+                top_p=LLM_TOP_P
+            ),
+            max_attempts=self.retry_count + 1,
+            base_delay=float(self.retry_delay),
+            operation_name=operation_name,
+            logger=logger,
+        )
+
     def decompose_query(self, query: str) -> LLMProcessedQuery:
         """
         Decompose query into structured components using LLM.
@@ -387,14 +408,12 @@ class QueryPreprocessor:
         expanded_query = self._expand_medical_entities(query)
         
         try:
-            response = self.openai_client.chat.completions.create(
-                model=self.model,
+            response = self._chat_completion_with_retry(
                 messages=[
-                    {"role": "system", "content": QUERY_DECOMPOSER_PROMPT},
+                    {"role": "system", "content": self._get_query_decomposer_prompt()},
                     {"role": "user", "content": expanded_query}
                 ],
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P
+                operation_name="DeepInfra query decomposition"
             )
 
             decomposed = self._parse_llm_response(response.choices[0].message.content.strip())
@@ -454,14 +473,12 @@ RULES:
 4. Output ONLY the queries, one per line, no numbering or bullets"""
 
         try:
-            response = self.openai_client.chat.completions.create(
-                model=self.model,
+            response = self._chat_completion_with_retry(
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f'Generate {self.expansion_count} alternative medical search queries for:\n\n"{query}"\n\nOutput only the queries, one per line:'}
                 ],
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P
+                operation_name="DeepInfra query expansion"
             )
 
             expanded = []

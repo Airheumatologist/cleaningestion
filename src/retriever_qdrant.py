@@ -22,9 +22,11 @@ from .config import (
     EMBEDDING_MODEL, EMBEDDING_PROVIDER, QDRANT_CLOUD_INFERENCE, QDRANT_TIMEOUT, 
     QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY, USE_HYBRID_SEARCH,
     SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
-    SPARSE_REMOVE_STOPWORDS, DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL
+    SPARSE_REMOVE_STOPWORDS, DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
+    QUANTIZATION_RESCORE, QUANTIZATION_OVERSAMPLING
 )
 from .bm25_sparse import BM25SparseEncoder
+from .retry_utils import retry_with_exponential_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +113,7 @@ class QdrantRetriever(AbstractRetriever):
 
         # Initialize sparse query encoder for hybrid search.
         self.bm25_sparse_encoder = None
+        self.sparse_mode = SPARSE_RETRIEVAL_MODE
         if USE_HYBRID_SEARCH:
             self.bm25_sparse_encoder = BM25SparseEncoder(
                 max_terms_doc=max(SPARSE_MAX_TERMS_QUERY, 64),
@@ -198,11 +201,17 @@ class QdrantRetriever(AbstractRetriever):
                     query_with_instruct = f"Instruct: {instruction}\nQuery: {query}"
                 else:
                     query_with_instruct = query
-                
-                response = self.openai_client.embeddings.create(
-                    model=self.embedding_model,
-                    input=[query_with_instruct],
-                    encoding_format="float"
+
+                response = retry_with_exponential_backoff(
+                    lambda: self.openai_client.embeddings.create(
+                        model=self.embedding_model,
+                        input=[query_with_instruct],
+                        encoding_format="float"
+                    ),
+                    max_attempts=self.retry_count + 1,
+                    base_delay=float(self.retry_delay),
+                    operation_name="DeepInfra embeddings.create",
+                    logger=logger,
                 )
                 return response.data[0].embedding
             except Exception as e:
@@ -241,7 +250,6 @@ class QdrantRetriever(AbstractRetriever):
         Supported filters:
         - year: "2020-2025" or "2020-" or "-2025"
         - venue: "NEJM,Lancet" (comma-separated)
-        - field_of_study: "Medicine"
         - article_type: "systematic-review,rct"
         
         Note: DailyMed articles are EXCLUDED from semantic search to prevent
@@ -352,7 +360,8 @@ class QdrantRetriever(AbstractRetriever):
                 search_filter=search_filter,
                 dense_weight=dense_weight,
                 sparse_weight=sparse_weight,
-                precomputed_sparse_vector=precomputed_sparse_vector
+                precomputed_sparse_vector=precomputed_sparse_vector,
+                filter_kwargs=filter_kwargs,
             )
 
         # Dense-only search using configured embedding provider
@@ -365,6 +374,7 @@ class QdrantRetriever(AbstractRetriever):
             results = self.client.query_points(
                 collection_name=self.collection_name,
                 query=query_embedding,
+                using="dense",
                 limit=self.n_retrieval,
                 score_threshold=self.score_threshold,
                 query_filter=search_filter,
@@ -432,7 +442,8 @@ class QdrantRetriever(AbstractRetriever):
         search_filter: Optional[Filter],
         dense_weight: float = 0.7,
         sparse_weight: float = 0.3,
-        precomputed_sparse_vector: Optional[SparseVector] = None
+        precomputed_sparse_vector: Optional[SparseVector] = None,
+        filter_kwargs: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Perform hybrid search using both dense and sparse vectors.
@@ -452,10 +463,10 @@ class QdrantRetriever(AbstractRetriever):
         sparse_vector = precomputed_sparse_vector or self._build_sparse_query_vector(query)
         if sparse_vector is None:
             logger.warning("Sparse encoding unavailable, falling back to dense-only")
-            return self.retrieve_passages(query, use_hybrid=False, **{})
+            return self.retrieve_passages(query, use_hybrid=False, **(filter_kwargs or {}))
         if not sparse_vector.indices:
             logger.info("Sparse vector empty, falling back to dense-only")
-            return self.retrieve_passages(query, use_hybrid=False, **{})
+            return self.retrieve_passages(query, use_hybrid=False, **(filter_kwargs or {}))
         
         # Perform dense search
         dense_results = None
@@ -465,7 +476,9 @@ class QdrantRetriever(AbstractRetriever):
                 dense_results = self.client.query_points(
                     collection_name=self.collection_name,
                     query=query_embedding,
+                    using="dense",
                     limit=self.n_retrieval * 2,  # Get more for fusion
+                    score_threshold=self.score_threshold,
                     query_filter=search_filter,
                     with_payload=True,
                     search_params=SearchParams(
@@ -523,17 +536,6 @@ class QdrantRetriever(AbstractRetriever):
                 dense_scores.get(key, 0) + sparse_scores.get(key, 0)
             )
         
-        # Normalize combined scores to full 0-1 range for clearer separation
-        # RRF scores are very small (0.001-0.03), so we normalize to full range
-        if combined_scores:
-            max_score = max(combined_scores.values())
-            min_score = min(combined_scores.values())
-            score_range = max_score - min_score if max_score > min_score else 1.0
-            for key in combined_scores:
-                # Normalize to full 0.0-1.0 range
-                normalized = (combined_scores[key] - min_score) / score_range
-                combined_scores[key] = normalized
-
         # Get all points from both results
         all_points = {}
         if dense_results:
@@ -662,8 +664,10 @@ class QdrantRetriever(AbstractRetriever):
 
             dense_request = QueryRequest(
                 query=dense_query,
+                using="dense",
                 filter=search_filter,
                 limit=self.n_retrieval * 2,  # Get more for fusion
+                score_threshold=self.score_threshold,
                 with_payload=True,
                 params=search_params  # Enable quantization rescore
             )
@@ -703,6 +707,7 @@ class QdrantRetriever(AbstractRetriever):
                         dense_weight=dense_weight,
                         sparse_weight=sparse_weight,
                         precomputed_sparse_vector=sparse_vectors[idx],
+                        filter_kwargs=filter_kwargs,
                     )
                 else:
                     passages = self.retrieve_passages(query, use_hybrid=False, **filter_kwargs)
@@ -738,14 +743,6 @@ class QdrantRetriever(AbstractRetriever):
                 if key not in all_points:
                     all_points[key] = point
         
-        # Normalize combined scores to 0-1 range
-        if combined_scores:
-            max_score = max(combined_scores.values())
-            min_score = min(combined_scores.values())
-            score_range = max_score - min_score if max_score > min_score else 1.0
-            for key in combined_scores:
-                combined_scores[key] = (combined_scores[key] - min_score) / score_range
-
         # Sort by score and limit total results
         sorted_keys = sorted(
             combined_scores.keys(),
@@ -804,42 +801,26 @@ class QdrantRetriever(AbstractRetriever):
         """
         try:
             search_filter = self._build_filter(**filter_kwargs)
+            query_embedding = self._embed_query(query, use_instruction=False)
+            if query_embedding is None:
+                logger.error("No embedding method available for additional search")
+                return []
 
-            # Use same embedding logic as main retrieval
-            use_cloud_inference = QDRANT_CLOUD_INFERENCE
-            results = None
-
-            if use_cloud_inference:
-                try:
-                    results = self.client.query_points(
-                        collection_name=self.collection_name,
-                        query=Document(
-                            text=query,
-                            model=self.embedding_model,
-                        ),
-                        limit=self.n_keyword_search,
-                        score_threshold=max(self.score_threshold - 0.1, 0.2),  # Lower threshold
-                        query_filter=search_filter,
-                        with_payload=True
+            results = self.client.query_points(
+                collection_name=self.collection_name,
+                query=query_embedding,
+                using="dense",
+                limit=self.n_keyword_search,
+                score_threshold=max(self.score_threshold - 0.1, 0.2),  # Lower threshold
+                query_filter=search_filter,
+                with_payload=True,
+                search_params=SearchParams(
+                    quantization=QuantizationSearchParams(
+                        rescore=QUANTIZATION_RESCORE,
+                        oversampling=QUANTIZATION_OVERSAMPLING
                     )
-                except Exception as e:
-                    logger.warning(f"Cloud inference failed for additional search: {e}, using local embeddings")
-                    use_cloud_inference = False  # Fall back to local embeddings for this query only
-
-            # Use local embeddings if cloud inference is disabled or failed
-            if not use_cloud_inference:
-                if self.local_encoder is None:
-                    logger.error("No embedding method available for additional search")
-                    return []
-                query_embedding = self.local_encoder.encode(query, normalize_embeddings=True)
-                results = self.client.query_points(
-                    collection_name=self.collection_name,
-                    query=query_embedding.tolist(),
-                    limit=self.n_keyword_search,
-                    score_threshold=max(self.score_threshold - 0.1, 0.2),
-                    query_filter=search_filter,
-                    with_payload=True
                 )
+            )
 
             papers = []
             for point in results.points:

@@ -79,6 +79,34 @@ def _patch_2bit_quantization(collection_name: str) -> None:
         logger.info("Applied 2-bit quantization patch")
 
 
+def _validate_collection_vector_schema(client: QdrantClient, collection_name: str) -> None:
+    """Validate named vector schema required by ingestion pipeline."""
+    info = client.get_collection(collection_name)
+    params = info.config.params
+
+    vectors_config = params.vectors
+    sparse_vectors_config = params.sparse_vectors or {}
+
+    if not isinstance(vectors_config, dict) or "dense" not in vectors_config:
+        raise RuntimeError(
+            "Collection vector schema mismatch: expected named dense vector key 'dense'. "
+            "Recreate the collection with scripts/05_setup_qdrant.py."
+        )
+
+    dense_cfg = vectors_config["dense"]
+    expected_size = IngestionConfig.get_vector_size()
+    if dense_cfg.size != expected_size:
+        raise RuntimeError(
+            f"Collection dense vector size mismatch: expected {expected_size}, got {dense_cfg.size}."
+        )
+
+    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
+        if not isinstance(sparse_vectors_config, dict) or "sparse" not in sparse_vectors_config:
+            raise RuntimeError(
+                "Collection sparse schema mismatch: expected sparse vector key 'sparse'."
+            )
+
+
 def setup_collection(collection_name: str, keep_existing: bool, shard_number: int, use_2bit: bool) -> None:
     if not IngestionConfig.QDRANT_URL:
         logger.error("QDRANT_URL is required")
@@ -113,11 +141,13 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
         
         client.create_collection(
             collection_name=collection_name,
-            vectors_config=models.VectorParams(
-                size=vector_size,
-                distance=models.Distance.COSINE,
-                on_disk=True,
-            ),
+            vectors_config={
+                "dense": models.VectorParams(
+                    size=vector_size,
+                    distance=models.Distance.COSINE,
+                    on_disk=True,
+                )
+            },
             sparse_vectors_config=sparse_vectors_config,
             quantization_config=_get_quantization_config(),
             hnsw_config=models.HnswConfigDiff(
@@ -133,6 +163,9 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
     if use_2bit:
         _patch_2bit_quantization(collection_name)
 
+    _validate_collection_vector_schema(client, collection_name)
+    logger.info("Collection vector schema validated: dense + sparse names are correct")
+
     indexes = {
         "year": models.PayloadSchemaType.INTEGER,
         "source": models.PayloadSchemaType.KEYWORD,
@@ -147,7 +180,7 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
         "chunk_id": models.PayloadSchemaType.KEYWORD,
         "section_type": models.PayloadSchemaType.KEYWORD,
         # Merged PubMed pipeline - Government affiliation fields
-        "is_gov_affiliated": models.PayloadSchemaType.KEYWORD,
+        "is_gov_affiliated": models.PayloadSchemaType.BOOL,
         "gov_agencies": models.PayloadSchemaType.KEYWORD,
         # PMC/PubMed identifiers (frequently queried)
         "pmcid": models.PayloadSchemaType.KEYWORD,

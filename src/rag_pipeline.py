@@ -248,7 +248,7 @@ class MedicalRAGPipeline:
         ]
         
         for drug in common_drugs:
-            if drug in text:
+            if re.search(r'\b' + re.escape(drug) + r'\b', text):
                 drug_names.add(drug)
         
         # Extract capitalized words that might be brand names
@@ -406,7 +406,6 @@ class MedicalRAGPipeline:
                         'contraindications': dm.get('contraindications', ''),
                         'warnings': dm.get('warnings', ''),
                         'adverse_reactions': dm.get('adverse_reactions', ''),
-                        'clinical_pharmacology': dm.get('clinical_pharmacology', ''),
                         'clinical_studies': dm.get('clinical_studies', ''),
                     })
                     existing_pmcids.add(pmcid)
@@ -705,7 +704,6 @@ class MedicalRAGPipeline:
         
         For DailyMed articles, intelligently selects sections:
         - Always: highlights + clinical_studies
-        - Conditional: clinical_pharmacology (when query mentions mechanisms, PK/PD)
         """
         from .specialty_journals import PRIORITY_JOURNALS
         HIGH_VALUE_TYPES = {'review_article', 'clinical_trial', 'systematic_review', 'meta_analysis', 'guideline'}
@@ -715,7 +713,13 @@ class MedicalRAGPipeline:
 
         for idx, row in papers_df.head(MAX_ABSTRACTS).iterrows():
             journal = row.get('journal', '') or row.get('venue', '')
-            is_priority_journal = journal in PRIORITY_JOURNALS
+            corpus_id = str(row.get('corpus_id', '')).strip()
+            normalized_journal = re.sub(r'[^a-z0-9]+', ' ', str(journal).lower()).strip()
+            is_priority_journal = (
+                journal in PRIORITY_JOURNALS
+                or normalized_journal in PRIORITY_JOURNALS
+                or corpus_id in PRIORITY_JOURNALS
+            )
             article_type = row.get('article_type', 'other')
             is_high_value = article_type in HIGH_VALUE_TYPES
 
@@ -776,12 +780,6 @@ class MedicalRAGPipeline:
                 if clinical_studies:
                     sections.append(f"### Clinical Studies\n{clinical_studies[:15000]}")
                 
-                # Conditionally include clinical pharmacology
-                if self._needs_clinical_pharmacology(query):
-                    clinical_pharm = _get_dm_section("clinical_pharmacology")
-                    if clinical_pharm:
-                        sections.append(f"### Clinical Pharmacology\n{clinical_pharm[:10000]}")
-                
                 if sections:
                     text_content = "\n\n".join(sections)
                     dailymed_section_count += 1
@@ -801,20 +799,6 @@ class MedicalRAGPipeline:
             
         logger.info(f"Context built: {len(context_parts)} papers ({dailymed_section_count} DailyMed with section selection).")
         return context_parts, used_papers
-
-    def _needs_clinical_pharmacology(self, query: str) -> bool:
-        """Check if query needs clinical pharmacology section (mechanism, PK/PD)."""
-        if not query:
-            return False
-        keywords = [
-            'mechanism', 'pharmacokinetic', 'pharmacodynamic', 'metabolism',
-            'half-life', 'half life', 'absorption', 'distribution', 'excretion', 
-            'clearance', 'pk', 'pd', 'bioavailability', 'drug interaction',
-            'cyp', 'enzyme', 'how does', 'how it works', 'mode of action',
-            'moa', 'pathway', 'receptor', 'binding'
-        ]
-        query_lower = query.lower()
-        return any(kw in query_lower for kw in keywords)
 
     def _clean_source_text(self, text: str) -> str:
         """
@@ -1224,7 +1208,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 sparse_weight=0.3
             )
         
-        if not passages:
+        if not passages and not dailymed_results:
             # No passages retrieved - use fallback LLM generation
             logger.info("📭 No passages retrieved, using fallback generation")
             answer, _ = self._run_fallback_generation(query, stream=False)

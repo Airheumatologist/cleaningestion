@@ -3,6 +3,8 @@ High-impact and specialty journal configuration for prioritization.
 These journals should be prioritized when selecting full-text articles.
 """
 
+import re
+
 # High-impact specialty journals by corpus_id
 PRIORITY_JOURNALS = {
     # General/Multi-specialty High-Impact
@@ -158,6 +160,117 @@ PRIORITY_JOURNALS = {
     # Nuclear Medicine
     'S73746427',   # Journal of Nuclear Medicine
 }
+
+# Normalized journal-name aliases (derived from the canonical priority list above).
+# This allows runtime matching by journal title as well as corpus/document identifiers.
+_PRIORITY_JOURNAL_NAME_TEXT = """
+JAMA
+New England Journal of Medicine
+The Lancet
+BMJ
+JAMA Internal Medicine
+Annals of Internal Medicine
+PLOS Medicine
+Circulation
+Journal of the American College of Cardiology
+European Heart Journal
+JACC: Heart Failure
+Reviews in Cardiovascular Medicine
+Journal of Clinical Medicine
+Cardiology Journal
+Heart Rhythm
+Emergency Medicine Clinics of North America
+Emergency Medicine International
+Annals of Emergency Medicine
+Academic Emergency Medicine
+Arthritis & Rheumatology
+Annals of the Rheumatic Diseases
+Arthritis Research & Therapy
+Reumatismo
+Modern Rheumatology
+The Journal of Rheumatology
+Clinical Rheumatology
+Rheumatology (Oxford)
+Respiratory Research
+American Journal of Respiratory and Critical Care Medicine
+European Respiratory Journal
+Chest
+Thorax
+Journal of the American Society of Nephrology
+Kidney International
+American Journal of Kidney Diseases
+Clinical Journal of the American Society of Nephrology
+Blood
+British Journal of Haematology
+Haematologica
+Blood Advances
+Neurology
+JAMA Neurology
+Annals of Neurology
+Gastroenterology
+Gut
+Clinical Gastroenterology and Hepatology
+Alimentary Pharmacology & Therapeutics
+Diabetes Care
+The Journal of Clinical Endocrinology & Metabolism
+Diabetologia
+Clinical Infectious Diseases
+The Journal of Infectious Diseases
+Antimicrobial Agents and Chemotherapy
+Journal of Clinical Oncology
+Cancer
+JAMA Oncology
+Critical Care Medicine
+Intensive Care Medicine
+Critical Care
+Journal of the American Academy of Dermatology
+JAMA Dermatology
+British Journal of Dermatology
+Journal of Investigative Dermatology
+Dermatologic Surgery
+Ophthalmology
+JAMA Ophthalmology
+American Journal of Ophthalmology
+British Journal of Ophthalmology
+Retina
+Laryngoscope
+Otolaryngology-Head and Neck Surgery
+JAMA Otolaryngology-Head & Neck Surgery
+International Forum of Allergy & Rhinology
+Journal of Bone and Joint Surgery
+Clinical Orthopaedics and Related Research
+Journal of Orthopaedic Research
+American Journal of Psychiatry
+Journal of Clinical Psychiatry
+Radiology
+American Journal of Roentgenology
+European Radiology
+Journal of Vascular and Interventional Radiology
+American Journal of Surgical Pathology
+Modern Pathology
+Anesthesiology
+Anesthesia & Analgesia
+British Journal of Anaesthesia
+Annals of Surgery
+British Journal of Surgery
+Pediatrics
+Journal of Pediatrics
+Obstetrics & Gynecology
+American Journal of Obstetrics & Gynecology
+Journal of Urology
+Plastic and Reconstructive Surgery
+International Journal of Radiation Oncology
+Journal of Nuclear Medicine
+"""
+
+PRIORITY_JOURNAL_NAMES = {
+    re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+    for name in _PRIORITY_JOURNAL_NAME_TEXT.splitlines()
+    if name.strip()
+}
+
+# Export includes both corpus/document IDs and normalized journal names.
+PRIORITY_JOURNALS = PRIORITY_JOURNALS | PRIORITY_JOURNAL_NAMES
 
 # Guideline organizations (for future use in filtering/prioritization)
 GUIDELINE_ORGANIZATIONS = {
