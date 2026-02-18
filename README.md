@@ -95,7 +95,7 @@ RAG-pipeline/
 │   ├── medical_qdrant_client.py            # Qdrant client wrapper
 │   ├── medical_entity_expander.py          # MeSH acronym expansion
 │   ├── bm25_sparse.py                      # BM25 sparse encoder
-│   ├── splade_encoder.py                   # SPLADE sparse encoder (backup)
+│   ├── bm25_sparse.py                      # BM25 sparse encoder for hybrid search
 │   └── specialty_journals.py               # Journal priority lists
 │
 ├── scripts/                                # Data ingestion pipeline

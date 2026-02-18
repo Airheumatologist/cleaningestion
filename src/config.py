@@ -69,8 +69,7 @@ QUANTIZATION_ALWAYS_RAM = _env_bool("QUANTIZATION_ALWAYS_RAM", default=True)
 QUANTIZATION_RESCORE = _env_bool("QUANTIZATION_RESCORE", default=True)
 QUANTIZATION_OVERSAMPLING = float(os.getenv("QUANTIZATION_OVERSAMPLING", "1.5"))
 
-# SPLADE Sparse Vector Configuration
-SPLADE_MODEL = "naver/splade-cocondenser-ensembledistil"
+# Hybrid Search Configuration
 USE_HYBRID_SEARCH = _env_bool("USE_HYBRID_SEARCH", default=True)
 DENSE_WEIGHT = 0.7  # Weight for dense vector scores in hybrid search
 SPARSE_WEIGHT = 0.3  # Weight for sparse vector scores in hybrid search

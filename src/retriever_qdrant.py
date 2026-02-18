@@ -28,14 +28,6 @@ from .bm25_sparse import BM25SparseEncoder
 
 logger = logging.getLogger(__name__)
 
-# SPLADE encoder for sparse vectors (optional legacy mode)
-try:
-    from .splade_encoder import get_splade_encoder
-    SPLADE_AVAILABLE = True
-except ImportError:
-    SPLADE_AVAILABLE = False
-    logger.warning("SPLADE encoder not available; bm25 sparse mode will be used if enabled")
-
 
 # =============================================================================
 # Abstract Base (matches ScholarQA pattern)
@@ -118,26 +110,15 @@ class QdrantRetriever(AbstractRetriever):
             raise ValueError(f"Unsupported embedding provider: {self.embedding_provider}. Only 'deepinfra' is supported.")
 
         # Initialize sparse query encoder for hybrid search.
-        self.splade_encoder = None
         self.bm25_sparse_encoder = None
-        self.sparse_mode = (SPARSE_RETRIEVAL_MODE or "bm25").lower().strip()
         if USE_HYBRID_SEARCH:
-            if self.sparse_mode == "splade" and SPLADE_AVAILABLE:
-                try:
-                    self.splade_encoder = get_splade_encoder()
-                    logger.info("✅ SPLADE encoder initialized for hybrid search")
-                except Exception as e:
-                    logger.warning(f"SPLADE initialization failed, falling back to bm25 sparse: {e}")
-                    self.sparse_mode = "bm25"
-
-            if self.sparse_mode != "splade":
-                self.bm25_sparse_encoder = BM25SparseEncoder(
-                    max_terms_doc=max(SPARSE_MAX_TERMS_QUERY, 64),
-                    max_terms_query=SPARSE_MAX_TERMS_QUERY,
-                    min_token_len=SPARSE_MIN_TOKEN_LEN,
-                    remove_stopwords=SPARSE_REMOVE_STOPWORDS,
-                )
-                logger.info("✅ BM25 sparse encoder initialized for hybrid search")
+            self.bm25_sparse_encoder = BM25SparseEncoder(
+                max_terms_doc=max(SPARSE_MAX_TERMS_QUERY, 64),
+                max_terms_query=SPARSE_MAX_TERMS_QUERY,
+                min_token_len=SPARSE_MIN_TOKEN_LEN,
+                remove_stopwords=SPARSE_REMOVE_STOPWORDS,
+            )
+            logger.info("✅ BM25 sparse encoder initialized for hybrid search")
         else:
             logger.info("ℹ️ Hybrid search disabled in config")
         
@@ -233,38 +214,15 @@ class QdrantRetriever(AbstractRetriever):
         return None
 
     def _build_sparse_query_vector(self, query: str) -> Optional[SparseVector]:
-        """Build sparse query vector from configured sparse mode."""
-        if self.splade_encoder is not None:
-            try:
-                sparse_dicts = self.splade_encoder.encode([query])
-                if sparse_dicts and sparse_dicts[0]:
-                    sparse_dict = sparse_dicts[0]
-                    return SparseVector(
-                        indices=list(sparse_dict.keys()),
-                        values=list(sparse_dict.values()),
-                    )
-            except Exception as exc:
-                logger.warning("SPLADE sparse encoding failed: %s", exc)
-
+        """Build sparse query vector using BM25."""
         if self.bm25_sparse_encoder is not None:
             return self.bm25_sparse_encoder.encode_query(query)
         return None
 
     def build_sparse_query_vectors(self, queries: List[str]) -> List[SparseVector]:
-        """Batch-build sparse vectors for queries."""
-        if self.splade_encoder is not None:
-            try:
-                sparse_dicts = self.splade_encoder.encode_batch_cached(queries)
-                return [
-                    SparseVector(indices=list(s.keys()), values=list(s.values())) if s else SparseVector(indices=[], values=[])
-                    for s in sparse_dicts
-                ]
-            except Exception as exc:
-                logger.warning("Batch SPLADE sparse encoding failed: %s", exc)
-
+        """Batch-build sparse vectors for queries using BM25."""
         if self.bm25_sparse_encoder is not None:
             return self.bm25_sparse_encoder.encode_queries(queries)
-
         return [SparseVector(indices=[], values=[]) for _ in queries]
     
     def _build_filter(self, **kwargs) -> Optional[Filter]:
@@ -366,10 +324,10 @@ class QdrantRetriever(AbstractRetriever):
 
         Args:
             query: Search query (embedded via Cloud Inference or locally)
-            use_hybrid: Whether to use hybrid search (dense + SPLADE sparse)
+            use_hybrid: Whether to use hybrid search (dense + BM25 sparse)
             dense_weight: Weight for dense vector scores (default: 0.7)
             sparse_weight: Weight for sparse vector scores (default: 0.3)
-            precomputed_sparse_vector: Optional pre-computed SPLADE sparse vector (for batch optimization)
+            precomputed_sparse_vector: Optional pre-computed BM25 sparse vector (for batch optimization)
             **filter_kwargs: Filters (year, venue, article_type, country)
 
         Returns:
@@ -379,7 +337,7 @@ class QdrantRetriever(AbstractRetriever):
         search_filter = self._build_filter(**filter_kwargs)
 
         # Try hybrid search if sparse query encoder is available
-        if use_hybrid and (self.splade_encoder is not None or self.bm25_sparse_encoder is not None):
+        if use_hybrid and self.bm25_sparse_encoder is not None:
             return self._hybrid_search(
                 query=query,
                 search_filter=search_filter,
@@ -475,7 +433,7 @@ class QdrantRetriever(AbstractRetriever):
             search_filter: Qdrant filter
             dense_weight: Weight for dense vector scores
             sparse_weight: Weight for sparse vector scores
-            precomputed_sparse_vector: Optional pre-computed SPLADE sparse vector (for batch optimization)
+            precomputed_sparse_vector: Optional pre-computed BM25 sparse vector (for batch optimization)
             
         Returns:
             List of passages with combined scores
@@ -647,7 +605,7 @@ class QdrantRetriever(AbstractRetriever):
         
         Args:
             queries: List of query strings (will use Cloud Inference for dense embedding)
-            sparse_vectors: List of pre-computed SPLADE sparse vectors (one per query)
+            sparse_vectors: List of pre-computed BM25 sparse vectors (one per query)
             dense_weight: Weight for dense vector scores (default: 0.7)
             sparse_weight: Weight for sparse vector scores (default: 0.3)
             **filter_kwargs: Filters (year, venue, article_type)
@@ -701,7 +659,7 @@ class QdrantRetriever(AbstractRetriever):
             batch_requests.append(dense_request)
             
             if use_sparse:
-                # Sparse query using pre-computed sparse vector (SPLADE or BM25).
+                # Sparse query using pre-computed BM25 sparse vector.
                 sparse_request = QueryRequest(
                     query=sparse_vectors[i],
                     using="sparse",

@@ -124,7 +124,7 @@ class MedicalRAGPipeline:
         Retrieve passages from Qdrant using multi-query expansion.
         
         Optimized with BATCH query API:
-        - Batch encodes ALL query variations with SPLADE in ONE call
+        - Batch encodes ALL query variations with BM25 in ONE call
         - Sends ALL queries (dense + sparse) to Qdrant in ONE HTTP request
         - DailyMed search runs in parallel thread
         """

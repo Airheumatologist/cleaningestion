@@ -35,6 +35,7 @@ from ingestion_utils import (
     get_section_weight,
     get_chunker as get_shared_chunker,
     detect_evidence_grade,
+    get_evidence_level,
 )
 
 # Import enhanced utilities for semantic chunking
@@ -167,37 +168,34 @@ def parse_pubmed_update_xml(xml_gz_path: Path) -> Iterable[Dict[str, Any]]:
                 "article_type": article_type,
                 "publication_type": pub_types[:5],
                 "evidence_grade": evidence_grade,
-                "source": "pubmed_update",
+                "source": "pubmed_abstract",
                 "has_full_text": False,
             }
 
             elem.clear()
 
 
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider) -> tuple[List[PointStruct], List[str]]:
-    """Build Qdrant points from article batch with semantic chunking."""
+def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, 
+                 sparse_encoder: Optional[Any] = None) -> tuple[List[PointStruct], List[str]]:
+    """Build Qdrant points from article batch with semantic chunking.
+    
+    Args:
+        batch: List of parsed articles
+        embedding_provider: Provider for generating embeddings
+        sparse_encoder: Optional sparse encoder for hybrid search (created once and reused)
+    """
     # Use shared chunker instance (SemanticChunker if available)
     chunker = get_shared_chunker(
         chunker_class=CHUNKER_CLASS,
         chunk_size=IngestionConfig.CHUNK_SIZE_TOKENS,
         overlap=IngestionConfig.CHUNK_OVERLAP_TOKENS,
     )
-    
-    sparse_encoder = None
-    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
-        sparse_encoder = BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
 
     points: List[PointStruct] = []
     pmids: List[str] = []
     
     # Batch collection
     all_chunks_text: List[str] = []
-    all_chunks_sparse = []
     chunk_metadata: List[Dict[str, Any]] = []
 
     for article in batch:
@@ -224,7 +222,6 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         for i, chunk in enumerate(text_chunks):
             chunk_text = chunk["text"]
             all_chunks_text.append(chunk_text)
-            all_chunks_sparse.append(sparse_encoder.encode_document(chunk_text) if sparse_encoder is not None else None)
             
             # Extract chunk abstract (remove title prefix if present)
             chunk_abstract = chunk_text
@@ -262,7 +259,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 
                 # Evidence
                 "evidence_grade": article.get("evidence_grade", "C"),
-                "evidence_level": {"A": 1, "B": 2, "C": 3, "D": 4}.get(article.get("evidence_grade", "C"), 3),
+                "evidence_level": get_evidence_level(article.get("evidence_grade", "C")),
                 
                 # Parent-child indexing fields
                 "section_title": f"Abstract (Part {i+1}/{len(text_chunks)})" if len(text_chunks) > 1 else "Abstract",
@@ -272,7 +269,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 "full_section_text": text,
                 
                 # Source and type
-                "source": article.get("source", "pubmed_update"),
+                "source": article.get("source", "pubmed_abstract"),
                 "has_full_text": False,
                 "content_type": "abstract",
                 
@@ -287,13 +284,24 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
 
     # Embed all chunks using shared embedding provider
     vectors = embedding_provider.embed_batch(all_chunks_text)
+    
+    # Batch encode sparse vectors (if enabled)
+    sparse_vectors = []
+    if sparse_encoder:
+        try:
+            sparse_vectors = sparse_encoder.encode_batch(all_chunks_text)
+        except Exception as e:
+            logger.warning("Sparse encoding failed for batch: %s", e)
+            sparse_vectors = [None] * len(all_chunks_text)
+    
     for i, vector in enumerate(vectors):
         payload = chunk_metadata[i]
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pubmed_update:{payload['chunk_id']}"))
-        sparse_vector = all_chunks_sparse[i]
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pubmed:{payload['chunk_id']}"))
         vector_data: Any = {"dense": vector}
-        if sparse_vector is not None:
-            vector_data["sparse"] = sparse_vector
+        
+        # Add sparse vector if available
+        if sparse_vectors and i < len(sparse_vectors) and sparse_vectors[i]:
+            vector_data["sparse"] = sparse_vectors[i].model_dump() if hasattr(sparse_vectors[i], 'model_dump') else sparse_vectors[i]
         
         points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
 
@@ -317,6 +325,17 @@ def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingPro
                 IngestionConfig.CHUNK_SIZE_TOKENS,
                 IngestionConfig.CHUNK_OVERLAP_TOKENS,
                 chunker.__class__.__name__)
+    
+    # Create sparse encoder once (reused for all batches)
+    sparse_encoder: Optional[Any] = None
+    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
+        sparse_encoder = BM25SparseEncoder(
+            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
+            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
+            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
+            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
+        )
+        logger.info("BM25 sparse encoder initialized for hybrid search")
 
     inserted = 0
     for file_name in new_files:
@@ -328,7 +347,7 @@ def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingPro
             batch.append(article)
             if len(batch) < IngestionConfig.BATCH_SIZE:
                 continue
-            points, _ = build_points(batch, embedding_provider)
+            points, _ = build_points(batch, embedding_provider, sparse_encoder)
             if points:
                 upsert_with_retry(client, points)
                 inserted += len(points)
@@ -336,7 +355,7 @@ def ingest_pubmed_updates(client: QdrantClient, embedding_provider: EmbeddingPro
             batch.clear()
 
         if batch:
-            points, _ = build_points(batch, embedding_provider)
+            points, _ = build_points(batch, embedding_provider, sparse_encoder)
             if points:
                 upsert_with_retry(client, points)
                 inserted += len(points)

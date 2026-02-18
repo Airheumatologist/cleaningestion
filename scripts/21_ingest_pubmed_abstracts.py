@@ -382,9 +382,13 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         if validate_chunks and ENHANCED_UTILS_AVAILABLE:
             valid_payloads = []
             for payload in payloads:
+                chunk_text = payload.get("page_content", "")
                 is_valid, issues = QualityValidator.validate_chunk(
-                    payload["page_content"],
-                    {k: payload.get(k) for k in ["doc_id", "chunk_id", "title", "pmid", "year"]}
+                    chunk_text,
+                    {
+                        k: payload.get(k)
+                        for k in ["doc_id", "chunk_id", "title", "pmid", "year", "page_content"]
+                    },
                 )
                 if is_valid:
                     valid_payloads.append(payload)
