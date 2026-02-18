@@ -437,6 +437,7 @@ class QdrantRetriever(AbstractRetriever):
                     "corpus_id": doc_id,
                     "pmcid": point.payload.get("pmcid", doc_id),
                     "pmid": point.payload.get("pmid"),
+                    "doi": point.payload.get("doi"),
                     "title": point.payload.get("title", ""),
                     # Use page_content (chunk) if available, else abstract
                     "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
@@ -451,7 +452,7 @@ class QdrantRetriever(AbstractRetriever):
                     "venue": point.payload.get("journal", ""),
                     "nlm_unique_id": point.payload.get("nlm_unique_id"),
                     "year": point.payload.get("year"),
-                    "authors": self._parse_authors(point.payload.get("authors")),
+                    "authors": [],
                     "article_type": point.payload.get("article_type", ""),
                     "publication_type": self._normalize_publication_type_list(
                         point.payload.get("publication_type")
@@ -609,6 +610,7 @@ class QdrantRetriever(AbstractRetriever):
                     "corpus_id": doc_id,
                     "pmcid": point.payload.get("pmcid", doc_id),
                     "pmid": point.payload.get("pmid"),
+                    "doi": point.payload.get("doi"),
                     "title": point.payload.get("title", ""),
                     "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
@@ -622,7 +624,7 @@ class QdrantRetriever(AbstractRetriever):
                     "venue": point.payload.get("journal", ""),
                     "nlm_unique_id": point.payload.get("nlm_unique_id"),
                     "year": point.payload.get("year"),
-                    "authors": self._parse_authors(point.payload.get("authors")),
+                    "authors": [],
                     "article_type": point.payload.get("article_type", ""),
                     "publication_type": self._normalize_publication_type_list(
                         point.payload.get("publication_type")
@@ -803,6 +805,7 @@ class QdrantRetriever(AbstractRetriever):
                     "corpus_id": doc_id,
                     "pmcid": point.payload.get("pmcid", doc_id),
                     "pmid": point.payload.get("pmid"),
+                    "doi": point.payload.get("doi"),
                     "title": point.payload.get("title", ""),
                     "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
@@ -816,7 +819,7 @@ class QdrantRetriever(AbstractRetriever):
                     "venue": point.payload.get("journal", ""),
                     "nlm_unique_id": point.payload.get("nlm_unique_id"),
                     "year": point.payload.get("year"),
-                    "authors": self._parse_authors(point.payload.get("authors")),
+                    "authors": [],
                     "article_type": point.payload.get("article_type", ""),
                     "publication_type": self._normalize_publication_type_list(
                         point.payload.get("publication_type")
@@ -879,6 +882,7 @@ class QdrantRetriever(AbstractRetriever):
                         "corpus_id": doc_id,
                         "pmcid": point.payload.get("pmcid", doc_id),
                         "pmid": point.payload.get("pmid"),
+                        "doi": point.payload.get("doi"),
                         "title": point.payload.get("title", ""),
                         "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                         "abstract": point.payload.get("abstract", ""),
@@ -892,7 +896,7 @@ class QdrantRetriever(AbstractRetriever):
                         "venue": point.payload.get("journal", ""),
                         "nlm_unique_id": point.payload.get("nlm_unique_id"),
                         "year": point.payload.get("year"),
-                        "authors": self._parse_authors(point.payload.get("authors")),
+                        "authors": [],
                         "article_type": point.payload.get("article_type", ""),
                         "publication_type": self._normalize_publication_type_list(
                             point.payload.get("publication_type")
@@ -1584,20 +1588,7 @@ class QdrantRetriever(AbstractRetriever):
         }
 
     
-    def _parse_authors(self, authors_data) -> List[Dict[str, str]]:
-        """Parse authors from payload into ScholarQA format."""
-        if not authors_data:
-            return []
-        
-        if isinstance(authors_data, str):
-            # Simple string format: "Author A, Author B"
-            names = [a.strip() for a in authors_data.split(",")]
-            return [{"name": name} for name in names if name]
-        
-        if isinstance(authors_data, list):
-            return [{"name": a} if isinstance(a, str) else a for a in authors_data]
-        
-        return []
+
 
 
 if __name__ == "__main__":

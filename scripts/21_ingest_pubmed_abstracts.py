@@ -29,7 +29,6 @@ Usage:
 """
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import logging
@@ -57,6 +56,7 @@ from ingestion_utils import (
     get_chunker as get_shared_chunker,
     load_checkpoint as load_checkpoint_file,
     append_checkpoint as append_checkpoint_file,
+    generate_section_id,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -208,7 +208,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
     evidence_source = evidence["matched_from"]
     
     # Base section ID (for single chunk or parent reference)
-    base_section_id = hashlib.sha256(f"{pmid}:Abstract".encode()).hexdigest()[:16]
+    base_section_id = generate_section_id(pmid, "Abstract")
     
     payloads = []
     
@@ -278,6 +278,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
             
             # Metadata
             "source": "pubmed_abstract",
+            "source_family": "pubmed",
             "content_type": "abstract",
             "has_full_text": False,
             "table_count": 0,
@@ -294,7 +295,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
         
         for i, chunk_data in enumerate(chunk_results):
             # Create sub-section ID for this chunk
-            chunk_section_id = hashlib.sha256(f"{pmid}:Abstract:{i}".encode()).hexdigest()[:16]
+            chunk_section_id = generate_section_id(pmid, f"Abstract_{i}")
             
             # Determine chunk title
             if i == 0:
@@ -359,7 +360,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
                 "keywords_full": keywords if i == 0 else [],
                 
                 # Parent-child fields
-                "full_section_text": chunk_text,
+                "full_section_text": full_text,
                 "section_id": chunk_section_id,
                 "parent_section_id": base_section_id,
                 "section_weight": 1.0 - (i * 0.05),  # Slight decay for later chunks
@@ -368,6 +369,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
                 
                 # Metadata
                 "source": "pubmed_abstract",
+                "source_family": "pubmed",
                 "content_type": "abstract",
                 "has_full_text": False,
                 "table_count": 0,

@@ -223,6 +223,7 @@ def create_payload(article: Dict[str, Any], source_type: str) -> Dict[str, Any]:
         "keywords": classification.get("keywords", []) if classification else article.get("keywords", [])[:20],
         "mesh_terms": classification.get("mesh_terms", []) if classification else article.get("mesh_terms", [])[:30],
         "article_type": metadata.get("article_type", "") if metadata else article.get("article_type", "")[:50],
+        "publication_type": article.get("publication_type_list", []),
         "evidence_grade": article.get("evidence_grade", ""),
         "evidence_level": article.get("evidence_level"),
         "evidence_term": article.get("evidence_term"),
@@ -297,10 +298,12 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
         "year": year,
         "pmcid": identifiers.get("pmcid") if identifiers else article.get("pmcid"),
         "pmid": pmid,
+        "doi": identifiers.get("doi") or article.get("doi", ""),
         "country": country,
         "keywords": keywords,
         "mesh_terms": mesh_terms,
         "article_type": article_payload.get("article_type", ""),
+        "publication_type": article_payload.get("publication_type", []),
         "evidence_grade": article_payload.get("evidence_grade", ""),
         "evidence_level": article_payload.get("evidence_level"),
         "evidence_term": article_payload.get("evidence_term"),
@@ -424,6 +427,12 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
                 **base_metadata,
             })
     
+    # Add chunk_index and total_chunks for cross-source consistency
+    total_chunks = len(chunks)
+    for idx, chunk in enumerate(chunks):
+        chunk["chunk_index"] = idx
+        chunk["total_chunks"] = total_chunks
+    
     return chunks
 
 
@@ -532,6 +541,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             "chunk_id": chunk_id,
             "pmcid": chunk.get("pmcid", ""),
             "pmid": chunk.get("pmid", ""),
+            "doi": chunk.get("doi", ""),
             
             # CRITICAL: Full text for retriever (was missing!)
             "page_content": chunk["text"],
@@ -571,8 +581,13 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             "is_author_manuscript": bool(chunk.get("is_author_manuscript", False)),
             "nihms_id": chunk.get("nihms_id"),
             "article_type": chunk.get("article_type", "other"),
+            "publication_type": chunk.get("publication_type", []),
             "has_full_text": chunk.get("has_full_text", True),
             "is_open_access": chunk.get("is_open_access"),
+            
+            # Chunking metadata for cross-source consistency
+            "chunk_index": chunk.get("chunk_index", 0),
+            "total_chunks": chunk.get("total_chunks", 1),
             
             # Preview for dashboard browsing (keep for UI)
             "text_preview": chunk["text"][:500],

@@ -717,7 +717,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 "section_id": chunk_section_id,
                 "parent_section_id": base_section_id if len(text_chunks) > 1 else None,
                 "section_weight": get_section_weight("abstract") - (i * 0.05),  # Slight decay for later chunks
-                "full_section_text": chunk_text,
+                "full_section_text": text,
 
                 # Source and type
                 "source": article.get("source", "pubmed_abstract"),

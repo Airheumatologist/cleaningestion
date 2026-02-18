@@ -44,40 +44,6 @@ def make_int(value) -> int:
         return 0
 
 
-def get_ref_author_str(authors) -> str:
-    """
-    Format authors for reference string (ScholarQA format).
-    
-    Returns: "LastName, LastName2 et al." or "LastName"
-    """
-    if not authors:
-        return "Unknown"
-    
-    if isinstance(authors, str):
-        # Simple string format
-        names = [a.strip() for a in authors.split(",")]
-        if len(names) >= 2:
-            return f"{names[0].split()[-1]}, {names[1].split()[-1]} et al."
-        return names[0].split()[-1] if names else "Unknown"
-    
-    if isinstance(authors, list):
-        author_names = []
-        for a in authors[:2]:  # First 2 authors
-            if isinstance(a, dict):
-                name = a.get("name", "Unknown")
-            else:
-                name = str(a)
-            # Get last name
-            author_names.append(name.split()[-1] if name else "Unknown")
-        
-        if len(author_names) >= 2:
-            return f"{author_names[0]}, {author_names[1]} et al."
-        elif author_names:
-            return author_names[0]
-    
-    return "Unknown"
-
-
 # =============================================================================
 # Abstract Reranker Interface (matches ScholarQA)
 # =============================================================================
@@ -996,7 +962,7 @@ class PaperFinderWithReranker:
         # Create reference string (ScholarQA format with PMCID)
         df["reference_string"] = df.apply(
             lambda row: anyascii(
-                f"[{row['pmcid']} | {get_ref_author_str(row['authors'])} | "
+                f"[{row['pmcid']} | Unknown | "
                 f"{make_int(row['year'])} | Citations: {make_int(row.get('citation_count', 0))}]"
             ),
             axis=1

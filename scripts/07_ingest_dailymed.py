@@ -353,6 +353,7 @@ def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
             "manufacturer": manufacturer,
             "sections": sections,
             "source": "dailymed",
+            "source_family": "dailymed",
             "article_type": "drug_label",
         }
     except Exception as e:
@@ -416,6 +417,8 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
                 "manufacturer": manufacturer,
                 "active_ingredients": active_ingredients,
                 "source": "dailymed",
+                "source_family": "dailymed",
+                "article_type": "drug_label",
                 # Chunking metadata for consistency
                 "chunk_index": j,
                 "total_chunks": len(section_chunks),
@@ -449,6 +452,8 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
                     "manufacturer": manufacturer,
                     "active_ingredients": active_ingredients,
                     "source": "dailymed",
+                    "source_family": "dailymed",
+                    "article_type": "drug_label",
                     # Chunking metadata for consistency
                     "chunk_index": j,
                     "total_chunks": len(table_chunks),
@@ -554,20 +559,47 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
     for i, chunk in enumerate(chunks):
         try:
             # Generate UUID from chunk_id for consistent ID
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk["chunk_id"]))
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"dailymed:{chunk['chunk_id']}"))
             
             vector = {"dense": embeddings[i]}
             
             if sparse_encoder and i < len(sparse_vectors) and sparse_vectors[i]:
                 vector["sparse"] = sparse_vectors[i]
             
-            # Add timestamp
-            chunk["ingestion_timestamp"] = time.time()
+            # Build explicit payload with only fields needed for retriever/reranker
+            payload = {
+                # Core identifiers (doc_id mapped from set_id for index consistency)
+                "doc_id": chunk.get("set_id", ""),
+                "chunk_id": chunk["chunk_id"],
+                "set_id": chunk.get("set_id", ""),
+                
+                # Drug label metadata
+                "drug_name": chunk.get("drug_name", ""),
+                "manufacturer": chunk.get("manufacturer", ""),
+                "active_ingredients": chunk.get("active_ingredients", []),
+                
+                # Section metadata
+                "section_type": chunk.get("section_type", ""),
+                "section_title": chunk.get("section_title", ""),
+                "section_weight": chunk.get("section_weight", 1.0),
+                "has_tables": chunk.get("has_tables", False),
+                
+                # Content (for retriever)
+                "page_content": chunk.get("page_content", chunk["text"]),
+                
+                # Source info
+                "source": chunk.get("source", "dailymed"),
+                "source_family": chunk.get("source_family", "dailymed"),
+                "article_type": chunk.get("article_type", "drug_label"),
+                
+                # Ingestion metadata
+                "ingestion_timestamp": time.time(),
+            }
             
             points.append(PointStruct(
                 id=point_id,
                 vector=vector,
-                payload=chunk
+                payload=payload
             ))
             chunk_ids.append(chunk["chunk_id"])
             
