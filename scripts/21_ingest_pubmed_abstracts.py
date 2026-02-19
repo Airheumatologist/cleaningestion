@@ -119,6 +119,80 @@ def load_checkpoint_namespaced(path: Path) -> set[str]:
         if (resolved := _resolve_checkpoint_line(line)) is not None
     }
 
+
+def _read_last_non_empty_line(input_file: Path) -> Optional[str]:
+    """
+    Read the last non-empty line from a potentially large text file.
+
+    Scans from the end to avoid loading the full file into memory.
+    """
+    with open(input_file, "rb") as f:
+        f.seek(0, 2)
+        file_size = f.tell()
+        if file_size == 0:
+            return None
+
+        pos = file_size - 1
+
+        # Skip trailing whitespace/newlines at EOF.
+        while pos >= 0:
+            f.seek(pos)
+            byte = f.read(1)
+            if byte not in b" \t\r\n":
+                break
+            pos -= 1
+
+        if pos < 0:
+            return None
+
+        line_end = pos
+
+        while pos >= 0:
+            f.seek(pos)
+            if f.read(1) == b"\n":
+                break
+            pos -= 1
+
+        line_start = pos + 1
+        f.seek(line_start)
+        line_bytes = f.read(line_end - line_start + 1)
+
+    return line_bytes.decode("utf-8")
+
+
+def validate_jsonl_tail(input_file: Path) -> bool:
+    """
+    Pre-flight check for truncated/incomplete JSONL files.
+
+    Ensures the final non-empty line parses as JSON before ingestion begins.
+    """
+    try:
+        last_line = _read_last_non_empty_line(input_file)
+    except UnicodeDecodeError as e:
+        logger.error("Input file is not valid UTF-8 near EOF: %s", e)
+        return False
+    except OSError as e:
+        logger.error("Failed reading input file tail: %s", e)
+        return False
+
+    if last_line is None:
+        logger.error("Input file appears empty or whitespace-only: %s", input_file)
+        return False
+
+    try:
+        json.loads(last_line)
+    except json.JSONDecodeError as e:
+        logger.error(
+            "Pre-flight failed: last JSONL line is invalid JSON in %s. "
+            "This often indicates a truncated/interrupted write. Error: %s",
+            input_file,
+            e,
+        )
+        return False
+
+    logger.info("Pre-flight check passed: last JSONL line parses successfully.")
+    return True
+
 # Token counting is handled by the shared Chunker class from ingestion_utils.
 # Counts are estimated from words for consistency across ingestion scripts.
 
@@ -539,6 +613,9 @@ def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_p
 def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: EmbeddingProvider) -> None:
     if not input_file.exists():
         logger.error("Input file not found: %s", input_file)
+        return
+    if not validate_jsonl_tail(input_file):
+        logger.error("Aborting ingestion due to failed JSONL pre-flight check.")
         return
 
     ensure_data_dirs()

@@ -22,6 +22,8 @@ from ingestion_utils import (
     EmbeddingProvider,
     upsert_with_retry,
     validate_qdrant_collection_schema,
+    reset_pmc_xml_parse_failure_count,
+    get_pmc_xml_parse_failure_count,
     get_chunker as get_shared_chunker,
     load_checkpoint as load_checkpoint_file,
     append_checkpoint as append_checkpoint_file,
@@ -705,6 +707,7 @@ def process_batch(
 
 def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_source: bool = False) -> None:
     ensure_data_dirs()
+    reset_pmc_xml_parse_failure_count()
     
     if delete_source:
         logger.warning("Source file deletion enabled: XML/NXML files will be deleted after successful ingestion")
@@ -814,7 +817,16 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
             future_to_batch.clear()
 
     elapsed = time.time() - start_time
-    logger.info("PMC ingestion complete. Total Inserted: %s, Total Skipped: %s, Time: %.1fs", total_inserted, total_skipped, elapsed)
+    parse_failures = get_pmc_xml_parse_failure_count()
+    logger.info(
+        "PMC ingestion complete. Total Inserted: %s, Total Skipped: %s, Parse Failures: %s, Time: %.1fs",
+        total_inserted,
+        total_skipped,
+        parse_failures,
+        elapsed,
+    )
+    if parse_failures > 0:
+        logger.warning("PMC XML parse failures skipped: %s", parse_failures)
 
 
 if __name__ == "__main__":

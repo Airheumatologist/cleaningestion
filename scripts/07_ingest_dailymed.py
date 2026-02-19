@@ -267,6 +267,9 @@ def _parse_spl_xml_with_status(xml_path: Path) -> Tuple[Optional[Dict[str, Any]]
             
             # Get section text (direct content)
             section_text = get_text(text_elem[0]) if text_elem else ""
+            table_text_elements: List[ET.Element] = []
+            if text_elem:
+                table_text_elements.append(text_elem[0])
             
             # IMPORTANT: For parent sections (Dosage, Warnings, etc.), also aggregate
             # text from child subsections, since parent <text> is often empty
@@ -275,6 +278,7 @@ def _parse_spl_xml_with_status(xml_path: Path) -> Tuple[Optional[Dict[str, Any]]
             for child in child_sections:
                 child_text_elem = child.xpath("hl7:text", namespaces=NS)
                 if child_text_elem:
+                    table_text_elements.append(child_text_elem[0])
                     child_text = get_text(child_text_elem[0])
                     if child_text:
                         child_title = child.xpath("hl7:title/text()", namespaces=NS)
@@ -292,19 +296,21 @@ def _parse_spl_xml_with_status(xml_path: Path) -> Tuple[Optional[Dict[str, Any]]
             
             combined_text = "\n\n".join(all_text_parts) if all_text_parts else ""
             
-            # Parse tables within this section and its children (only for whitelisted sections)
+            # Parse tables from the same text elements used for prose aggregation.
+            # This keeps section prose/table context aligned for chunking.
             tables = []
-            all_text_elements = section.xpath(".//hl7:text", namespaces=NS)  # Get all text elements in section + children
-            for te in all_text_elements:
+            table_index = 0
+            for te in table_text_elements:
                 table_elements = te.xpath(".//hl7:table", namespaces=NS)
-                for i, table in enumerate(table_elements):
+                for table in table_elements:
                     table_content = parse_table_to_markdown(table)
                     if table_content:
                         tables.append({
-                            "index": i,
+                            "index": table_index,
                             "content": table_content,
-                            "type": f"table_{i}"
+                            "type": f"table_{table_index}"
                         })
+                        table_index += 1
             
             # Only add if has content
             if combined_text or tables:
@@ -318,7 +324,7 @@ def _parse_spl_xml_with_status(xml_path: Path) -> Tuple[Optional[Dict[str, Any]]
                 else:
                     sections[section_key] = {
                         "title": section_title,
-                        "text": combined_text[:20000],
+                        "text": combined_text,
                         "tables": tables,
                         "has_tables": len(tables) > 0
                     }

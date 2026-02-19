@@ -152,20 +152,70 @@ def list_pubmed_update_files(max_files: Optional[int]) -> List[str]:
     return files
 
 
+def _is_valid_gzip(path: Path) -> bool:
+    """Return True when a local .gz file can be opened and read."""
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    try:
+        with gzip.open(path, "rb") as handle:
+            while handle.read(1024 * 1024):
+                pass
+        return True
+    except Exception:
+        return False
+
+
 def download_pubmed_file(file_name: str, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     local_path = output_dir / file_name
+    temp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+    max_attempts = 3
 
-    if local_path.exists() and local_path.stat().st_size > 0:
+    if _is_valid_gzip(local_path):
         return local_path
 
-    ftp = ftplib.FTP(PUBMED_FTP_HOST, timeout=120)
-    ftp.login()
-    ftp.cwd(PUBMED_UPDATE_DIR)
-    with local_path.open("wb") as f:
-        ftp.retrbinary(f"RETR {file_name}", f.write, blocksize=1024 * 1024)
-    ftp.quit()
-    return local_path
+    if local_path.exists():
+        logger.warning("Found invalid/incomplete PubMed update file, re-downloading: %s", local_path)
+        local_path.unlink(missing_ok=True)
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        ftp = None
+        temp_path.unlink(missing_ok=True)
+        try:
+            ftp = ftplib.FTP(PUBMED_FTP_HOST, timeout=120)
+            ftp.login()
+            ftp.cwd(PUBMED_UPDATE_DIR)
+            with temp_path.open("wb") as f:
+                ftp.retrbinary(f"RETR {file_name}", f.write, blocksize=1024 * 1024)
+
+            if not _is_valid_gzip(temp_path):
+                raise RuntimeError(f"Downloaded file is not a valid gzip archive: {file_name}")
+
+            temp_path.replace(local_path)
+            return local_path
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Failed to download PubMed update file %s (attempt %d/%d): %s",
+                file_name,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            if attempt < max_attempts:
+                time.sleep(min(2 ** (attempt - 1), 5))
+        finally:
+            if ftp is not None:
+                try:
+                    ftp.quit()
+                except Exception:
+                    pass
+            temp_path.unlink(missing_ok=True)
+
+    raise RuntimeError(
+        f"Failed to download PubMed update file after {max_attempts} attempts: {file_name}"
+    ) from last_error
 
 
 def parse_pubmed_date(pub_date_elem: Optional[ET.Element]) -> Dict[str, Any]:
@@ -774,7 +824,11 @@ def ingest_pubmed_updates(
 ) -> int:
     processed = load_processed_files()
     baseline_pmids = load_baseline_pmids(CHECKPOINT_FILE)
-    logger.info("Loaded baseline PubMed checkpoint IDs=%d from %s", len(baseline_pmids), CHECKPOINT_FILE)
+    logger.info(
+        "Loaded baseline PubMed checkpoint IDs=%d from %s (used for checkpoint dedupe only)",
+        len(baseline_pmids),
+        CHECKPOINT_FILE,
+    )
 
     all_files = list_pubmed_update_files(max_files=max_files)
     new_files = [f for f in all_files if f not in processed]
@@ -816,13 +870,8 @@ def ingest_pubmed_updates(
 
         batch: List[Dict[str, Any]] = []
         file_inserted = 0
-        skipped_from_baseline = 0
         for article in parse_pubmed_update_xml(local_file, min_year=min_year):
             pmid = str(article.get("pmid") or "").strip()
-            if pmid in baseline_pmids:
-                skipped_from_baseline += 1
-                continue
-
             batch.append(article)
             if len(batch) < IngestionConfig.BATCH_SIZE:
                 continue
@@ -835,10 +884,11 @@ def ingest_pubmed_updates(
             )
             if points:
                 upsert_with_retry(client, points)
-                checkpoint_ids = [_checkpoint_id(pmid) for pmid in ingested_pmids]
+                new_checkpoint_pmids = [pmid for pmid in ingested_pmids if pmid not in baseline_pmids]
+                checkpoint_ids = [_checkpoint_id(pmid) for pmid in new_checkpoint_pmids]
                 if checkpoint_ids:
                     append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
-                    baseline_pmids.update(ingested_pmids)
+                baseline_pmids.update(ingested_pmids)
                 inserted += len(points)
                 file_inserted += len(points)
                 time.sleep(0.5)  # Throttle: allow RocksDB compaction
@@ -854,17 +904,18 @@ def ingest_pubmed_updates(
             )
             if points:
                 upsert_with_retry(client, points)
-                checkpoint_ids = [_checkpoint_id(pmid) for pmid in ingested_pmids]
+                new_checkpoint_pmids = [pmid for pmid in ingested_pmids if pmid not in baseline_pmids]
+                checkpoint_ids = [_checkpoint_id(pmid) for pmid in new_checkpoint_pmids]
                 if checkpoint_ids:
                     append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
-                    baseline_pmids.update(ingested_pmids)
+                baseline_pmids.update(ingested_pmids)
                 inserted += len(points)
                 file_inserted += len(points)
 
         processed.add(file_name)
         save_processed_files(processed)
         local_file.unlink(missing_ok=True)
-        logger.info("Completed file: %s inserted=%d skipped_baseline=%d", file_name, file_inserted, skipped_from_baseline)
+        logger.info("Completed file: %s inserted=%d", file_name, file_inserted)
 
     return inserted
 

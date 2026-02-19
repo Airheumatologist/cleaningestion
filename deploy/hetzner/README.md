@@ -40,8 +40,8 @@ QDRANT_COLLECTION=rag_pipeline
 COLLECTION_NAME=rag_pipeline
 QDRANT_CLOUD_INFERENCE=false
 
-EMBEDDING_PROVIDER=local
-EMBEDDING_MODEL=mixedbread-ai/mxbai-embed-large-v1
+EMBEDDING_PROVIDER=deepinfra
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B-batch
 EMBEDDING_BATCH_SIZE=64
 
 SPARSE_ENABLED=true
@@ -51,8 +51,8 @@ SPARSE_RETRIEVAL_MODE=bm25
 
 EMBED_FILTER_ENABLED=true
 EMBED_FILTER_MODE=conservative
-CHUNK_SIZE_TOKENS=384
-CHUNK_OVERLAP_TOKENS=64
+CHUNK_SIZE_TOKENS=2048
+CHUNK_OVERLAP_TOKENS=256
 
 DATA_DIR=/data/ingestion
 
@@ -108,11 +108,15 @@ python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
 
 ## 8) Install cron jobs
 
+`medical-rag-update.cron` already chains `backup.sh` after a successful weekly update, so do not install `qdrant-backup.cron` as a standalone cron job.
+
 ```bash
 sudo cp deploy/hetzner/cron/medical-rag-update.cron /etc/cron.d/medical-rag-update
-sudo cp deploy/hetzner/cron/qdrant-backup.cron /etc/cron.d/qdrant-backup
 sudo cp deploy/hetzner/cron/qdrant-health.cron /etc/cron.d/qdrant-health
-sudo chmod 644 /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-backup /etc/cron.d/qdrant-health
+sudo chmod 644 /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-health
+
+# Optional cleanup if an old standalone backup job was previously installed
+sudo rm -f /etc/cron.d/qdrant-backup
 ```
 
 ## 9) Firewall allowlist
@@ -155,6 +159,6 @@ sed -i "s/QDRANT_API_KEY=.*/QDRANT_API_KEY=${NEW_KEY}/" /opt/RAG-pipeline/.env
 |---|---|
 | Collection has sparse config | `curl -s -H "api-key: $QDRANT_API_KEY" localhost:6333/collections/rag_pipeline \| grep idf` |
 | Points have dense + sparse vectors | `curl -s -H "api-key: $QDRANT_API_KEY" "localhost:6333/collections/rag_pipeline/points/scroll?limit=1&with_vectors=true"` |
-| Cron installed | `ls /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-backup /etc/cron.d/qdrant-health` |
+| Cron installed | `ls /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-health` |
 | Firewall active | `ufw status` |
 | Monthly update runs | `tail -f /var/log/rag-update.log` |

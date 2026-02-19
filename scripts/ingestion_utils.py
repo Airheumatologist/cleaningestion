@@ -6,6 +6,7 @@ import gzip
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
@@ -22,6 +23,29 @@ import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+# Track hard parse failures (malformed/unreadable XML) across a run.
+_PMC_PARSE_FAILURE_COUNT = 0
+_PMC_PARSE_FAILURE_LOCK = threading.Lock()
+
+
+def reset_pmc_xml_parse_failure_count() -> None:
+    """Reset the global PMC XML parse failure counter."""
+    global _PMC_PARSE_FAILURE_COUNT
+    with _PMC_PARSE_FAILURE_LOCK:
+        _PMC_PARSE_FAILURE_COUNT = 0
+
+
+def get_pmc_xml_parse_failure_count() -> int:
+    """Return the number of PMC XML files skipped due to parse exceptions."""
+    with _PMC_PARSE_FAILURE_LOCK:
+        return _PMC_PARSE_FAILURE_COUNT
+
+
+def _increment_pmc_xml_parse_failure_count() -> None:
+    global _PMC_PARSE_FAILURE_COUNT
+    with _PMC_PARSE_FAILURE_LOCK:
+        _PMC_PARSE_FAILURE_COUNT += 1
 
 # ============================================================================
 # PMC XML Parsing - PRD v1.0 Compliant
@@ -700,9 +724,9 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
         return output
 
     except Exception as e:
-        logger.debug(f"Error parsing {xml_path}: {e}")
-        import traceback
-        logger.debug(traceback.format_exc())
+        _increment_pmc_xml_parse_failure_count()
+        logger.warning("Error parsing %s: %s", xml_path, e)
+        logger.debug("PMC XML parse traceback for %s", xml_path, exc_info=True)
         return None
 
 
@@ -1407,7 +1431,6 @@ def _extract_abstract(article_meta: ET.Element) -> str:
 # across ingestion scripts (06, 07, 21, 08_monthly_update, 12, etc.)
 # ============================================================================
 
-import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 

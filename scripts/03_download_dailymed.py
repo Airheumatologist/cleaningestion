@@ -211,11 +211,24 @@ else:
     DEFAULT_SET_ID_MANIFEST = _fallback_set_id_manifest()
 
 
+def _is_valid_zip(path: Path) -> bool:
+    """Return True when a ZIP file can be opened and indexed."""
+    if not path.exists() or path.stat().st_size <= 0:
+        return False
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            zf.namelist()
+        return True
+    except Exception:
+        return False
+
+
 def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 1024):
     """Stream-download a large file with progress logging."""
     logger.info(f"Downloading: {url}")
     logger.info(f"Destination: {dest_path}")
-    
+    temp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
+
     try:
         with requests.get(url, stream=True, timeout=300) as r:
             r.raise_for_status()
@@ -224,7 +237,7 @@ def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 102
             
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             
-            with open(dest_path, "wb") as f:
+            with open(temp_path, "wb") as f:
                 with tqdm(total=total, unit='B', unit_scale=True, desc=dest_path.name) as pbar:
                     for chunk in r.iter_content(chunk_size=chunk_size):
                         if not chunk:
@@ -232,6 +245,14 @@ def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 102
                         f.write(chunk)
                         downloaded += len(chunk)
                         pbar.update(len(chunk))
+
+        if downloaded <= 0:
+            raise RuntimeError("Downloaded file is empty")
+
+        if not _is_valid_zip(temp_path):
+            raise RuntimeError(f"Downloaded archive is invalid: {dest_path.name}")
+
+        os.replace(temp_path, dest_path)
         
         logger.info(f"✅ Downloaded: {dest_path.name} ({downloaded / (1024*1024):.1f} MB)")
         return True
@@ -239,6 +260,12 @@ def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 102
     except Exception as e:
         logger.error(f"❌ Download failed: {e}")
         return False
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
 
 
 def extract_nested_zip_xml(
@@ -417,13 +444,16 @@ def download_dailymed(
         zip_url = f"{DAILYMED_PUBLIC_RELEASE_BASE}/{zip_name}"
         local_zip = output_dir / zip_name
         
-        # Download if not exists (or refresh)
-        if not refresh and local_zip.exists() and local_zip.stat().st_size > 0:
+        # Download if not exists (or refresh). Validate any reused local ZIP first.
+        if not refresh and _is_valid_zip(local_zip):
             logger.info(f"ZIP already exists, reusing: {zip_name}")
         else:
-            if refresh and local_zip.exists():
-                logger.info(f"Refresh mode: re-downloading {zip_name}")
-                local_zip.unlink()
+            if local_zip.exists():
+                if refresh:
+                    logger.info(f"Refresh mode: re-downloading {zip_name}")
+                else:
+                    logger.warning(f"Existing ZIP is invalid/incomplete, re-downloading: {zip_name}")
+                local_zip.unlink(missing_ok=True)
             success = download_file_stream(zip_url, local_zip)
             if not success:
                 logger.warning(f"Failed to download {zip_name}, it may not exist yet...")

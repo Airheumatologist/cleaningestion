@@ -36,6 +36,12 @@ echo ""
 
 # Configuration
 DATA_DIR="${DATA_DIR:-/data/ingestion}"
+PUBMED_BASELINE_DIR="${PUBMED_BASELINE_DIR:-$DATA_DIR/pubmed_baseline}"
+DAILYMED_STATE_DIR="${DAILYMED_STATE_DIR:-$DATA_DIR/dailymed/state}"
+DAILYMED_SET_ID_MANIFEST="${DAILYMED_SET_ID_MANIFEST:-$DAILYMED_STATE_DIR/dailymed_last_update_set_ids.txt}"
+PUBMED_UPDATES_TRACKER="$DATA_DIR/processed_updates.json"
+PUBMED_UPDATEFILES_DIR="$DATA_DIR/pubmed_updatefiles"
+PUBMED_FILTER_PROGRESS_FILE="$PUBMED_BASELINE_DIR/progress.json"
 LOG_DIR="$DATA_DIR/logs"
 mkdir -p "$LOG_DIR"
 
@@ -70,8 +76,26 @@ if [ "$FRESH_MODE" = true ]; then
             rm -f "$file"
         fi
     done
+
+    STATE_FILES=(
+        "$PUBMED_UPDATES_TRACKER"
+        "$PUBMED_FILTER_PROGRESS_FILE"
+        "$DAILYMED_SET_ID_MANIFEST"
+    )
+
+    for file in "${STATE_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            echo "   Removing state: $(basename "$file")"
+            rm -f "$file"
+        fi
+    done
+
+    if [ -d "$PUBMED_UPDATEFILES_DIR" ]; then
+        echo "   Removing update cache dir: $PUBMED_UPDATEFILES_DIR"
+        rm -rf "$PUBMED_UPDATEFILES_DIR"
+    fi
     
-    echo "   ✅ Checkpoints cleared"
+    echo "   ✅ Checkpoints and incremental state cleared"
     echo ""
 fi
 

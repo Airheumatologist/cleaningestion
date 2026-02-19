@@ -36,11 +36,19 @@ echo "=========================================="
 DATA_DIR="${DATA_DIR:-/data/ingestion}"
 PUBMED_BASELINE_DIR="${PUBMED_BASELINE_DIR:-$DATA_DIR/pubmed_baseline}"
 PUBMED_DEFAULT_FILE="${PUBMED_ABSTRACTS_FILE:-$PUBMED_BASELINE_DIR/filtered/pubmed_abstracts.jsonl}"
+PMC_XML_DIR="${PMC_XML_DIR:-$DATA_DIR/pmc_xml}"
+DAILYMED_STATE_DIR="${DAILYMED_STATE_DIR:-$DATA_DIR/dailymed/state}"
+DAILYMED_SET_ID_MANIFEST="${DAILYMED_SET_ID_MANIFEST:-$DAILYMED_STATE_DIR/dailymed_last_update_set_ids.txt}"
+PMC_INCREMENTAL_STATE_FILE="$PMC_XML_DIR/.pmc_s3_inventory_state.json"
+PMC_INCREMENTAL_MARKERS_DIR="$PMC_XML_DIR/.pmc_s3_markers"
+PUBMED_UPDATES_TRACKER="$DATA_DIR/processed_updates.json"
+PUBMED_UPDATEFILES_DIR="$DATA_DIR/pubmed_updatefiles"
+PUBMED_FILTER_PROGRESS_FILE="$PUBMED_BASELINE_DIR/progress.json"
 LOG_DIR="$DATA_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-# Activate virtual environment
-source .venv/bin/activate || source venv/bin/activate
+# Activate virtual environment (deployment standard: venv; keep .venv fallback)
+source venv/bin/activate || source .venv/bin/activate
 
 echo ""
 echo "🔧 Configuration:"
@@ -93,11 +101,36 @@ if [ "$FRESH_MODE" = true ]; then
     if [ -d "$LOG_DIR" ]; then
         rm -f "$LOG_DIR"/*.pid
     fi
+
+    echo "🧹 Step 2: Clearing incremental state files..."
+    STATE_FILES=(
+        "$PUBMED_UPDATES_TRACKER"
+        "$PUBMED_FILTER_PROGRESS_FILE"
+        "$DAILYMED_SET_ID_MANIFEST"
+        "$PMC_INCREMENTAL_STATE_FILE"
+    )
+
+    for file in "${STATE_FILES[@]}"; do
+        if [ -f "$file" ]; then
+            echo "   Removing state: $(basename "$file")"
+            rm -f "$file"
+        fi
+    done
+
+    if [ -d "$PMC_INCREMENTAL_MARKERS_DIR" ]; then
+        echo "   Removing state dir: $PMC_INCREMENTAL_MARKERS_DIR"
+        rm -rf "$PMC_INCREMENTAL_MARKERS_DIR"
+    fi
+
+    if [ -d "$PUBMED_UPDATEFILES_DIR" ]; then
+        echo "   Removing update cache dir: $PUBMED_UPDATEFILES_DIR"
+        rm -rf "$PUBMED_UPDATEFILES_DIR"
+    fi
     
-    echo "   ✅ Checkpoints cleared"
+    echo "   ✅ Checkpoints and incremental state cleared"
     echo ""
     
-    echo "🗄️  Step 2: Recreating Qdrant collection..."
+    echo "🗄️  Step 3: Recreating Qdrant collection..."
     python3 scripts/05_setup_qdrant.py --recreate
     echo "   ✅ Collection recreated"
     echo ""
@@ -149,7 +182,7 @@ echo ""
 
 # Check PMC
 PMC_AVAILABLE=false
-PMC_DEFAULT_DIR="$DATA_DIR/pmc_xml"
+PMC_DEFAULT_DIR="$PMC_XML_DIR"
 if [ -d "$PMC_DEFAULT_DIR" ] && [ "$(find "$PMC_DEFAULT_DIR" -name "*.xml" -o -name "*.nxml" 2>/dev/null | wc -l)" -gt 0 ]; then
     PMC_XML_COUNT=$(find "$PMC_DEFAULT_DIR" -name "*.xml" -o -name "*.nxml" 2>/dev/null | wc -l)
     echo "   ✅ PMC: Found $PMC_XML_COUNT XML files in $PMC_DEFAULT_DIR"
@@ -200,9 +233,10 @@ echo "   2) PubMed Abstracts"
 echo "   3) DailyMed (drug labels)"
 echo "   4) All (in sequence - recommended)"
 echo "   5) All (parallel - uses more resources)"
-echo "   6) Post-ingestion: Generate drug lookup (run after DailyMed completes)"
+echo "   6) Post-ingestion: Generate drug lookup + finalize Qdrant indexing"
 echo ""
 read -p "Enter choice [1-6]: " choice
+parallel_drug_lookup_hook_scheduled=false
 
 case $choice in
     1)
@@ -308,6 +342,8 @@ case $choice in
         echo ""
         echo "📋 Generating drug lookup cache..."
         python3 scripts/generate_drug_lookup.py || echo "⚠️  Drug lookup generation failed (non-critical)"
+        echo "⚙️  Finalizing Qdrant indexing..."
+        python3 scripts/05_setup_qdrant.py --finalize
         
         echo ""
         echo "✅ All sequential ingestion complete!"
@@ -323,6 +359,8 @@ case $choice in
         fi
         
         started_any=false
+        dailymed_started=false
+        dailymed_pid=""
         
         # PMC
         if [ "$PMC_AVAILABLE" = true ]; then
@@ -351,6 +389,8 @@ case $choice in
             if [ -d "$dailymed_dir" ]; then
                 run_ingestion_bg "dailymed" "scripts/07_ingest_dailymed.py" "--xml-dir $dailymed_dir"
                 started_any=true
+                dailymed_started=true
+                dailymed_pid=$(cat "$LOG_DIR/dailymed.pid")
             fi
         fi
         
@@ -358,11 +398,37 @@ case $choice in
             echo "❌ No data sources available to start"
             exit 1
         fi
+
+        # In parallel mode, auto-run drug lookup when DailyMed ingestion completes.
+        # This prevents a missed manual option 6 step from leaving stale lookup data.
+        if [ "$dailymed_started" = true ] && [ -n "$dailymed_pid" ]; then
+            post_ingestion_log="$LOG_DIR/post_ingestion_$(date +%Y%m%d_%H%M%S).log"
+            (
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for DailyMed PID $dailymed_pid to finish..."
+                while kill -0 "$dailymed_pid" 2>/dev/null; do
+                    sleep 30
+                done
+
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] DailyMed ingestion finished; generating drug lookup cache..."
+                if python3 scripts/generate_drug_lookup.py; then
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Drug lookup cache generation complete."
+                else
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: Drug lookup cache generation failed."
+                fi
+            ) >> "$post_ingestion_log" 2>&1 &
+
+            echo $! > "$LOG_DIR/post_ingestion.pid"
+            echo ""
+            echo "📋 Post-hook scheduled: drug lookup will auto-run after DailyMed completes"
+            echo "   Hook log: $post_ingestion_log"
+            echo "   Hook PID: $(cat "$LOG_DIR/post_ingestion.pid")"
+            parallel_drug_lookup_hook_scheduled=true
+        fi
         
         echo ""
         echo "✅ Parallel ingestion started"
         echo ""
-        echo "⚠️  IMPORTANT: After DailyMed ingestion completes, run option 6 to generate drug lookup"
+        echo "⚠️  IMPORTANT: After all ingestion pipelines complete, run option 6 to finalize Qdrant indexing"
         ;;
     
     6)
@@ -371,6 +437,8 @@ case $choice in
         echo ""
         echo "Generating drug lookup cache for fast O(1) drug name → set_id lookups..."
         python3 scripts/generate_drug_lookup.py
+        echo "Re-enabling Qdrant indexing (HNSW build)..."
+        python3 scripts/05_setup_qdrant.py --finalize
         echo ""
         echo "✅ Post-ingestion tasks complete!"
         ;;
@@ -396,7 +464,17 @@ if [ "$choice" != "6" ]; then
     echo "To stop ingestion:"
     echo "   kill \$(cat $LOG_DIR/*.pid)"
     echo ""
-    echo "📋 IMPORTANT: After DailyMed ingestion completes, run:"
-    echo "   ./start_ingestion.sh  →  Select option 6) Post-ingestion: Generate drug lookup"
+    if [ "$choice" = "5" ]; then
+        if [ "$parallel_drug_lookup_hook_scheduled" = true ]; then
+            echo "📋 IMPORTANT: In parallel mode, drug lookup auto-runs after DailyMed completes."
+            echo "   After all ingestion pipelines complete, run option 6 to finalize Qdrant indexing."
+        else
+            echo "📋 IMPORTANT: DailyMed was not started in this run."
+            echo "   Run option 6 after ingestion completes to generate drug lookup and finalize indexing."
+        fi
+    else
+        echo "📋 IMPORTANT: After all ingestion pipelines complete, run:"
+        echo "   ./start_ingestion.sh  →  Select option 6) Post-ingestion tasks (drug lookup + indexing finalize)"
+    fi
     echo ""
 fi

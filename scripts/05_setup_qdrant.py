@@ -107,6 +107,38 @@ def _validate_collection_vector_schema(client: QdrantClient, collection_name: st
             )
 
 
+def finalize_collection(collection_name: str, indexing_threshold: int) -> None:
+    """Re-enable HNSW indexing after bulk ingestion."""
+    if not IngestionConfig.QDRANT_URL:
+        logger.error("QDRANT_URL is required")
+        sys.exit(1)
+
+    client = QdrantClient(
+        url=IngestionConfig.QDRANT_URL,
+        api_key=IngestionConfig.QDRANT_API_KEY or None,
+        timeout=120,
+        prefer_grpc=IngestionConfig.USE_GRPC,
+    )
+
+    existing = {c.name for c in client.get_collections().collections}
+    if collection_name not in existing:
+        raise RuntimeError(
+            f"Collection '{collection_name}' does not exist. "
+            "Create it first with scripts/05_setup_qdrant.py."
+        )
+
+    logger.info(
+        "Re-enabling indexing for collection '%s' (indexing_threshold=%d)",
+        collection_name,
+        indexing_threshold,
+    )
+    client.update_collection(
+        collection_name=collection_name,
+        optimizers_config=models.OptimizersConfigDiff(indexing_threshold=indexing_threshold),
+    )
+    logger.info("Collection indexing finalize request submitted")
+
+
 def setup_collection(collection_name: str, keep_existing: bool, shard_number: int, use_2bit: bool) -> None:
     if not IngestionConfig.QDRANT_URL:
         logger.error("QDRANT_URL is required")
@@ -169,6 +201,7 @@ def setup_collection(collection_name: str, keep_existing: bool, shard_number: in
     indexes = {
         "year": models.PayloadSchemaType.INTEGER,
         "source": models.PayloadSchemaType.KEYWORD,
+        "source_family": models.PayloadSchemaType.KEYWORD,
         "article_type": models.PayloadSchemaType.KEYWORD,
         "journal": models.PayloadSchemaType.KEYWORD,
         "evidence_grade": models.PayloadSchemaType.KEYWORD,
@@ -221,6 +254,17 @@ def main() -> None:
         help="Recreate the collection if it already exists (default behavior)",
     )
     parser.add_argument("--shards", type=int, default=4)
+    parser.add_argument(
+        "--finalize",
+        action="store_true",
+        help="Re-enable HNSW indexing after bulk ingestion",
+    )
+    parser.add_argument(
+        "--indexing-threshold",
+        type=int,
+        default=20000,
+        help="Indexing threshold used with --finalize (default: 20000)",
+    )
     parser.add_argument("--no-2bit", action="store_true", help="Skip 2-bit patch and keep standard binary")
     parser.add_argument(
         "--quantization",
@@ -234,6 +278,13 @@ def main() -> None:
     if args.quantization != IngestionConfig.QUANTIZATION_TYPE:
         logger.info(f"Overriding quantization type: {IngestionConfig.QUANTIZATION_TYPE} -> {args.quantization}")
         IngestionConfig.QUANTIZATION_TYPE = args.quantization
+
+    if args.finalize:
+        finalize_collection(
+            collection_name=args.collection_name,
+            indexing_threshold=args.indexing_threshold,
+        )
+        return
 
     setup_collection(
         collection_name=args.collection_name,
