@@ -194,7 +194,7 @@ def create_payload(article: Dict[str, Any], source_type: str) -> Dict[str, Any]:
     
     pmcid = str(identifiers.get("pmcid") or article.get("pmcid") or "")
     pmid = str(identifiers.get("pmid") or article.get("pmid") or "")
-    doi = identifiers.get("doi") or article.get("doi", "")
+    doi = str(identifiers.get("doi") or article.get("doi") or "")
     title = content.get("title", "") if content else article.get("title", "")
     journal_info = publication.get("journal", {}) if publication else {}
     journal = journal_info.get("title", "") if journal_info else article.get("journal", "")
@@ -298,7 +298,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
         "year": year,
         "pmcid": identifiers.get("pmcid") if identifiers else article.get("pmcid"),
         "pmid": pmid,
-        "doi": identifiers.get("doi") or article.get("doi", ""),
+        "doi": article_payload.get("doi", ""),
         "country": country,
         "keywords": keywords,
         "mesh_terms": mesh_terms,

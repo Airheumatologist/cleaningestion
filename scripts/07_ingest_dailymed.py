@@ -24,6 +24,7 @@ try:
 
     sys.path.insert(0, str(Path(__file__).parent))         # Add scripts/ to path
     sys.path.insert(0, str(Path(__file__).parent.parent))  # Add root to path for src
+    from dailymed_rx_filters import extract_document_label_type, is_human_prescription_label
     from config_ingestion import IngestionConfig, ensure_data_dirs
     from ingestion_utils import (
         EmbeddingProvider,
@@ -191,7 +192,7 @@ def parse_table_to_markdown(table_elem: ET.Element) -> str:
     return "\n".join(md_lines)
 
 
-def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
+def _parse_spl_xml_with_status(xml_path: Path) -> Tuple[Optional[Dict[str, Any]], str]:
     """Parse DailyMed SPL XML file with STRICT section filtering.
     
     Only includes whitelisted high-value clinical sections:
@@ -207,6 +208,10 @@ def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
     try:
         tree = ET.parse(str(xml_path))
         root = tree.getroot()
+
+        label_type_code, label_type_display = extract_document_label_type(root, namespaces=NS)
+        if not is_human_prescription_label(label_type_code, label_type_display):
+            return None, "non_rx"
 
         set_id_elem = root.xpath(".//hl7:setId", namespaces=NS)
         set_id = set_id_elem[0].get("root", "") if set_id_elem else ""
@@ -351,14 +356,22 @@ def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
             "title": title,
             "active_ingredients": active_ingredients,
             "manufacturer": manufacturer,
+            "label_type_code": label_type_code,
+            "label_type_display": label_type_display,
             "sections": sections,
             "source": "dailymed",
             "source_family": "dailymed",
             "article_type": "drug_label",
-        }
+        }, "ok"
     except Exception as e:
         logger.warning("Failed to parse %s: %s", xml_path, e)
-        return None
+        return None, "parse_error"
+
+
+def parse_spl_xml(xml_path: Path) -> Optional[Dict[str, Any]]:
+    """Compatibility wrapper for callers that expect only parsed data."""
+    drug, _status = _parse_spl_xml_with_status(xml_path)
+    return drug
 
 
 def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -> List[Dict[str, Any]]:
@@ -372,14 +385,50 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
     raw_chunks = []  # Collect chunks before validation
     set_id = drug.get("set_id", "")
     drug_name = drug.get("drug_name", "")
+    label_title = drug.get("title", "") or drug_name
     manufacturer = drug.get("manufacturer", "")
     active_ingredients = drug.get("active_ingredients", [])
     sections = drug.get("sections", {})
+    publication_type = ["Drug Label"]
     
     # Helper to generate section_id
     def generate_section_id(doc_id: str, section_title: str) -> str:
         content = f"{doc_id}:{section_title.lower().strip()}"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    base_metadata = {
+        "doc_id": set_id,
+        "set_id": set_id,
+        "pmcid": "",
+        "pmid": "",
+        "doi": "",
+        "pii": None,
+        "other_ids": {},
+        "title": label_title,
+        "abstract": "",
+        "full_text": "",
+        "journal": "DailyMed",
+        "nlm_unique_id": None,
+        "year": None,
+        "country": "",
+        "keywords": [],
+        "mesh_terms": [],
+        "publication_type": publication_type,
+        "evidence_grade": "",
+        "evidence_level": None,
+        "evidence_term": None,
+        "evidence_source": None,
+        "source": "dailymed",
+        "source_family": "dailymed",
+        "content_type": "drug_label",
+        "article_type": "drug_label",
+        "label_type_code": drug.get("label_type_code", ""),
+        "label_type_display": drug.get("label_type_display", ""),
+        "has_full_text": True,
+        "is_open_access": None,
+        "is_author_manuscript": False,
+        "nihms_id": None,
+    }
     
     # Process ONLY whitelisted sections
     for section_key, section_data in sections.items():
@@ -405,28 +454,37 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
         for j, chunk_data in enumerate(section_chunks):
             chunk_id = f"{set_id}_{section_key}_part{j}" if len(section_chunks) > 1 else f"{set_id}_{section_key}"
             chunk_text = chunk_data["text"]
-            
+            chunk_section_id = (
+                generate_section_id(set_id, f"{section_title} Part {j}")
+                if len(section_chunks) > 1
+                else section_id
+            )
             chunks.append({
+                **base_metadata,
                 "chunk_id": chunk_id,
-                "set_id": set_id,
                 "drug_name": drug_name,
+                "table_type": "",
+                "is_table": False,
                 "section_type": section_key,
                 "section_title": section_title,
                 "text": chunk_text,
                 "has_tables": section_data.get("has_tables", False),
+                "table_caption": "",
+                "table_id": "",
                 "manufacturer": manufacturer,
                 "active_ingredients": active_ingredients,
-                "source": "dailymed",
-                "source_family": "dailymed",
-                "article_type": "drug_label",
+                "table_count": len(section_data.get("tables", [])),
                 # Chunking metadata for consistency
                 "chunk_index": j,
                 "total_chunks": len(section_chunks),
+                "token_count": chunk_data.get("token_count", 0),
                 # Parent-child ready fields
                 "full_section_text": full_section_text,
-                "section_id": section_id,
+                "section_id": chunk_section_id,
+                "parent_section_id": section_id if len(section_chunks) > 1 else None,
                 "section_weight": section_weight,
                 "page_content": chunk_text,
+                "text_preview": chunk_text[:500],
             })
         
         # Table chunks (only for whitelisted sections - already filtered in parse)
@@ -440,28 +498,37 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
             for j, chunk_data in enumerate(table_chunks):
                 chunk_id = f"{set_id}_{section_key}_table_{table['index']}_part{j}" if len(table_chunks) > 1 else f"{set_id}_{section_key}_table_{table['index']}"
                 chunk_text = chunk_data["text"]
-                
+                chunk_section_id = (
+                    generate_section_id(set_id, f"{section_title} Table {table['index']} Part {j}")
+                    if len(table_chunks) > 1
+                    else table_section_id
+                )
                 raw_chunks.append({
+                    **base_metadata,
                     "chunk_id": chunk_id,
-                    "set_id": set_id,
                     "drug_name": drug_name,
+                    "is_table": True,
                     "section_type": "table",
                     "section_title": f"{section_title} Table",
                     "table_type": section_key,
+                    "table_caption": f"{section_title} Table",
+                    "table_id": f"{section_key}_table_{table['index']}",
                     "text": chunk_text,
+                    "has_tables": True,
                     "manufacturer": manufacturer,
                     "active_ingredients": active_ingredients,
-                    "source": "dailymed",
-                    "source_family": "dailymed",
-                    "article_type": "drug_label",
+                    "table_count": 1,
                     # Chunking metadata for consistency
                     "chunk_index": j,
                     "total_chunks": len(table_chunks),
+                    "token_count": chunk_data.get("token_count", 0),
                     # Parent-child ready fields
                     "full_section_text": table_full_text,
-                    "section_id": table_section_id,
+                    "section_id": chunk_section_id,
+                    "parent_section_id": table_section_id if len(table_chunks) > 1 else None,
                     "section_weight": 0.75,  # Tables get slightly higher weight
                     "page_content": chunk_text,
+                    "text_preview": chunk_text[:500],
                 })
     
     # Combine all chunks
@@ -566,31 +633,73 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
             if sparse_encoder and i < len(sparse_vectors) and sparse_vectors[i]:
                 vector["sparse"] = sparse_vectors[i]
             
-            # Build explicit payload with only fields needed for retriever/reranker
+            # Build canonical payload aligned with PMC/PubMed schemas
             payload = {
                 # Core identifiers (doc_id mapped from set_id for index consistency)
-                "doc_id": chunk.get("set_id", ""),
+                "doc_id": chunk.get("doc_id", chunk.get("set_id", "")),
                 "chunk_id": chunk["chunk_id"],
                 "set_id": chunk.get("set_id", ""),
+                "pmcid": chunk.get("pmcid", ""),
+                "pmid": chunk.get("pmid", ""),
+                "doi": chunk.get("doi", ""),
+                "pii": chunk.get("pii"),
+                "other_ids": chunk.get("other_ids", {}),
+                
+                # Content
+                "page_content": chunk.get("page_content", chunk["text"]),
+                "text_preview": chunk.get("text_preview", chunk.get("page_content", chunk["text"])[:500]),
+                "title": chunk.get("title", chunk.get("drug_name", "")),
+                "abstract": chunk.get("abstract", ""),
+                "full_text": chunk.get("full_text", ""),
+                
+                # Section metadata
+                "is_table": chunk.get("is_table", False),
+                "section_type": chunk.get("section_type", ""),
+                "section_title": chunk.get("section_title", ""),
+                "table_type": chunk.get("table_type", ""),
+                "table_caption": chunk.get("table_caption", ""),
+                "table_id": chunk.get("table_id", ""),
+                "section_weight": chunk.get("section_weight", 1.0),
+                "has_tables": chunk.get("has_tables", False),
+                "full_section_text": chunk.get("full_section_text", chunk.get("page_content", chunk["text"])),
+                "section_id": chunk.get("section_id", ""),
+                "parent_section_id": chunk.get("parent_section_id"),
                 
                 # Drug label metadata
                 "drug_name": chunk.get("drug_name", ""),
                 "manufacturer": chunk.get("manufacturer", ""),
                 "active_ingredients": chunk.get("active_ingredients", []),
-                
-                # Section metadata
-                "section_type": chunk.get("section_type", ""),
-                "section_title": chunk.get("section_title", ""),
-                "section_weight": chunk.get("section_weight", 1.0),
-                "has_tables": chunk.get("has_tables", False),
-                
-                # Content (for retriever)
-                "page_content": chunk.get("page_content", chunk["text"]),
+                "label_type_code": chunk.get("label_type_code", ""),
+                "label_type_display": chunk.get("label_type_display", ""),
+
+                # Publication metadata
+                "journal": chunk.get("journal", "DailyMed"),
+                "nlm_unique_id": chunk.get("nlm_unique_id"),
+                "year": chunk.get("year"),
+                "country": chunk.get("country", ""),
+                "keywords": chunk.get("keywords", []),
+                "mesh_terms": chunk.get("mesh_terms", []),
+                "article_type": chunk.get("article_type", "drug_label"),
+                "publication_type": chunk.get("publication_type", ["Drug Label"]),
+                "evidence_grade": chunk.get("evidence_grade", ""),
+                "evidence_level": chunk.get("evidence_level"),
+                "evidence_term": chunk.get("evidence_term"),
+                "evidence_source": chunk.get("evidence_source"),
+
+                # Chunk metadata
+                "chunk_index": chunk.get("chunk_index", 0),
+                "total_chunks": chunk.get("total_chunks", 1),
+                "token_count": chunk.get("token_count", 0),
                 
                 # Source info
                 "source": chunk.get("source", "dailymed"),
                 "source_family": chunk.get("source_family", "dailymed"),
-                "article_type": chunk.get("article_type", "drug_label"),
+                "content_type": chunk.get("content_type", "drug_label"),
+                "has_full_text": chunk.get("has_full_text", True),
+                "table_count": chunk.get("table_count", 0),
+                "is_open_access": chunk.get("is_open_access"),
+                "is_author_manuscript": bool(chunk.get("is_author_manuscript", False)),
+                "nihms_id": chunk.get("nihms_id"),
                 
                 # Ingestion metadata
                 "ingestion_timestamp": time.time(),
@@ -647,6 +756,8 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
     skipped = 0
+    non_rx_skipped = 0
+    parse_error_skipped = 0
     
     drugs = []
     new_ids = []
@@ -662,8 +773,13 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
                 skipped += 1
                 continue
 
-            drug = parse_spl_xml(xml_file)
+            drug, parse_status = _parse_spl_xml_with_status(xml_file)
             if not drug:
+                skipped += 1
+                if parse_status == "non_rx":
+                    non_rx_skipped += 1
+                elif parse_status == "parse_error":
+                    parse_error_skipped += 1
                 continue
             
             set_id = drug.get("set_id")
@@ -682,6 +798,11 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
             
         except Exception as e:
             logger.warning("Failed to parse %s: %s", xml_file, e)
+
+    if non_rx_skipped:
+        logger.info("Skipped %d non-RX DailyMed labels in batch", non_rx_skipped)
+    if parse_error_skipped:
+        logger.debug("Skipped %d DailyMed labels due to parse errors in batch", parse_error_skipped)
 
     if not drugs:
         return 0, len(batch_files)

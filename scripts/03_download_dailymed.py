@@ -34,6 +34,10 @@ import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Set
+from dailymed_rx_filters import (
+    INCREMENTAL_ALLOWED_NESTED_ROOTS,
+    select_nested_zip_members,
+)
 
 # Setup logging BEFORE any imports that might fail
 logging.basicConfig(
@@ -237,7 +241,12 @@ def download_file_stream(url: str, dest_path: Path, chunk_size: int = 1024 * 102
         return False
 
 
-def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = False) -> tuple[int, Set[str]]:
+def extract_nested_zip_xml(
+    zip_path: Path,
+    output_dir: Path,
+    refresh: bool = False,
+    allowed_nested_roots: Optional[Set[str]] = None,
+) -> tuple[int, Set[str]]:
     """
     Extract XML files from a DailyMed ZIP.
     
@@ -245,6 +254,12 @@ def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = Fal
     - outer.zip → contains many inner.zip files
     - inner.zip → contains the actual XML file
     
+    Args:
+        zip_path: Outer DailyMed ZIP file path.
+        output_dir: Destination directory for extracted XML files.
+        refresh: Whether to overwrite existing XMLs.
+        allowed_nested_roots: Optional top-level member roots to include for nested ZIPs.
+
     Returns:
         Tuple of (number of XML files extracted, set_ids extracted)
     """
@@ -276,8 +291,29 @@ def extract_nested_zip_xml(zip_path: Path, output_dir: Path, refresh: bool = Fal
             # Nested ZIPs (standard DailyMed format)
             nested_zips = [m for m in zf.namelist() if m.lower().endswith(".zip")]
             logger.info(f"  Found {len(nested_zips)} nested ZIP files")
+
+            selected_nested_zips, root_counts, used_fallback = select_nested_zip_members(
+                nested_zips,
+                allowed_roots=allowed_nested_roots,
+            )
+            if allowed_nested_roots:
+                roots_str = ", ".join(f"{root}={count}" for root, count in sorted(root_counts.items()))
+                logger.info(f"  Nested ZIP roots: {roots_str}")
+                if used_fallback:
+                    allowlist = ", ".join(sorted(r.lower() for r in allowed_nested_roots))
+                    logger.warning(
+                        "  No nested ZIPs matched allowed roots [%s]; falling back to all nested ZIPs",
+                        allowlist,
+                    )
+                else:
+                    excluded = len(nested_zips) - len(selected_nested_zips)
+                    logger.info(
+                        "  Applied nested ZIP root filter: selected=%d excluded=%d",
+                        len(selected_nested_zips),
+                        excluded,
+                    )
             
-            for nested_zip_name in tqdm(nested_zips, desc=f"Processing {zip_path.name}"):
+            for nested_zip_name in tqdm(selected_nested_zips, desc=f"Processing {zip_path.name}"):
                 try:
                     with zf.open(nested_zip_name) as nested_zip_data:
                         # Read nested ZIP into memory
@@ -397,7 +433,13 @@ def download_dailymed(
         # Extract XML files
         # For incremental updates, always overwrite existing XMLs to get latest versions
         extract_refresh = True if update_type else refresh
-        extracted, extracted_ids = extract_nested_zip_xml(local_zip, output_dir, refresh=extract_refresh)
+        allowed_nested_roots = INCREMENTAL_ALLOWED_NESTED_ROOTS if update_type in ("daily", "weekly", "monthly") else None
+        extracted, extracted_ids = extract_nested_zip_xml(
+            local_zip,
+            output_dir,
+            refresh=extract_refresh,
+            allowed_nested_roots=allowed_nested_roots,
+        )
         total_extracted += extracted
         updated_set_ids.update(extracted_ids)
         

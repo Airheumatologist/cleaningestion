@@ -28,6 +28,8 @@ Usage:
     python 21_ingest_pubmed_abstracts.py --input /data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 """
 
+from __future__ import annotations
+
 import argparse
 import importlib.util
 import json
@@ -272,6 +274,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
             # Parent-child fields
             "full_section_text": full_text,
             "section_id": base_section_id,
+            "parent_section_id": None,
             "section_weight": 1.0,
             "section_type": "abstract",
             "section_title": "Abstract",
