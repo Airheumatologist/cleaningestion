@@ -21,174 +21,287 @@ from anyascii import anyascii
 
 PRIORITY_JOURNALS_NLM = {
     # General/Multi-specialty High-Impact
-    '7501160',    # JAMA - Journal of the American Medical Association
-    '0255562',    # New England Journal of Medicine
-    '2985213R',   # The Lancet
-    '8900488',    # BMJ - British Medical Journal
-    '101589534',  # JAMA Internal Medicine (verified)
-    '0372351',    # Annals of Internal Medicine
-    '101231360',  # PLOS Medicine (verified)
-    '9502015',    # Nature Medicine
-    '101729235',  # JAMA Network Open (verified)
-    '101613665',  # The Lancet Global Health (verified)
-    '0267200',    # The American Journal of Medicine (verified)
-    '0405543',    # Mayo Clinic Proceedings (verified)
+    '7501160',  # JAMA
+    '0255562',  # New England Journal of Medicine
+    '2985213',  # The Lancet (fixed: removed erroneous 'R')
+    '8900488',  # BMJ
+    '101589534',  # JAMA Internal Medicine
+    '0372351',  # Annals of Internal Medicine
+    '101231360',  # PLOS Medicine
+    '9502015',  # Nature Medicine
+    '101729235',  # JAMA Network Open
+    '101613665',  # The Lancet Global Health
+    '0267200',  # The American Journal of Medicine
+    '0405543',  # Mayo Clinic Proceedings
+    '8904841',  # Journal of Internal Medicine
+    '9711805',  # CMAJ
+    '101190723',  # BMC Medicine
+    '8605834',  # Journal of General Internal Medicine
+    '100959882',  # Journal of Medical Internet Research (JMIR)
+    '7802877',  # The Journal of Clinical Investigation
+    '8303128',  # Health Affairs
+    '101769500',  # JAMA Health Forum
+    '101672103',  # Nature Reviews. Disease Primers
+    '100909747',  # Cochrane Database of Systematic Reviews
+    '101505086',  # Science Translational Medicine
+    '101751302',  # The Lancet Digital Health
+    '101731738',  # npj Digital Medicine
+
+    # Family Medicine / Primary Care
+    '101167762',  # Annals of Family Medicine
+    '1272646',  # American Family Physician
+    '101256526',  # Journal of the American Board of Family Medicine
+    '9005323',  # British Journal of General Practice
+
+    # Public Health / Epidemiology
+    '1254074',  # American Journal of Public Health
+    '8704773',  # American Journal of Preventive Medicine
+    '101699003',  # The Lancet Public Health
+    '7910653',  # American Journal of Epidemiology
+    '7802429',  # MMWR. Morbidity and Mortality Weekly Report
+    '0330411',  # Environmental Health Perspectives
+
+    # Geriatrics
+    '7503062',  # Journal of the American Geriatrics Society
+
+    # Palliative Care
+    '9808462',  # Journal of Palliative Medicine
+    '9008229',  # American Journal of Hospice and Palliative Care
+
+    # Medical Education
+    '8904605',  # Academic Medicine
+    '7909593',  # Medical Teacher
+
+    # Hospital Medicine
+    '101271025',  # Journal of Hospital Medicine
 
     # Cardiology
-    '0147763',    # Circulation
-    '8301365',    # Journal of the American College of Cardiology (JACC)
-    '8006263',    # European Heart Journal
-    '101598241',  # JACC: Heart Failure (verified)
-    '0047103',    # Circulation Research (added - AHA basic science, verified)
-    '101676033',  # JAMA Cardiology (verified)
-    '101580524',  # Journal of the American Heart Association (JAHA, verified)
-    '101200317',  # Heart Rhythm (corrected ID - Heart Rhythm Society)
-    
+    '0147763',  # Circulation
+    '8301365',  # Journal of the American College of Cardiology (JACC)
+    '8006263',  # European Heart Journal
+    '101598241',  # JACC: Heart Failure
+    '0047103',  # Circulation Research
+    '101676033',  # JAMA Cardiology
+    '101580524',  # Journal of the American Heart Association (JAHA)
+    '101200317',  # Heart Rhythm
+    '101500075',  # Nature Reviews Cardiology
+    '0207277',  # American Journal of Cardiology
+    '101467004',  # JACC: Cardiovascular Interventions
+
     # Emergency Medicine
-    '8007457',    # Emergency Medicine Clinics of North America
-    '101244046',  # Emergency Medicine International
-    '8002646',    # Annals of Emergency Medicine
-    '9205910',    # Academic Emergency Medicine
-    
+    '8007457',  # Emergency Medicine Clinics of North America
+    '101244046',  # Emergency Medicine International  # Note: lower impact but listed
+    '8002646',  # Annals of Emergency Medicine
+    '9205910',  # Academic Emergency Medicine
+
     # Rheumatology
     '101623795',  # Arthritis & Rheumatology
-    '0372355',    # Annals of the Rheumatic Diseases
+    '0372355',  # Annals of the Rheumatic Diseases
     '101132864',  # Arthritis Research & Therapy
-    '7605992',    # The Journal of Rheumatology
+    '7605992',  # The Journal of Rheumatology
     '101215956',  # Clinical Rheumatology
     '100897526',  # Rheumatology (Oxford)
-    # Note: Reumatismo and Modern Rheumatology do not have NLM IDs
+    '101500080',  # Nature Reviews. Rheumatology
 
     # Pulmonology/Respiratory
     '101088569',  # Respiratory Research
-    '9421642',    # American Journal of Respiratory and Critical Care Medicine
-    '8803460',    # European Respiratory Journal
-    '15035010',   # Chest
-    '0413533',    # Thorax
-    '101605555',  # The Lancet Respiratory Medicine (verified)
+    '9421642',  # American Journal of Respiratory and Critical Care Medicine
+    '8803460',  # European Respiratory Journal
+    '15035010',  # Chest
+    '0413533',  # Thorax
+    '101605555',  # The Lancet Respiratory Medicine
 
     # Nephrology
-    '9013836',    # Journal of the American Society of Nephrology
-    '0077425',    # Kidney International
-    '8612470',    # American Journal of Kidney Diseases
-    '101271570',  # Clinical Journal of the American Society of Nephrology (verified)
-    
+    '9013836',  # Journal of the American Society of Nephrology
+    '0077425',  # Kidney International
+    '8612470',  # American Journal of Kidney Diseases
+    '101271570',  # Clinical Journal of the American Society of Nephrology
+    '8706402',  # Nephrology Dialysis Transplantation
+    '101500081',  # Nature Reviews. Nephrology
+
     # Hematology
-    '7603509',    # Blood
-    '0372542',    # British Journal of Haematology
-    '0406014',    # Haematologica
+    '7603509',  # Blood
+    '0372542',  # British Journal of Haematology
+    '0406014',  # Haematologica
     '101690679',  # Blood Advances
-    
+    '101643584',  # The Lancet Haematology
+
     # Neurology
-    '0401060',    # Neurology (CORRECTED - American Academy of Neurology)
+    '0401060',  # Neurology
     '101589536',  # JAMA Neurology
-    '7707447',    # Annals of Neurology
-    '101139309',  # The Lancet Neurology (verified)
-    '0235266',    # Stroke (added - AHA, verified)
-    # Note: 9509333 was Continuum (education journal), not the primary Neurology journal
+    '7707447',  # Annals of Neurology
+    '101139309',  # The Lancet Neurology
+    '0235266',  # Stroke
+    '2985191',  # Journal of Neurology, Neurosurgery & Psychiatry (fixed: removed 'R')
+    '0372537',  # Brain
+    '101500072',  # Nature Reviews. Neurology
+    '8610688',  # Movement Disorders
+
+    # Neurosurgery
+    '0253357',  # Journal of Neurosurgery
+    '7802914',  # Neurosurgery
 
     # Gastroenterology
-    '0374630',    # Gastroenterology
-    '2985108R',   # Gut
+    '0374630',  # Gastroenterology
+    '2985108',  # Gut (fixed: removed 'R')
     '101241154',  # Clinical Gastroenterology and Hepatology
-    '8912027',    # Alimentary Pharmacology & Therapeutics
-    '8302946',    # Hepatology (added - AASLD, verified)
-    '8503886',    # Journal of Hepatology (added - EASL, verified)
-    '0421030',    # American Journal of Gastroenterology (added - ACG, verified)
+    '8912027',  # Alimentary Pharmacology & Therapeutics
+    '8302946',  # Hepatology
+    '8503886',  # Journal of Hepatology
+    '0421030',  # American Journal of Gastroenterology
+    '101690683',  # The Lancet Gastroenterology & Hepatology
+    '101500079',  # Nature Reviews. Gastroenterology & Hepatology
 
     # Endocrinology
-    '7805975',    # Diabetes Care
-    '0375362',    # The Journal of Clinical Endocrinology & Metabolism
-    '0370670',    # Diabetologia
-    
+    '7805975',  # Diabetes Care
+    '0375362',  # The Journal of Clinical Endocrinology & Metabolism
+    '0370670',  # Diabetologia
+    '0372763',  # Diabetes
+    '101618821',  # The Lancet Diabetes & Endocrinology
+    '101500078',  # Nature Reviews. Endocrinology
+
     # Infectious Disease
-    '9203213',    # Clinical Infectious Diseases
-    '7708673',    # The Journal of Infectious Diseases
-    '8407191',    # Antimicrobial Agents and Chemotherapy
-    '101130150',  # The Lancet Infectious Diseases (verified)
+    '9203213',  # Clinical Infectious Diseases
+    '7708673',  # The Journal of Infectious Diseases
+    '8407191',  # Antimicrobial Agents and Chemotherapy
+    '101130150',  # The Lancet Infectious Diseases
+    '9508155',  # Emerging Infectious Diseases
 
     # Oncology
-    '8309333',    # Journal of Clinical Oncology
-    '0374236',    # Cancer
+    '8309333',  # Journal of Clinical Oncology
+    '0374236',  # Cancer
     '101652861',  # JAMA Oncology
-    '100957246',  # The Lancet Oncology (verified)
-    
+    '100957246',  # The Lancet Oncology
+    '0370647',  # CA: A Cancer Journal for Clinicians
+    '9007735',  # Annals of Oncology
+    '7503089',  # Journal of the National Cancer Institute (JNCI)
+    '101124168',  # Nature Reviews. Cancer
+    '0370635',  # British Journal of Cancer
+
     # Critical Care
-    '0355501',    # Critical Care Medicine
-    '7704851',    # Intensive Care Medicine
-    '9801906',    # Critical Care
-    
+    '0355501',  # Critical Care Medicine
+    '7704851',  # Intensive Care Medicine
+    '9801906',  # Critical Care
+
     # Dermatology
-    '7708717',    # Journal of the American Academy of Dermatology
+    '7708717',  # Journal of the American Academy of Dermatology
     '101589530',  # JAMA Dermatology
-    '0004041',    # British Journal of Dermatology
-    '0375417',    # Journal of Investigative Dermatology
-    '0241006',    # Dermatologic Surgery
-    
+    '0004041',  # British Journal of Dermatology
+    '0375417',  # Journal of Investigative Dermatology
+    '0241006',  # Dermatologic Surgery
+
     # Ophthalmology
-    '7708242',    # Ophthalmology
+    '7708242',  # Ophthalmology
     '101589539',  # JAMA Ophthalmology
-    '0370507',    # American Journal of Ophthalmology
-    '0370657',    # British Journal of Ophthalmology
-    '8309910',    # Retina
-    
+    '0370507',  # American Journal of Ophthalmology
+    '0370657',  # British Journal of Ophthalmology
+    '8309910',  # Retina
+
     # Otolaryngology (ENT)
-    '0376432',    # Laryngoscope
-    '7807629',    # Otolaryngology-Head and Neck Surgery
+    '0376432',  # Laryngoscope
+    '7807629',  # Otolaryngology-Head and Neck Surgery
     '101589542',  # JAMA Otolaryngology-Head & Neck Surgery
     '101558145',  # International Forum of Allergy & Rhinology
-    
+
     # Orthopedics
-    '0375355',    # Journal of Bone and Joint Surgery
-    '0240663',    # Clinical Orthopaedics and Related Research
-    '8309867',    # Journal of Orthopaedic Research
-    
+    '0375355',  # Journal of Bone and Joint Surgery
+    '0240663',  # Clinical Orthopaedics and Related Research
+    '8309867',  # Journal of Orthopaedic Research
+    '0432520',  # British Journal of Sports Medicine
+    '7609541',  # The American Journal of Sports Medicine
+    '101599229',  # The Bone & Joint Journal
+
     # Psychiatry
-    '0370522',    # American Journal of Psychiatry
-    '7806866',    # Journal of Clinical Psychiatry
-    
+    '0370522',  # American Journal of Psychiatry
+    '7806866',  # Journal of Clinical Psychiatry
+    '101589550',  # JAMA Psychiatry
+    '101638123',  # The Lancet Psychiatry
+    '101189643',  # World Psychiatry
+    '0342367',  # British Journal of Psychiatry
+    '0213264',  # Biological Psychiatry
+
     # Radiology
-    '0401260',    # Radiology
-    '7708173',    # American Journal of Roentgenology
+    '0401260',  # Radiology
+    '7708173',  # American Journal of Roentgenology
     '100883023',  # European Radiology
-    '9502789',    # Journal of Vascular and Interventional Radiology
-    
+    '9502789',  # Journal of Vascular and Interventional Radiology
+    '8302501',  # Radiographics
+
     # Pathology
-    '7707903',    # American Journal of Surgical Pathology
+    '7707903',  # American Journal of Surgical Pathology
     '101468356',  # Modern Pathology
-    
+
     # Anesthesiology
-    '0063126',    # Anesthesiology
-    '0148047',    # Anesthesia & Analgesia
-    '0372541',    # British Journal of Anaesthesia
-    
+    '0063126',  # Anesthesiology
+    '0148047',  # Anesthesia & Analgesia
+    '0372541',  # British Journal of Anaesthesia
+
     # General Surgery
-    '0372654',    # Annals of Surgery
-    '0372552',    # British Journal of Surgery
-    '101589553',  # JAMA Surgery (verified)
+    '0372654',  # Annals of Surgery
+    '0372552',  # British Journal of Surgery
+    '101589553',  # JAMA Surgery
+    '8407742',  # Journal of Vascular Surgery
+    '9431305',  # Journal of the American College of Surgeons (JACS)
 
     # Allergy & Immunology
-    '1275002',    # The Journal of Allergy and Clinical Immunology (verified)
-    
+    '1275002',  # The Journal of Allergy and Clinical Immunology
+
     # Pediatrics
-    '0376422',    # Pediatrics
-    '0375416',    # Journal of Pediatrics
-    
+    '0376422',  # Pediatrics
+    '0375416',  # Journal of Pediatrics
+    '101589544',  # JAMA Pediatrics
+    '101712925',  # The Lancet Child & Adolescent Health
+    '9102136',  # Journal of Adolescent Health
+    '0372434',  # Archives of Disease in Childhood
+
     # Obstetrics & Gynecology
-    '0372343',    # Obstetrics & Gynecology
-    '0370476',    # American Journal of Obstetrics & Gynecology
-    
+    '0372343',  # Obstetrics & Gynecology
+    '0370476',  # American Journal of Obstetrics & Gynecology
+    '8701199',  # Human Reproduction
+    '9108340',  # Ultrasound in Obstetrics & Gynecology
+    '100935741',  # BJOG
+    '0372772',  # Fertility and Sterility
+
     # Urology
-    '0376372',    # Journal of Urology
-    
+    '0376372',  # Journal of Urology
+    '7512719',  # European Urology
+    '100886721',  # BJU International
+
     # Plastic Surgery
-    '0370656',    # Plastic and Reconstructive Surgery
-    
+    '0370656',  # Plastic and Reconstructive Surgery
+
     # Radiation Oncology
-    '7706812',    # International Journal of Radiation Oncology
-    
+    '7706812',  # International Journal of Radiation Oncology
+
     # Nuclear Medicine
-    '7611109',    # Journal of Nuclear Medicine
+    '7611109',  # Journal of Nuclear Medicine
+
+    # Medical Genetics / Genomics
+    '0370475',  # The American Journal of Human Genetics
+    '9815831',  # Genetics in Medicine
+    '101500077',  # Nature Reviews. Genetics
+
+    # Clinical Pharmacology
+    '0372741',  # Clinical Pharmacology & Therapeutics
+
+    # Transplantation Medicine
+    '100968638',  # American Journal of Transplantation
+
+    # Physical Medicine & Rehabilitation
+    '2985158',  # Archives of Physical Medicine and Rehabilitation (fixed: removed 'R')
+
+    # Pain Medicine
+    '7504682',  # Pain
+
+    # Sleep Medicine
+    '7809084',  # Sleep
+
+    # Quality Improvement, Patient Safety & Implementation Science
+    '101258411',  # Implementation Science
+    '101085951',  # BMJ Quality & Safety
+
+    # Occupational & Environmental Medicine
+    '9800481',  # Occupational and Environmental Medicine
 }
 
 # =============================================================================
@@ -209,14 +322,46 @@ JAMA Network Open
 The Lancet Global Health
 The American Journal of Medicine
 Mayo Clinic Proceedings
+Journal of Internal Medicine
+CMAJ
+BMC Medicine
+Journal of General Internal Medicine
+Journal of Medical Internet Research (JMIR)
+The Journal of Clinical Investigation
+Health Affairs
+JAMA Health Forum
+Nature Reviews. Disease Primers
+Cochrane Database of Systematic Reviews
+Science Translational Medicine
+The Lancet Digital Health
+npj Digital Medicine
+Annals of Family Medicine
+American Family Physician
+Journal of the American Board of Family Medicine
+British Journal of General Practice
+American Journal of Public Health
+American Journal of Preventive Medicine
+The Lancet Public Health
+American Journal of Epidemiology
+MMWR. Morbidity and Mortality Weekly Report
+Environmental Health Perspectives
+Journal of the American Geriatrics Society
+Journal of Palliative Medicine
+American Journal of Hospice and Palliative Care
+Academic Medicine
+Medical Teacher
+Journal of Hospital Medicine
 Circulation
-Journal of the American College of Cardiology
+Journal of the American College of Cardiology (JACC)
 European Heart Journal
 JACC: Heart Failure
 Circulation Research
 JAMA Cardiology
-Journal of the American Heart Association
+Journal of the American Heart Association (JAHA)
 Heart Rhythm
+Nature Reviews Cardiology
+American Journal of Cardiology
+JACC: Cardiovascular Interventions
 Emergency Medicine Clinics of North America
 Emergency Medicine International
 Annals of Emergency Medicine
@@ -224,11 +369,10 @@ Academic Emergency Medicine
 Arthritis & Rheumatology
 Annals of the Rheumatic Diseases
 Arthritis Research & Therapy
-Reumatismo
-Modern Rheumatology
 The Journal of Rheumatology
 Clinical Rheumatology
 Rheumatology (Oxford)
+Nature Reviews. Rheumatology
 Respiratory Research
 American Journal of Respiratory and Critical Care Medicine
 European Respiratory Journal
@@ -239,15 +383,24 @@ Journal of the American Society of Nephrology
 Kidney International
 American Journal of Kidney Diseases
 Clinical Journal of the American Society of Nephrology
+Nephrology Dialysis Transplantation
+Nature Reviews. Nephrology
 Blood
 British Journal of Haematology
 Haematologica
 Blood Advances
+The Lancet Haematology
 Neurology
 JAMA Neurology
 Annals of Neurology
 The Lancet Neurology
 Stroke
+Journal of Neurology, Neurosurgery & Psychiatry
+Brain
+Nature Reviews. Neurology
+Movement Disorders
+Journal of Neurosurgery
+Neurosurgery
 Gastroenterology
 Gut
 Clinical Gastroenterology and Hepatology
@@ -255,17 +408,28 @@ Alimentary Pharmacology & Therapeutics
 Hepatology
 Journal of Hepatology
 American Journal of Gastroenterology
+The Lancet Gastroenterology & Hepatology
+Nature Reviews. Gastroenterology & Hepatology
 Diabetes Care
 The Journal of Clinical Endocrinology & Metabolism
 Diabetologia
+Diabetes
+The Lancet Diabetes & Endocrinology
+Nature Reviews. Endocrinology
 Clinical Infectious Diseases
 The Journal of Infectious Diseases
 Antimicrobial Agents and Chemotherapy
 The Lancet Infectious Diseases
+Emerging Infectious Diseases
 Journal of Clinical Oncology
 Cancer
 JAMA Oncology
 The Lancet Oncology
+CA: A Cancer Journal for Clinicians
+Annals of Oncology
+Journal of the National Cancer Institute (JNCI)
+Nature Reviews. Cancer
+British Journal of Cancer
 Critical Care Medicine
 Intensive Care Medicine
 Critical Care
@@ -286,12 +450,21 @@ International Forum of Allergy & Rhinology
 Journal of Bone and Joint Surgery
 Clinical Orthopaedics and Related Research
 Journal of Orthopaedic Research
+British Journal of Sports Medicine
+The American Journal of Sports Medicine
+The Bone & Joint Journal
 American Journal of Psychiatry
 Journal of Clinical Psychiatry
+JAMA Psychiatry
+The Lancet Psychiatry
+World Psychiatry
+British Journal of Psychiatry
+Biological Psychiatry
 Radiology
 American Journal of Roentgenology
 European Radiology
 Journal of Vascular and Interventional Radiology
+Radiographics
 American Journal of Surgical Pathology
 Modern Pathology
 Anesthesiology
@@ -300,15 +473,38 @@ British Journal of Anaesthesia
 Annals of Surgery
 British Journal of Surgery
 JAMA Surgery
+Journal of Vascular Surgery
+Journal of the American College of Surgeons (JACS)
 The Journal of Allergy and Clinical Immunology
 Pediatrics
 Journal of Pediatrics
+JAMA Pediatrics
+The Lancet Child & Adolescent Health
+Journal of Adolescent Health
+Archives of Disease in Childhood
 Obstetrics & Gynecology
 American Journal of Obstetrics & Gynecology
+Human Reproduction
+Ultrasound in Obstetrics & Gynecology
+BJOG
+Fertility and Sterility
 Journal of Urology
+European Urology
+BJU International
 Plastic and Reconstructive Surgery
 International Journal of Radiation Oncology
 Journal of Nuclear Medicine
+The American Journal of Human Genetics
+Genetics in Medicine
+Nature Reviews. Genetics
+Clinical Pharmacology & Therapeutics
+American Journal of Transplantation
+Archives of Physical Medicine and Rehabilitation
+Pain
+Sleep
+Implementation Science
+BMJ Quality & Safety
+Occupational and Environmental Medicine
 """
 
 PRIORITY_JOURNAL_NAMES = {
