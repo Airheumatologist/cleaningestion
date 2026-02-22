@@ -9,6 +9,8 @@ import gzip
 import json
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List, Literal, Tuple
 from urllib.parse import quote, urlparse
@@ -357,8 +359,12 @@ def download_pmc(
     datasets: List[str] | None = None,
     release_mode: ReleaseMode = "all",
     max_files: int | None = None,
+    workers: int = 16,
 ) -> int:
-    """Download requested datasets from PMC Cloud Service and return total files downloaded."""
+    """Download requested datasets from PMC Cloud Service and return total files downloaded.
+
+    Uses a thread pool to download multiple files concurrently for much faster throughput.
+    """
     selected = datasets or list(REMOTE_DIRS.keys())
     invalid = [value for value in selected if value not in REMOTE_DIRS]
     if invalid:
@@ -378,17 +384,48 @@ def download_pmc(
     if max_files is not None and max_files < 0:
         raise ValueError("--max-files must be >= 0")
 
-    total_downloaded = 0
-    total_extracted = 0
-    processed_entries = 0
+    if max_files == 0:
+        logger.info("--max-files is 0; nothing to process.")
+        return 0
+
+    # Thread-safe counters
+    lock = threading.Lock()
+    counters = {
+        "total_downloaded": 0,
+        "total_extracted": 0,
+        "processed_entries": 0,
+    }
+
+    def _process_entry_wrapper(entry_tuple):
+        """Wrapper for thread pool execution."""
+        metadata_key, etag = entry_tuple
+        downloaded_now, extracted_now = _process_metadata_entry(
+            output_dir=output_dir,
+            datasets=selected,
+            dataset_sig=dataset_sig,
+            metadata_key=metadata_key,
+            etag=etag,
+        )
+        with lock:
+            counters["total_downloaded"] += downloaded_now
+            counters["total_extracted"] += extracted_now
+            counters["processed_entries"] += 1
+            if counters["processed_entries"] % 1000 == 0:
+                logger.info(
+                    "Progress: processed=%s downloaded=%s (workers=%s)",
+                    counters["processed_entries"],
+                    counters["total_downloaded"],
+                    workers,
+                )
+        return downloaded_now
+
+    # Phase 1: Collect eligible entries from inventory (this is fast, just scanning metadata)
+    logger.info("Phase 1: Scanning inventory for eligible metadata entries...")
+    eligible_entries = []
     scanned_entries = 0
     included_entries = 0
     max_seen_last_modified: str | None = None
     stopped_by_max_files = False
-
-    if max_files == 0:
-        logger.info("--max-files is 0; nothing to process.")
-        return 0
 
     for metadata_key, last_modified, etag in _iter_metadata_entries():
         scanned_entries += 1
@@ -400,30 +437,41 @@ def download_pmc(
 
         included_entries += 1
 
-        if max_files is not None and processed_entries >= max_files:
+        if max_files is not None and len(eligible_entries) >= max_files:
             logger.info("Reached --max-files=%s; stopping scan early.", max_files)
             stopped_by_max_files = True
             break
 
-        downloaded_now, extracted_now = _process_metadata_entry(
-            output_dir=output_dir,
-            datasets=selected,
-            dataset_sig=dataset_sig,
-            metadata_key=metadata_key,
-            etag=etag,
-        )
-        total_downloaded += downloaded_now
-        total_extracted += extracted_now
-        processed_entries += 1
+        eligible_entries.append((metadata_key, etag))
 
-        if processed_entries % 1000 == 0:
+        if scanned_entries % 100_000 == 0:
             logger.info(
-                "Progress: scanned=%s included=%s processed=%s downloaded=%s",
+                "Scanning inventory: scanned=%s included=%s",
                 scanned_entries,
                 included_entries,
-                processed_entries,
-                total_downloaded,
             )
+
+    logger.info(
+        "Phase 1 complete: scanned=%s included=%s eligible=%s",
+        scanned_entries,
+        included_entries,
+        len(eligible_entries),
+    )
+
+    # Phase 2: Download in parallel
+    logger.info("Phase 2: Downloading with %s parallel workers...", workers)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_process_entry_wrapper, entry): entry
+            for entry in eligible_entries
+        }
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                entry = futures[future]
+                logger.warning("Worker error for %s: %s", entry[0], exc)
 
     if max_seen_last_modified is not None and release_mode == "incremental" and not stopped_by_max_files:
         state.setdefault("last_modified_by_signature", {})[dataset_sig] = max_seen_last_modified
@@ -435,10 +483,10 @@ def download_pmc(
     logger.info("=" * 70)
     logger.info("PMC Cloud download complete. Scanned metadata rows: %s", scanned_entries)
     logger.info("Rows included by release mode/cutoff: %s", included_entries)
-    logger.info("Metadata rows processed: %s", processed_entries)
-    logger.info("Downloaded XML files: %s", total_downloaded)
-    logger.info("Extracted-equivalent count: %s", total_extracted)
-    return total_downloaded
+    logger.info("Metadata rows processed: %s", counters["processed_entries"])
+    logger.info("Downloaded XML files: %s", counters["total_downloaded"])
+    logger.info("Extracted-equivalent count: %s", counters["total_extracted"])
+    return counters["total_downloaded"]
 
 
 def _parse_datasets(value: str) -> List[str]:
@@ -472,6 +520,12 @@ def main() -> None:
             "baseline=alias of all (not available in PMC Cloud layout)."
         ),
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="Number of parallel download workers (default: 16)",
+    )
     args = parser.parse_args()
 
     ensure_data_dirs()
@@ -480,6 +534,7 @@ def main() -> None:
         datasets=args.datasets,
         release_mode=args.release_mode,
         max_files=args.max_files,
+        workers=args.workers,
     )
 
 
