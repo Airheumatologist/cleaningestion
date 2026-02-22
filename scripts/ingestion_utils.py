@@ -298,8 +298,14 @@ def _parse_table_to_rows(table_elem: ET.Element, ns: Optional[Dict[str, str]] = 
                 cell_idx += 1
             
             cell_text = get_text(cell).replace("|", "\\|").replace("\n", " ").strip()
-            colspan = int(cell.get("colspan", "1"))
-            rowspan = int(cell.get("rowspan", "1"))
+            try:
+                colspan = int(cell.get("colspan", "1"))
+            except (ValueError, TypeError):
+                colspan = 1
+            try:
+                rowspan = int(cell.get("rowspan", "1"))
+            except (ValueError, TypeError):
+                rowspan = 1
             
             row_cells.append(cell_text)
             

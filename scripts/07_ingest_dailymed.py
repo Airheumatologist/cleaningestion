@@ -546,7 +546,7 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
         for chunk in all_chunks:
             is_valid, issues = QualityValidator.validate_chunk(
                 chunk["text"],
-                {k: chunk.get(k) for k in ["set_id", "chunk_id", "drug_name", "section_title"]}
+                {k: chunk.get(k) for k in ["doc_id", "set_id", "chunk_id", "drug_name", "section_title"]}
             )
             if is_valid:
                 valid_chunks.append(chunk)
