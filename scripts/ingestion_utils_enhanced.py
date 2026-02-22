@@ -93,6 +93,10 @@ class SemanticChunker:
         words = len(text.split())
         return int(words / self.WORDS_PER_TOKEN)
     
+    def count_tokens(self, text: str) -> int:
+        """Public API matching base Chunker.count_tokens()."""
+        return self._count_tokens(text)
+    
     def _count_medical_entities(self, text: str) -> int:
         """Count medical entities in text."""
         count = 0
