@@ -544,6 +544,7 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
         Article dict following PRD JSON structure, or None if invalid/skipped.
     """
     try:
+        xml_path = Path(xml_path)  # Accept both str and Path
         file_name = xml_path.name
         lowered_name = file_name.lower()
 
@@ -568,7 +569,11 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
             pmcid_from_file = _base_name_from_archive(file_name, lowered_name)
 
         # Get article and article-meta elements
-        article_elem = root.find(".//article")
+        # Handle both cases: root IS the article, or article is nested
+        if root.tag == "article" or root.tag.endswith("}article"):
+            article_elem = root
+        else:
+            article_elem = root.find(".//article")
         if article_elem is None:
             logger.debug(f"No article element found in {xml_path}")
             return None
@@ -923,23 +928,33 @@ def _extract_identifiers(article_meta: ET.Element) -> Dict[str, Optional[str]]:
 
 def _extract_article_type(root: ET.Element) -> str:
     """Extract article type per PRD Section 1.1."""
-    article_elem = root.xpath(".//article")
-    if article_elem:
-        art_type = article_elem[0].get("article-type", "")
+    # Handle root being the article element itself
+    if root.tag == "article" or root.tag.endswith("}article"):
+        art_type = root.get("article-type", "")
         if art_type:
             return art_type.lower()
+    else:
+        article_elem = root.xpath(".//article")
+        if article_elem:
+            art_type = article_elem[0].get("article-type", "")
+            if art_type:
+                return art_type.lower()
     return "other"
 
 
 def _extract_language(root: ET.Element) -> str:
     """Extract language per PRD Section 1.1."""
-    article_elem = root.xpath(".//article")
-    if article_elem:
-        lang = article_elem[0].get("{http://www.w3.org/XML/1998/namespace}lang")
+    # Handle root being the article element itself
+    if root.tag == "article" or root.tag.endswith("}article"):
+        elem = root
+    else:
+        article_elems = root.xpath(".//article")
+        elem = article_elems[0] if article_elems else None
+    if elem is not None:
+        lang = elem.get("{http://www.w3.org/XML/1998/namespace}lang")
         if lang:
             return lang.lower()
-        # Try without namespace
-        lang = article_elem[0].get("xml:lang")
+        lang = elem.get("xml:lang")
         if lang:
             return lang.lower()
     return "en"
