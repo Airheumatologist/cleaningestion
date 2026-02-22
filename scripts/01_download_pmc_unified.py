@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, List, Literal, Tuple
@@ -17,10 +18,31 @@ from urllib.parse import quote, urlparse
 import xml.etree.ElementTree as ET
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Thread-local storage for HTTP sessions with connection pooling
+_thread_local = threading.local()
+
+
+def _get_session(pool_size: int = 64) -> requests.Session:
+    """Get or create a thread-local requests.Session with connection pooling."""
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+        retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
+            max_retries=retry,
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _thread_local.session = session
+    return _thread_local.session
 logger = logging.getLogger(__name__)
 
 S3_BUCKET = "pmc-oa-opendata"
@@ -57,11 +79,12 @@ def _normalize_s3_or_https_url(value: str) -> str:
     raise ValueError(f"Unsupported URL scheme in xml_url: {value}")
 
 
-def _download_file_http(url: str, local_path: Path, chunk_size: int = 1024 * 1024) -> bool:
+def _download_file_http(url: str, local_path: Path, chunk_size: int = 1024 * 1024, session: requests.Session | None = None) -> bool:
     temp_path = local_path.with_suffix(local_path.suffix + ".tmp")
+    _session = session or _get_session()
     try:
-        logger.info("Downloading: %s", url)
-        with requests.get(url, stream=True, timeout=120) as response:
+        logger.debug("Downloading: %s", url)
+        with _session.get(url, stream=True, timeout=120) as response:
             if response.status_code != 200:
                 logger.warning("HTTP missing (status %s): %s", response.status_code, url)
                 return False
@@ -262,10 +285,11 @@ def _marker_path(marker_root: Path, dataset_sig: str, metadata_key: str, etag: s
     return marker_root / safe_sig / f".{safe_key}.{safe_etag}.done"
 
 
-def _download_metadata_json(metadata_key: str) -> dict | None:
+def _download_metadata_json(metadata_key: str, session: requests.Session | None = None) -> dict | None:
     metadata_url = _s3_key_to_https(metadata_key)
+    _session = session or _get_session()
     try:
-        response = requests.get(metadata_url, timeout=120)
+        response = _session.get(metadata_url, timeout=120)
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict):
@@ -281,6 +305,7 @@ def _process_metadata_entry(
     dataset_sig: str,
     metadata_key: str,
     etag: str,
+    session: requests.Session | None = None,
 ) -> tuple[int, int]:
     marker_root = output_dir / MARKER_DIR_NAME
     marker_path = _marker_path(marker_root, dataset_sig, metadata_key, etag)
@@ -288,7 +313,8 @@ def _process_metadata_entry(
     if marker_path.exists():
         return 0, 0
 
-    metadata = _download_metadata_json(metadata_key)
+    _session = session or _get_session()
+    metadata = _download_metadata_json(metadata_key, session=_session)
     if metadata is None:
         return 0, 0
 
@@ -300,7 +326,7 @@ def _process_metadata_entry(
 
     xml_url = metadata.get("xml_url")
     if not isinstance(xml_url, str) or not xml_url:
-        logger.warning("Skipping metadata without xml_url: %s", metadata_key)
+        logger.debug("Skipping metadata without xml_url: %s", metadata_key)
         return 0, 0
 
     try:
@@ -311,7 +337,7 @@ def _process_metadata_entry(
 
     xml_name = Path(urlparse(xml_http_url).path).name
     if not xml_name.endswith((".xml", ".nxml")):
-        logger.warning("Skipping non-XML target for %s: %s", metadata_key, xml_name)
+        logger.debug("Skipping non-XML target for %s: %s", metadata_key, xml_name)
         return 0, 0
 
     downloaded_now = 0
@@ -323,7 +349,7 @@ def _process_metadata_entry(
         if local_path.exists() and local_path.stat().st_size > 0:
             continue
 
-        if _download_file_http(xml_http_url, local_path):
+        if _download_file_http(xml_http_url, local_path, session=_session):
             downloaded_now += 1
         else:
             logger.error("Failed XML download for %s (%s)", metadata_key, dataset)
@@ -359,11 +385,12 @@ def download_pmc(
     datasets: List[str] | None = None,
     release_mode: ReleaseMode = "all",
     max_files: int | None = None,
-    workers: int = 16,
+    workers: int = 64,
 ) -> int:
     """Download requested datasets from PMC Cloud Service and return total files downloaded.
 
     Uses a thread pool to download multiple files concurrently for much faster throughput.
+    Each thread gets its own HTTP session with connection pooling for maximum performance.
     """
     selected = datasets or list(REMOTE_DIRS.keys())
     invalid = [value for value in selected if value not in REMOTE_DIRS]
@@ -394,29 +421,44 @@ def download_pmc(
         "total_downloaded": 0,
         "total_extracted": 0,
         "processed_entries": 0,
+        "skipped_marker": 0,
     }
+    start_time = time.monotonic()
+    last_log_time = [start_time]  # mutable for closure
 
     def _process_entry_wrapper(entry_tuple):
         """Wrapper for thread pool execution."""
         metadata_key, etag = entry_tuple
+        session = _get_session(pool_size=workers)
         downloaded_now, extracted_now = _process_metadata_entry(
             output_dir=output_dir,
             datasets=selected,
             dataset_sig=dataset_sig,
             metadata_key=metadata_key,
             etag=etag,
+            session=session,
         )
         with lock:
             counters["total_downloaded"] += downloaded_now
             counters["total_extracted"] += extracted_now
             counters["processed_entries"] += 1
-            if counters["processed_entries"] % 1000 == 0:
+            if downloaded_now == 0 and extracted_now == 0:
+                counters["skipped_marker"] += 1
+            now = time.monotonic()
+            # Log progress every 30 seconds instead of every N entries
+            if now - last_log_time[0] >= 30:
+                elapsed = now - start_time
+                rate = counters["total_downloaded"] / elapsed if elapsed > 0 else 0
                 logger.info(
-                    "Progress: processed=%s downloaded=%s (workers=%s)",
+                    "Progress: processed=%s downloaded=%s skipped=%s rate=%.1f files/sec elapsed=%.0fs (workers=%s)",
                     counters["processed_entries"],
                     counters["total_downloaded"],
+                    counters["skipped_marker"],
+                    rate,
+                    elapsed,
                     workers,
                 )
+                last_log_time[0] = now
         return downloaded_now
 
     # Phase 1: Collect eligible entries from inventory (this is fast, just scanning metadata)
@@ -459,7 +501,7 @@ def download_pmc(
     )
 
     # Phase 2: Download in parallel
-    logger.info("Phase 2: Downloading with %s parallel workers...", workers)
+    logger.info("Phase 2: Downloading with %s parallel workers (connection pooling enabled)...", workers)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -473,6 +515,9 @@ def download_pmc(
                 entry = futures[future]
                 logger.warning("Worker error for %s: %s", entry[0], exc)
 
+    elapsed_total = time.monotonic() - start_time
+    rate = counters["total_downloaded"] / elapsed_total if elapsed_total > 0 else 0
+
     if max_seen_last_modified is not None and release_mode == "incremental" and not stopped_by_max_files:
         state.setdefault("last_modified_by_signature", {})[dataset_sig] = max_seen_last_modified
         _save_state(state_path, state)
@@ -481,11 +526,11 @@ def download_pmc(
         logger.info("Skipped incremental state update because run ended early due to --max-files.")
 
     logger.info("=" * 70)
-    logger.info("PMC Cloud download complete. Scanned metadata rows: %s", scanned_entries)
+    logger.info("PMC Cloud download complete in %.1f min (%.1f files/sec)", elapsed_total / 60, rate)
+    logger.info("Scanned metadata rows: %s", scanned_entries)
     logger.info("Rows included by release mode/cutoff: %s", included_entries)
     logger.info("Metadata rows processed: %s", counters["processed_entries"])
-    logger.info("Downloaded XML files: %s", counters["total_downloaded"])
-    logger.info("Extracted-equivalent count: %s", counters["total_extracted"])
+    logger.info("Downloaded XML files: %s (skipped: %s)", counters["total_downloaded"], counters["skipped_marker"])
     return counters["total_downloaded"]
 
 
@@ -523,8 +568,8 @@ def main() -> None:
     parser.add_argument(
         "--workers",
         type=int,
-        default=16,
-        help="Number of parallel download workers (default: 16)",
+        default=64,
+        help="Number of parallel download workers (default: 64)",
     )
     args = parser.parse_args()
 
