@@ -359,6 +359,10 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
             "content_type": "abstract",
             "has_full_text": False,
             "table_count": 0,
+            "is_open_access": None,
+            "country": "",
+            "is_author_manuscript": False,
+            "nihms_id": None,
             "text_preview": full_text[:500],
             
             # Government affiliation (merged from gov pipeline)
@@ -450,6 +454,10 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
                 "content_type": "abstract",
                 "has_full_text": False,
                 "table_count": 0,
+                "is_open_access": None,
+                "country": "",
+                "is_author_manuscript": False,
+                "nihms_id": None,
                 "text_preview": chunk_text[:500],
                 
                 # Government affiliation (merged from gov pipeline)

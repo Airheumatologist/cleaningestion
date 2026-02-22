@@ -579,19 +579,9 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
     if dedup_chunks and ContentDeduplicator is not None:
         dedup = ContentDeduplicator()
     
-    # Validate and deduplicate chunks
+    # Deduplicate chunks (validation already done in create_chunks)
     filtered_chunks = []
     for chunk in chunks:
-        # Validate chunk if enabled
-        if validate_chunks and ENHANCED_UTILS_AVAILABLE:
-            is_valid, issues = QualityValidator.validate_chunk(
-                chunk["text"],
-                {k: chunk.get(k) for k in ["set_id", "chunk_id", "drug_name", "section_title"]}
-            )
-            if not is_valid:
-                logger.debug("Skipping invalid chunk %s: %s", chunk.get("chunk_id"), issues)
-                continue
-        
         # Deduplicate if enabled
         if dedup:
             metadata = {

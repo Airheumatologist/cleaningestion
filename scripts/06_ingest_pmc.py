@@ -625,7 +625,7 @@ def process_batch(
     delete_source: bool = False,
 ) -> tuple[int, int]:
     """Process a batch of XML files in a single thread."""
-    from scripts.ingestion_utils import parse_pmc_xml
+    from ingestion_utils import parse_pmc_xml
     
     articles: List[Dict[str, Any]] = []
     new_ids: List[str] = []
