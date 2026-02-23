@@ -16,7 +16,14 @@ import requests
 from .config import (
     RERANKER_MODEL,
     DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
-    DEEPINFRA_RETRY_COUNT, DEEPINFRA_RETRY_DELAY
+    DEEPINFRA_RETRY_COUNT, DEEPINFRA_RETRY_DELAY,
+    RERANKER_V2_ENABLED,
+    TIER_1_BOOST as CFG_TIER_1_BOOST,
+    TIER_2_BOOST as CFG_TIER_2_BOOST,
+    TIER_3_BOOST as CFG_TIER_3_BOOST,
+    TIER_4_PENALTY as CFG_TIER_4_PENALTY,
+    RERANKER_SCORE_WEIGHT,
+    ENTITY_SCORE_WEIGHT,
 )
 from .retry_utils import retry_with_exponential_backoff
 from .specialty_journals import detect_guideline_society_signal
@@ -52,13 +59,36 @@ def make_int(value) -> int:
 # EVIDENCE HIERARCHY SYSTEM
 # =============================================================================
 
-# Tier multipliers - strong differentiation to ensure guidelines rank above case reports
-# A case report with 0.92 reranker score → 0.92 × 0.20 = 0.18
-# A guideline with 0.70 reranker score → 0.70 × 3.00 = 2.10 (11x higher)
-TIER_1_BOOST = 3.00  # Guidelines, systematic reviews, meta-analyses
-TIER_2_BOOST = 1.50  # RCTs, clinical trials, review articles
-TIER_3_BOOST = 1.00  # Standard research
-TIER_4_PENALTY = 0.20  # Case reports, letters, editorials - strictly suppressed
+# Tier multipliers - configurable via config.py / env vars.
+# Legacy (v1) values kept for rollback when RERANKER_V2_ENABLED=False:
+#   TIER_1=3.00  TIER_2=1.50  TIER_3=1.00  TIER_4=0.20
+# v2 defaults (env-overridable): 2.00 / 1.25 / 1.00 / 0.40
+_TIER_1_LEGACY, _TIER_2_LEGACY, _TIER_3_LEGACY, _TIER_4_LEGACY = 3.00, 1.50, 1.00, 0.20
+TIER_1_BOOST   = CFG_TIER_1_BOOST   if RERANKER_V2_ENABLED else _TIER_1_LEGACY
+TIER_2_BOOST   = CFG_TIER_2_BOOST   if RERANKER_V2_ENABLED else _TIER_2_LEGACY
+TIER_3_BOOST   = CFG_TIER_3_BOOST   if RERANKER_V2_ENABLED else _TIER_3_LEGACY
+TIER_4_PENALTY = CFG_TIER_4_PENALTY if RERANKER_V2_ENABLED else _TIER_4_LEGACY
+
+# =============================================================================
+# ENTITY EXTRACTION CONSTANTS
+# =============================================================================
+
+# Generic medical terms that add noise to entity matching (not specific disease terms)
+ENTITY_STOPWORDS = {
+    'management', 'treatment', 'therapy', 'diagnosis', 'clinical',
+    'features', 'symptoms', 'guidelines', 'recommendations',
+    'patients', 'patient', 'outcomes', 'approach', 'advances',
+    'review', 'overview', 'practice', 'evidence', 'recent',
+    'current', 'update', 'updates', 'prevention', 'screening',
+    'assessment', 'evaluation', 'classification', 'pathogenesis',
+    'epidemiology', 'prognosis', 'mechanism', 'pathophysiology',
+    'presentation', 'complications', 'associated', 'chronic',
+    'acute', 'primary', 'secondary', 'emerging', 'novel', 'standard',
+    'latest', 'options', 'strategies', 'interventions',
+}
+
+# Suffixes that indicate a word is likely a medical term even if lowercase
+MEDICAL_SUFFIXES = ('itis', 'osis', 'emia', 'pathy', 'oma', 'ectomy', 'plasty', 'scopy')
 
 # Article types for each tier
 TIER_1_TYPES = {
@@ -150,9 +180,18 @@ def _contains_normalized_phrase(text: str, phrase: str) -> bool:
     phrase_tokens = phrase.split()
     if len(phrase_tokens) > len(text_tokens):
         return False
+    # Exact sliding-window match (original behaviour, unchanged)
     for idx in range(len(text_tokens) - len(phrase_tokens) + 1):
         if text_tokens[idx:idx + len(phrase_tokens)] == phrase_tokens:
             return True
+    # Fuzzy fallback (v2): all phrase tokens present within a gap-tolerant window
+    # e.g., "non small cell lung" matches "non-small-cell lung" after normalization
+    if RERANKER_V2_ENABLED:
+        window = len(phrase_tokens) + 2     # allow up to 2 extra tokens between phrase words
+        phrase_set = set(phrase_tokens)
+        for idx in range(max(0, len(text_tokens) - window + 1)):
+            if phrase_set.issubset(set(text_tokens[idx:idx + window])):
+                return True
     return False
 
 
@@ -298,9 +337,20 @@ def apply_evidence_boosts(
             year = doc.get("year")
             if year:
                 try:
-                    year_int = int(year)
-                    if year_int >= current_year - 2:  # 2023-2025
-                        recency_mult = 1.10  # +10% for recent high-quality articles
+                    if RERANKER_V2_ENABLED:
+                        # Graduated recency boost — no penalty for old seminal papers
+                        age = current_year - int(year)
+                        if age <= 1:
+                            recency_mult = 1.25   # very recent: +25%
+                        elif age <= 3:
+                            recency_mult = 1.15   # recent: +15%
+                        elif age <= 5:
+                            recency_mult = 1.05   # somewhat recent: +5%
+                        # age > 5: neutral (1.0) — no penalty for older papers
+                    else:
+                        # Legacy binary boost
+                        if int(year) >= current_year - 2:
+                            recency_mult = 1.10   # +10% for recent high-quality articles
                 except (ValueError, TypeError):
                     pass
         
@@ -464,7 +514,8 @@ class PaperFinderWithReranker:
         query: str,
         retrieved_ctxs: List[Dict[str, Any]],
         pre_filter_threshold: float = 0.0,  # Disabled by default: retrieval score scales vary by retrieval mode
-        relevance_threshold: float = 0.1  # Minimum relevance score (filters truly irrelevant)
+        relevance_threshold: float = 0.1,   # Minimum relevance score (filters truly irrelevant)
+        medical_conditions: Optional[List[str]] = None,  # LLM-extracted conditions for entity scoring
     ) -> List[Dict[str, Any]]:
         """
         Rerank passages using DeepInfra Qwen3-Reranker + evidence hierarchy boosts.
@@ -545,14 +596,20 @@ class PaperFinderWithReranker:
             return []
         
         # Stage 4: Calculate entity matching scores
-        entity_scores = self._calculate_entity_scores(query, retrieved_ctxs)
+        # Prepend LLM-extracted conditions (high-quality disease terms) to the query so
+        # they are surfaced during entity extraction alongside the raw query terms.
+        entity_query = query
+        if medical_conditions:
+            entity_query = " ".join(medical_conditions) + " " + query
+        entity_scores = self._calculate_entity_scores(entity_query, retrieved_ctxs)
         
         # Combine reranker scores with entity matching scores
-        # Weight: 70% rerank score, 30% entity score
+        # Weight: configurable via RERANKER_SCORE_WEIGHT / ENTITY_SCORE_WEIGHT
+        # v2 defaults: 85% rerank score, 15% entity score (was 70/30)
         combined_scores = []
         for i, entity_score in enumerate(entity_scores):
             rerank_score = retrieved_ctxs[i].get("rerank_score", 0)
-            combined_score = 0.7 * rerank_score + 0.3 * entity_score
+            combined_score = RERANKER_SCORE_WEIGHT * rerank_score + ENTITY_SCORE_WEIGHT * entity_score
             combined_scores.append(combined_score)
             retrieved_ctxs[i]["entity_score"] = entity_score
             retrieved_ctxs[i]["combined_score"] = combined_score
@@ -616,122 +673,165 @@ class PaperFinderWithReranker:
                     return text
         return ""
     
+    def _build_entity_variants(self, entity: str) -> set:
+        """
+        Return a flat set of all normalized forms and MeSH synonyms for an entity.
+
+        Pre-computing variants once per query entity keeps matching O(variants)
+        per document instead of O(MeSH_vocab) per document.
+        """
+        def _norm(s: str) -> str:
+            return re.sub(r'[\s\-]+', ' ', s).lower().strip()
+
+        variants: set = {entity.lower(), _norm(entity)}
+
+        if self.entity_expander:
+            # MeSH synonyms for the entity treated as a full term
+            for syn in self.entity_expander.get_synonyms(entity):
+                variants.add(syn.lower())
+                variants.add(_norm(syn))
+            # Treat entity as acronym → expand to full terms
+            for exp in self.entity_expander.expand_acronym(entity):
+                variants.add(exp.lower())
+                variants.add(_norm(exp))
+            # Also look up synonyms of each expansion (catches abbreviation ↔ full-term)
+            for syn in self.entity_expander.get_synonyms(entity):
+                if re.match(r'^[A-Z0-9\-]{2,8}$', syn):
+                    variants.add(syn.lower())
+
+        # Remove empty strings that may have crept in
+        variants.discard('')
+        return variants
+
     def _calculate_entity_scores(self, query: str, documents: List[Dict[str, Any]]) -> List[float]:
         """
         Calculate entity matching scores for documents.
-        
+
         Extracts medical entities from query and scores documents based on entity overlap.
-        
+        Uses fuzzy matching: normalizes hyphens/whitespace and expands MeSH synonyms so
+        "IgG4-related disease" matches "IgG4 related disease", "RA" matches
+        "Rheumatoid Arthritis", and "T2DM" matches "Type 2 Diabetes Mellitus".
+
         Args:
             query: Search query
             documents: List of document dictionaries
-            
+
         Returns:
             List of entity scores (0.0 to 1.0)
         """
         if not self.entity_expander or not documents:
             return [0.0] * len(documents)
-        
+
         # Extract medical entities from query
         query_entities = self._extract_query_entities(query)
-        
+
         if not query_entities:
             return [0.0] * len(documents)
-        
+
+        # Pre-compute variant sets once per entity (avoids scanning MeSH per document)
+        entity_variant_sets = [self._build_entity_variants(e) for e in query_entities]
+
         scores = []
         for doc in documents:
             title = str(doc.get("title", "")).lower()
             abstract = str(doc.get("abstract", "")).lower()
             text = self._get_document_content(doc).lower()
             full_text = str(doc.get("full_text", "")).lower()
-            
-            # Combine text for searching
-            doc_text = f"{title} {abstract} {text} {full_text}".lower()
-            
-            # Count entity matches
+
+            # Combine text for searching; normalize hyphens/extra spaces once per doc
+            raw_doc_text = f"{title} {abstract} {text} {full_text}"
+            doc_text = re.sub(r'[\s\-]+', ' ', raw_doc_text).lower()
+            # Keep original too so literal forms also match
+            doc_text_orig = raw_doc_text.lower()
+
+            # Count entity matches — any variant form found counts as a match
             matches = 0
-            for entity in query_entities:
-                entity_lower = entity.lower()
-                # Check for entity in document (word boundary or exact match)
-                if (entity_lower in doc_text or 
-                    f" {entity_lower} " in doc_text or
-                    entity_lower in title):
+            for variants in entity_variant_sets:
+                if any(v in doc_text or v in doc_text_orig for v in variants):
                     matches += 1
-            
+
             # Score: proportion of query entities found in document
             score = matches / len(query_entities) if query_entities else 0.0
             scores.append(score)
-        
+
         return scores
     
     def _extract_query_entities(self, query: str) -> List[str]:
         """
         Extract medical entities from query for entity-based scoring.
-        
-        Improved extraction using:
-        1. Key medical terms (capitalized words, hyphenated terms)
-        2. MeSH acronym expansion
-        3. Disease/condition pattern matching
+
+        Extraction steps:
+        1. Hyphenated medical terms (e.g., "IgG4-related disease")
+        2. Acronyms (2+ uppercase letters) + MeSH expansion (keeps short ones like "RA", "SLE")
+        3. Capitalized multi-word terms (e.g., "Antiphospholipid Syndrome")
+        4. Disease-pattern suffixes (arthritis, fibrosis, anemia, neuropathy, …)
+        5. Remaining words — only if they look medical (capitalized, contain digits,
+           or end with a known medical suffix), filtered through ENTITY_STOPWORDS
         """
-        import re
         entities = []
-        
+
         if not self.entity_expander:
             # Fallback: extract key terms without MeSH
             key_terms = re.findall(r'\b[A-Z][a-z]+(?:[-][a-z]+)*\b', query)
             key_terms += re.findall(r'\b[A-Z]{2,}\d*\b', query)  # Acronyms
             logger.info(f"Entity extraction (no MeSH): {key_terms}")
             return list(set(key_terms))
-        
-        # 1. Extract hyphenated medical terms (e.g., "IgG4-related")
+
+        # 1. Hyphenated medical terms (e.g., "IgG4-related", "non-small-cell")
         hyphenated = re.findall(r'\b\w+(?:-\w+)+\b', query)
         entities.extend(hyphenated)
-        
-        # 2. Extract acronyms (2+ uppercase letters, optionally with numbers)
+
+        # 2. Acronyms (2+ uppercase letters, optionally followed by digits)
+        #    Keep short ones like "RA", "SLE" — the dedup filter used to drop len==2,
+        #    fixed below (>= 2 instead of > 2).
         acronyms = re.findall(r'\b[A-Z]{2,}\d*\b', query)
         for acr in acronyms:
             entities.append(acr)
-            # Try to expand acronym using MeSH
+            # Expand acronym via MeSH (e.g., "RA" → "Rheumatoid Arthritis")
             expansions = self.entity_expander.expand_acronym(acr)
             if expansions:
                 entities.append(expansions[0])
-        
-        # 3. Extract capitalized multi-word terms (e.g., "Antiphospholipid Syndrome")
+
+        # 3. Capitalized multi-word terms (e.g., "Antiphospholipid Syndrome")
         capitalized_phrases = re.findall(r'\b[A-Z][a-z]+(?:\s+[a-z]+)*(?:\s+[A-Z][a-z]+)*\b', query)
         entities.extend([p for p in capitalized_phrases if len(p) > 3])
-        
-        # 4. Extract disease-related patterns more flexibly
+
+        # 4. Disease-pattern suffixes
         disease_patterns = [
             r'\b\w+[-]?related\s+disease\b',    # "IgG4-related disease"
             r'\b\w+\s+disease\b',               # "X disease"
             r'\b\w+\s+syndrome\b',              # "X syndrome"
             r'\b\w+\s+disorder\b',              # "X disorder"
-            r'\b\w+itis\b',                     # "arthritis", etc.
-            r'\b\w+osis\b',                     # "fibrosis", etc.
-            r'\b\w+emia\b',                     # "anemia", etc.
-            r'\b\w+pathy\b',                    # "neuropathy", etc.
+            r'\b\w+itis\b',                     # arthritis, colitis, …
+            r'\b\w+osis\b',                     # fibrosis, cirrhosis, …
+            r'\b\w+emia\b',                     # anemia, leukemia, …
+            r'\b\w+pathy\b',                    # neuropathy, nephropathy, …
         ]
-        
         for pattern in disease_patterns:
             matches = re.findall(pattern, query, re.IGNORECASE)
             entities.extend(matches)
-        
-        # 5. Also extract significant lowercase medical terms (length > 5)
+
+        # 5. Remaining words — only keep if they look medical (selective catch-all)
         words = query.split()
         for word in words:
             clean = re.sub(r'[^\w-]', '', word)
-            if len(clean) > 5 and clean.lower() not in ['management', 'treatment', 'therapy', 'diagnosis', 'clinical', 'features', 'symptoms', 'guidelines', 'recommendations']:
+            if (len(clean) > 5
+                    and clean.lower() not in ENTITY_STOPWORDS
+                    and (clean[0].isupper()
+                         or any(c.isdigit() for c in clean)
+                         or clean.lower().endswith(MEDICAL_SUFFIXES))):
                 entities.append(clean)
-        
-        # Deduplicate (case-insensitive) while preserving order
-        seen = set()
+
+        # Deduplicate (case-insensitive) while preserving order.
+        # Fix: use >= 2 (not > 2) so 2-char acronyms like "RA" are kept.
+        seen: set = set()
         unique_entities = []
         for entity in entities:
             entity_lower = entity.lower()
-            if entity_lower not in seen and len(entity) > 2:
+            if entity_lower not in seen and len(entity) >= 2:
                 seen.add(entity_lower)
                 unique_entities.append(entity)
-        
+
         logger.info(f"Extracted entities from query: {unique_entities}")
         return unique_entities
 
