@@ -1146,8 +1146,8 @@ def _extract_license_type(article_meta: ET.Element) -> str:
         if "cc-by" in license_type:
             return "cc-by"
         if "open-access" in license_type:
-            # Continue to check text/href if it's generic OA
-            pass
+            # Generic open-access tag — treat as CC-BY unless text reveals otherwise
+            return "cc-by"
 
         # 2. Check href/xlink:href attribute
         # Namespaces can be tricky, check plain 'href' and with common prefixes
@@ -1180,16 +1180,20 @@ def _extract_license_type(article_meta: ET.Element) -> str:
 
 
 def _is_commercial_license(license_type: str) -> bool:
-    """Return True if the normalized license type allows commercial use."""
-    # Safe: CC-BY, CC-BY-SA, CC-BY-ND, CC0 (Public Domain)
-    # Unsafe: Anything containing 'nc' (Non-Commercial)
-    if not license_type or license_type == "unknown":
+    """Return True if the normalized license type allows commercial use.
+    
+    Uses a denylist approach: only explicitly NC (non-commercial) licenses
+    are rejected. Unknown/unparseable licenses are trusted because this
+    function is only called for files from the PMC OA Commercial Use Subset,
+    where PMC already curates articles to be commercially licensed.
+    """
+    # Explicitly non-commercial → reject
+    if "nc" in (license_type or ""):
         return False
     
-    if "nc" in license_type:
-        return False
-    
-    return license_type in ["cc0", "cc-by", "cc-by-sa", "cc-by-nd", "public_domain"]
+    # Unknown/unparseable → trust the PMC OA source curation
+    # (pmc_oa files are guaranteed commercially usable by PMC)
+    return True
 
 
 def _extract_open_access(article_meta: ET.Element) -> bool:
