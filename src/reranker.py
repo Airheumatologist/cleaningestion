@@ -342,7 +342,9 @@ class AbstractReranker:
 
 class DeepInfraReranker(AbstractReranker):
     """
-    Reranker using DeepInfra's rerank endpoint (Jina/Qwen/BGE models).
+    Reranker using DeepInfra's inference endpoint for Qwen/Qwen3-Reranker models.
+    
+    API Documentation: https://deepinfra.com/Qwen/Qwen3-Reranker-0.6B/api
     """
     
     def __init__(self, model: str = None):
@@ -350,30 +352,30 @@ class DeepInfraReranker(AbstractReranker):
         if not DEEPINFRA_API_KEY:
             raise ValueError("DEEPINFRA_API_KEY not set")
         self.api_key = DEEPINFRA_API_KEY
-        # DeepInfra uses a specific rerank endpoint, not standard OpenAI
-        self.api_url = "https://api.deepinfra.com/v1/rerank"
+        # DeepInfra inference endpoint for Qwen3-Reranker models
+        self.api_url = f"https://api.deepinfra.com/v1/inference/{self.model}"
         self.retry_count = DEEPINFRA_RETRY_COUNT
         self.retry_delay = DEEPINFRA_RETRY_DELAY
         logger.info(f"✅ DeepInfra Reranker initialized with {self.model}")
 
     def get_scores(self, query: str, documents: List[str], top_n: Optional[int] = None) -> List[float]:
         """
-        Get relevance scores for documents using DeepInfra API.
+        Get relevance scores for documents using DeepInfra inference API.
+        
+        DeepInfra Qwen3-Reranker API expects:
+        - Request: {"queries": [...], "documents": [...]}
+        - Response: {"scores": [...], "input_tokens": N}
         """
         if not documents:
             return []
 
-        # DeepInfra allows strict top_n, but we want scores for all if possible
-        # or at least the top ones.
         n_docs = len(documents)
         
         try:
+            # DeepInfra Qwen3-Reranker API format
             payload = {
-                "model": self.model,
-                "query": query,
-                "documents": documents,
-                "top_n": top_n or n_docs,
-                "return_documents": False
+                "queries": [query],
+                "documents": documents[:top_n] if top_n else documents
             }
             
             headers = {
@@ -382,7 +384,7 @@ class DeepInfraReranker(AbstractReranker):
             }
             
             def _post_rerank() -> requests.Response:
-                response = requests.post(self.api_url, json=payload, headers=headers, timeout=30)
+                response = requests.post(self.api_url, json=payload, headers=headers, timeout=60)
                 response.raise_for_status()
                 return response
 
@@ -390,18 +392,21 @@ class DeepInfraReranker(AbstractReranker):
                 _post_rerank,
                 max_attempts=self.retry_count + 1,
                 base_delay=float(self.retry_delay),
-                operation_name="DeepInfra rerank API call",
+                operation_name="DeepInfra Qwen3-Reranker API call",
                 logger=logger,
             )
-            results = response.json().get("results", [])
+            data = response.json()
             
-            # Create score array indexed by original position
-            scores = [0.0] * n_docs
-            for res in results:
-                idx = res.get("index")
-                score = res.get("relevance_score", 0.0)
-                if idx is not None and 0 <= idx < n_docs:
-                    scores[idx] = score
+            # DeepInfra returns scores directly in "scores" array
+            scores = data.get("scores", [])
+            
+            if not scores:
+                logger.warning("Empty scores from reranker API")
+                return [0.5] * n_docs
+            
+            # Log token usage for monitoring
+            input_tokens = data.get("input_tokens", 0)
+            logger.info(f"   Reranker API: {input_tokens} input tokens for {len(documents)} documents")
             
             return scores
             

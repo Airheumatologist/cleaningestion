@@ -119,7 +119,7 @@ RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
 # =============================================================================
 # Query Preprocessing Configuration
 # =============================================================================
-QUERY_EXPANSION_COUNT = 2  # Number of expanded query variations (3 total with base query)
+QUERY_EXPANSION_COUNT = int(os.getenv("QUERY_EXPANSION_COUNT", "3"))  # Number of expanded query variations
 # Bulk retrieval limits (adjusted for larger 2048-token chunks)
 BULK_RETRIEVAL_LIMIT = 300  # Reduced from 600 - larger chunks need fewer candidates
 BULK_RETRIEVAL_PER_QUERY = 100  # Reduced from 150 - more efficient with larger chunks
