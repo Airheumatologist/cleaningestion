@@ -233,10 +233,10 @@ def create_payload(article: Dict[str, Any], source_type: str) -> Dict[str, Any]:
         "country": country,
         "table_count": len(tables),
         "has_full_text": content_flags.get("has_full_text") if content_flags else article.get("has_full_text", False),
-        "is_open_access": content_flags.get("is_open_access") if content_flags else article.get("is_open_access", False),
         "source": normalized_source,
         "source_family": "pmc",
         "content_type": "full_text" if normalized_source == SOURCE_PMC_OA else "author_manuscript",
+        "license": article.get("license") or content_flags.get("license", "unknown"),
     }
 
     if normalized_source == SOURCE_PMC_AUTHOR:
@@ -317,6 +317,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
         "nihms_id": article_payload.get("nihms_id"),
         "has_full_text": article_payload["has_full_text"],
         "is_open_access": article_payload["is_open_access"],
+        "license": article_payload.get("license", "unknown"),
     }
     
     # 1. Abstract chunk (most important) - usually fits in single chunk
@@ -635,6 +636,12 @@ def process_batch(
     for xml_path in batch_files:
         try:
             source_type = _detect_source_type(xml_path, xml_root)
+            
+            # Skip author manuscripts entirely (as requested for commercial use safety)
+            if source_type == SOURCE_PMC_AUTHOR:
+                logger.debug("Skipping %s: author_manuscript", xml_path.name)
+                continue
+
             stem_id = _extract_stem_id(xml_path)
             candidate_ids = set()
             if stem_id:
@@ -644,11 +651,13 @@ def process_batch(
             if any(value in processed_ids for value in candidate_ids):
                 continue
 
+            # For PMC OAArticles, enforce strict commercial license filtering
             strict_oa = source_type == SOURCE_PMC_OA
             article = parse_pmc_xml(
                 xml_path,
                 require_pmid=strict_oa,
                 require_open_access=strict_oa,
+                require_commercial_license=strict_oa,
             )
             if not article:
                 continue

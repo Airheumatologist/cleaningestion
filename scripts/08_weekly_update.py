@@ -975,7 +975,7 @@ def run_pmc_refresh() -> None:
     subprocess.run([
         sys.executable, str(scripts_dir / "01_download_pmc_unified.py"),
         "--output-dir", str(IngestionConfig.PMC_XML_DIR),
-        "--datasets", "pmc_oa,author_manuscript",
+        "--datasets", "pmc_oa",
         "--release-mode", "incremental",
     ], check=True, cwd=PROJECT_ROOT)
     # Step 2: ingest — checkpoint skips already-ingested IDs; delete after

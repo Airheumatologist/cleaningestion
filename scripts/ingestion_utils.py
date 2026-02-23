@@ -531,7 +531,12 @@ def classify_evidence_grade(article_type: str, pub_types: List[str]) -> tuple:
     result = classify_evidence_metadata(article_type=article_type, pub_types=pub_types, abstract=None)
     return result["grade"], result["level_1_4"]
 
-def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access: bool = True) -> Optional[Dict[str, Any]]:
+def parse_pmc_xml(
+    xml_path: Path, 
+    require_pmid: bool = True, 
+    require_open_access: bool = True,
+    require_commercial_license: bool = False
+) -> Optional[Dict[str, Any]]:
     """
     Parse PMC XML using lxml with PRD v1.0 compliant extraction.
     
@@ -539,6 +544,7 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
         xml_path: Path to the XML file
         require_pmid: If True, skip articles without PMID (PRD Hard Fail rule)
         require_open_access: If True, skip non-open-access articles
+        require_commercial_license: If True, skip non-commercial licenses (CC-BY-NC, etc.)
     
     Returns:
         Article dict following PRD JSON structure, or None if invalid/skipped.
@@ -616,11 +622,18 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
             body_text = get_text(body_elem).strip()
             has_full_text = len(body_text) > 100
 
-        # Open Access Check (PRD Section 1.3)
+        # Open Access and Commercial License Check (PRD Section 1.3)
         is_open_access = _extract_open_access(article_meta)
+        license_type = _extract_license_type(article_meta)
+        
         if require_open_access and not is_open_access:
             logger.debug(f"Skipping {xml_path}: Not open access")
             return None
+            
+        if require_commercial_license:
+            if not _is_commercial_license(license_type):
+                logger.debug(f"Skipping {xml_path}: Non-commercial license ({license_type})")
+                return None
 
         # === 4. Controlled Vocabulary (PRD Section 1.4) ===
         mesh_terms, keywords = _extract_keywords(article_meta)
@@ -730,6 +743,7 @@ def parse_pmc_xml(xml_path: Path, require_pmid: bool = True, require_open_access
             "publication_type_list": pub_types,
             "is_open_access": is_open_access,
             "has_full_text": has_full_text,
+            "license": license_type,
         }
 
         return output
@@ -1108,6 +1122,76 @@ def _extract_country(root: ET.Element) -> Tuple[str, str]:
     return country_code, country_name
 
 
+
+def _extract_license_type(article_meta: ET.Element) -> str:
+    """
+    Extract and normalize the license type from PMC XML.
+    Returns normalized strings like 'cc-by', 'cc-by-nc', 'cc0', etc.
+    """
+    permissions = article_meta.find("permissions")
+    if permissions is None:
+        return "unknown"
+    
+    for license_elem in permissions.findall("license"):
+        # 1. Check license-type attribute
+        license_type = license_elem.get("license-type", "").lower()
+        if "cc0" in license_type:
+            return "cc0"
+        if "cc-by-nc" in license_type:
+            return "cc-by-nc"
+        if "cc-by-sa" in license_type:
+            return "cc-by-sa"
+        if "cc-by-nd" in license_type:
+            return "cc-by-nd"
+        if "cc-by" in license_type:
+            return "cc-by"
+        if "open-access" in license_type:
+            # Continue to check text/href if it's generic OA
+            pass
+
+        # 2. Check href/xlink:href attribute
+        # Namespaces can be tricky, check plain 'href' and with common prefixes
+        href = ""
+        for attr_key, attr_val in license_elem.attrib.items():
+            if "href" in attr_key.lower():
+                href = attr_val.lower()
+                break
+        
+        if href:
+            if "cc0" in href: return "cc0"
+            if "by-nc" in href: return "cc-by-nc"
+            if "by-sa" in href: return "cc-by-sa"
+            if "by-nd" in href: return "cc-by-nd"
+            if "by" in href: return "cc-by"
+
+        # 3. Fallback: Check license text content
+        license_text = (license_elem.text or "").lower()
+        for elem in license_elem.iter():
+            license_text += (elem.text or "").lower() + (elem.tail or "").lower()
+        
+        if "cc0" in license_text: return "cc0"
+        if "by-nc" in license_text: return "cc-by-nc"
+        if "by-sa" in license_text: return "cc-by-sa"
+        if "by-nd" in license_text: return "cc-by-nd"
+        if "cc by" in license_text or "cc-by" in license_text: return "cc-by"
+        if "public domain" in license_text: return "cc0"
+
+    return "unknown"
+
+
+def _is_commercial_license(license_type: str) -> bool:
+    """Return True if the normalized license type allows commercial use."""
+    # Safe: CC-BY, CC-BY-SA, CC-BY-ND, CC0 (Public Domain)
+    # Unsafe: Anything containing 'nc' (Non-Commercial)
+    if not license_type or license_type == "unknown":
+        return False
+    
+    if "nc" in license_type:
+        return False
+    
+    return license_type in ["cc0", "cc-by", "cc-by-sa", "cc-by-nd", "public_domain"]
+
+
 def _extract_open_access(article_meta: ET.Element) -> bool:
     """
     Extract open access status per PRD Section 1.3.
@@ -1117,6 +1201,10 @@ def _extract_open_access(article_meta: ET.Element) -> bool:
     if permissions is None:
         return False
     
+    # Check for <free-to-read/> tag (often used for gold OA/author manuscripts)
+    if permissions.find("free-to-read") is not None:
+        return True
+
     for license_elem in permissions.findall("license"):
         license_type = license_elem.get("license-type", "").lower()
         
