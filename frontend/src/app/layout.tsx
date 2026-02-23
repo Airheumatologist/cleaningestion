@@ -1,9 +1,14 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Elixir AI | Premium Medical RAG",
-  description: "Advanced medical research assistant grounded in PMC Open Access literature",
+  title: "Elixir AI | Medical Research Assistant",
+  description: "Evidence-based medical research assistant powered by 1.2M+ peer-reviewed articles from PMC, PubMed, and DailyMed.",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
 };
 
 export default function RootLayout({
@@ -13,9 +18,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>
-        {children}
-      </body>
+      <body>{children}</body>
     </html>
   );
 }

@@ -1,10 +1,30 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
-// Types for medical RAG
+/* ───────────────────────── Types ──────────────────────────── */
+
+interface Source {
+  pmcid: string;
+  title: string;
+  journal: string;
+  authors: string[] | { name: string }[];
+  year: number;
+  doi?: string;
+  pdf_url?: string;
+  article_type?: string;
+  dailymed_url?: string;
+  source?: string;
+  evidence_grade?: "A" | "B" | "C" | "D";
+  evidence_level?: 1 | 2 | 3 | 4;
+  evidence_term?: string;
+  evidence_source?: string;
+}
+
 interface EvidenceLevel {
-  grade: 'A' | 'B' | 'C' | 'D';
+  grade: "A" | "B" | "C" | "D";
   level: 1 | 2 | 3 | 4;
   label: string;
   terms: string[];
@@ -14,492 +34,514 @@ interface EvidenceHierarchy {
   levels: EvidenceLevel[];
 }
 
-interface Source {
-  pmcid: string;
-  title: string;
-  journal: string;
-  authors: string[];
-  year: number;
-  doi?: string;
-  pdf_url?: string;
-  article_type?: string;
-  dailymed_url?: string;  // DailyMed drug label URL
-  source?: string;  // 'dailymed' or 'pmc'
-  evidence_grade?: 'A' | 'B' | 'C' | 'D';
-  evidence_level?: 1 | 2 | 3 | 4;
-  evidence_term?: string;
-  evidence_source?: 'article_type' | 'publication_type' | 'abstract' | 'fallback';
-}
-
 interface Message {
-  role: 'user' | 'assistant';
+  role: "user" | "assistant";
   content: string;
   sources?: Source[];
   evidenceHierarchy?: EvidenceHierarchy;
-  steps?: { title: string; status: 'pending' | 'loading' | 'complete' }[];
-  activeTab?: 'answer' | 'drugs' | 'references';
+  steps?: { title: string; status: "pending" | "loading" | "complete" }[];
+  activeTab?: "answer" | "drugs" | "references";
 }
 
-// Citation color palette
+/* ───────────────────────── Constants ─────────────────────── */
+
 const CITATION_COLORS = [
-  '#f97316', // orange
-  '#3b82f6', // blue
-  '#10b981', // green
-  '#8b5cf6', // purple
-  '#f59e0b', // amber
-  '#ec4899', // pink
+  "#f97316", "#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#ec4899",
+  "#06b6d4", "#ef4444",
 ];
 
 const EVIDENCE_COLORS: Record<string, string> = {
-  A: '#16a34a',
-  B: '#2563eb',
-  C: '#d97706',
-  D: '#dc2626',
+  A: "#10b981", B: "#3b82f6", C: "#f59e0b", D: "#ef4444",
 };
+
+const SUGGESTED_QUERIES = [
+  "Best treatments for rheumatoid arthritis?",
+  "SGLT2 inhibitors cardiovascular benefits",
+  "Management of IgG4-related disease",
+  "Neurobrucellosis diagnosis and treatment",
+];
+
+/* ───────────────────────── Helpers ───────────────────────── */
+
+function formatAuthors(
+  authors: (string | { name: string })[] | undefined,
+): string {
+  if (!authors || authors.length === 0) return "Unknown Authors";
+  const strs = authors.map((a) =>
+    typeof a === "string" ? a : a?.name || "Unknown",
+  );
+  if (strs.length === 1) return strs[0];
+  if (strs.length === 2) return `${strs[0]}, ${strs[1]}`;
+  return `${strs[0]}, ${strs[1]}, et al.`;
+}
+
+function getArticleUrl(s: Source): string {
+  if (s.dailymed_url) return s.dailymed_url;
+  if (s.doi) {
+    const clean = s.doi.replace(/^https?:\/\/doi\.org\//, "");
+    return `https://doi.org/${clean}`;
+  }
+  if (s.pmcid && !s.pmcid.toLowerCase().includes("dailymed")) {
+    const id = s.pmcid.toUpperCase().startsWith("PMC")
+      ? s.pmcid
+      : `PMC${s.pmcid}`;
+    return `https://www.ncbi.nlm.nih.gov/pmc/articles/${id}/`;
+  }
+  return "#";
+}
+
+/* ───────────────────── Markdown Renderer ─────────────────── */
+
+/**
+ * Splits markdown content so that `[n]` citation markers become
+ * interleaved with the surrounding text. We then render each
+ * segment: plain text → ReactMarkdown, citation → badge.
+ */
+function MarkdownWithCitations({
+  content,
+  sources,
+  onCitationClick,
+}: {
+  content: string;
+  sources: Source[];
+  onCitationClick: () => void;
+}) {
+  // Split on citation markers like [1], [2], [12] etc.
+  const parts = content.split(/(\[\d+\])/g);
+
+  return (
+    <div className="md-content">
+      {parts.map((part, i) => {
+        const m = part.match(/^\[(\d+)\]$/);
+        if (m) {
+          const num = parseInt(m[1]);
+          const color = CITATION_COLORS[(num - 1) % CITATION_COLORS.length];
+          return (
+            <span
+              key={i}
+              className="citation-badge"
+              style={{ backgroundColor: color }}
+              onClick={onCitationClick}
+              title={sources[num - 1]?.title || `Reference ${num}`}
+            >
+              {num}
+            </span>
+          );
+        }
+        if (!part) return null;
+        return (
+          <ReactMarkdown key={i} remarkPlugins={[remarkGfm]}>
+            {part}
+          </ReactMarkdown>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ════════════════════════ MAIN PAGE ════════════════════════ */
 
 export default function Home() {
   const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [pdfUrl, setPdfUrl] = useState<string | null>(null); // For embedded PDF viewer
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const chatContainerRef = useRef<HTMLDivElement>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
-
+  /* Auto-scroll on new content */
   useEffect(() => {
-    scrollToBottom();
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  /* ── Set active tab for a specific message ── */
+  const setActiveTab = useCallback(
+    (idx: number, tab: "answer" | "drugs" | "references") => {
+      setMessages((prev) => {
+        const next = [...prev];
+        next[idx] = { ...next[idx], activeTab: tab };
+        return next;
+      });
+    },
+    [],
+  );
+
+  /* ── Submit handler (SSE streaming) ── */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    const q = input.trim();
+    if (!q || isLoading) return;
 
-    const userMessage: Message = { role: 'user', content: input };
-    setMessages(prev => [...prev, userMessage]);
-    setInput('');
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: q },
+      {
+        role: "assistant",
+        content: "",
+        steps: [
+          { title: "Analyzing Query", status: "loading" },
+          { title: "Retrieving Articles", status: "pending" },
+          { title: "Reranking Evidence", status: "pending" },
+          { title: "Checking Source PDFs", status: "pending" },
+          { title: "Synthesizing Answer", status: "pending" },
+        ],
+      },
+    ]);
+    setInput("");
     setIsLoading(true);
-    setPdfUrl(null); // Close PDF viewer on new query
-
-    // Add placeholder assistant message with steps
-    const assistantMessage: Message = {
-      role: 'assistant',
-      content: '',
-      steps: [
-        { title: 'Analyzing Query', status: 'loading' },
-        { title: 'Retrieving Articles', status: 'pending' },
-        { title: 'Reranking Evidence', status: 'pending' },
-        { title: 'Checking Source PDFs', status: 'pending' },
-        { title: 'Synthesizing Answer', status: 'pending' }
-      ]
-    };
-    setMessages(prev => [...prev, assistantMessage]);
+    setPdfUrl(null);
 
     try {
-      const response = await fetch('http://localhost:8000/api/chat/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: input, stream: true }),
+      const res = await fetch("http://localhost:8000/api/chat/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q, stream: true }),
       });
+      if (!res.ok) throw new Error("API request failed");
 
-      if (!response.ok) throw new Error('API request failed');
-
-      const reader = response.body?.getReader();
+      const reader = res.body?.getReader();
       const decoder = new TextDecoder();
+      let answer = "";
+      let sources: Source[] = [];
+      let hierarchy: EvidenceHierarchy | undefined;
+      let buf = "";
 
-      let currentAnswer = '';
-      let currentSources: Source[] = [];
-      let currentEvidenceHierarchy: EvidenceHierarchy | undefined = undefined;
-      let buffer = '';
+      const updateMsg = (fn: (m: Message) => Message) =>
+        setMessages((prev) => {
+          const n = [...prev];
+          n[n.length - 1] = fn(n[n.length - 1]);
+          return n;
+        });
+
+      // Mark step i as loading, all before it as complete
+      const activateStep = (i: number) =>
+        updateMsg((m) => ({
+          ...m,
+          steps: m.steps?.map((s, si) => ({
+            ...s,
+            status: si < i ? "complete" : si === i ? "loading" : s.status,
+          })),
+        }));
+
+      // Mark steps 0..upTo as complete
+      const completeUpTo = (upTo: number) =>
+        updateMsg((m) => ({
+          ...m,
+          steps: m.steps?.map((s, si) => ({
+            ...s,
+            status: si <= upTo ? "complete" : s.status,
+          })),
+        }));
 
       while (true) {
-        const { done, value } = await reader?.read() || { done: true, value: undefined };
+        const { done, value } = (await reader?.read()) || {
+          done: true,
+          value: undefined,
+        };
         if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6).trim();
-            if (dataStr === '[DONE]') break;
-            if (!dataStr) continue;
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice(6).trim();
+          if (raw === "[DONE]") break;
+          if (!raw) continue;
+          try {
+            const d = JSON.parse(raw);
+            if (d.evidence_hierarchy?.levels) hierarchy = d.evidence_hierarchy;
 
-            try {
-              const data = JSON.parse(dataStr);
-              if (data.evidence_hierarchy?.levels) {
-                currentEvidenceHierarchy = data.evidence_hierarchy;
-              }
+            // ── Step 0: Query Analysis ──
+            if (d.step === "query_expansion" && d.status === "running") {
+              activateStep(0);
+            } else if (d.step === "query_expansion" && d.status === "complete") {
+              completeUpTo(0);
 
-              if (data.step === 'query_expansion' && data.status === 'running') {
-                setMessages(prev => {
-                  const newMessages = [...prev];
-                  const lastIdx = newMessages.length - 1;
-                  if (newMessages[lastIdx]?.steps) {
-                    newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                      i === 0 ? { ...s, status: 'loading' } : s
-                    );
-                  }
-                  return newMessages;
-                });
-              } else if (data.step === 'retrieval' && data.status === 'running') {
-                setMessages(prev => {
-                  const newMessages = [...prev];
-                  const lastIdx = newMessages.length - 1;
-                  if (newMessages[lastIdx]?.steps) {
-                    newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                      i <= 1 ? { ...s, status: i === 1 ? 'loading' : 'complete' } : s
-                    );
-                  }
-                  return newMessages;
-                });
-              } else if (data.step === 'reranking' && data.status === 'complete') {
-                if (data.sources) {
-                  currentSources = data.sources;
-                }
-                setMessages(prev => {
-                  const newMessages = [...prev];
-                  const lastIdx = newMessages.length - 1;
-                    if (newMessages[lastIdx]?.steps) {
-                      newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                        i <= 2 ? { ...s, status: i === 2 ? 'complete' : s.status } : s
-                      );
-                      newMessages[lastIdx].sources = currentSources;
-                      if (currentEvidenceHierarchy) newMessages[lastIdx].evidenceHierarchy = currentEvidenceHierarchy;
-                    }
-                    return newMessages;
-                  });
-              } else if (data.step === 'generation' && data.status === 'running') {
-                if (data.token) {
-                  currentAnswer += data.token;
-                  setMessages(prev => {
-                    const newMessages = [...prev];
-                    const lastIdx = newMessages.length - 1;
-                    newMessages[lastIdx] = {
-                      ...newMessages[lastIdx],
-                      content: currentAnswer,
-                      steps: newMessages[lastIdx].steps?.map((s, i) =>
-                        i <= 4 ? { ...s, status: i === 4 ? 'loading' : 'complete' } : s
-                      )
-                    };
-                    return newMessages;
-                  });
-                } else {
-                  setMessages(prev => {
-                    const newMessages = [...prev];
-                    const lastIdx = newMessages.length - 1;
-                    if (newMessages[lastIdx]?.steps) {
-                      newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                        i <= 4 ? { ...s, status: i === 4 ? 'loading' : 'complete' } : s
-                      );
-                    }
-                    return newMessages;
-                  });
-                }
-              } else if (data.step === 'pdf_check' && data.status === 'running') {
-                setMessages(prev => {
-                  const newMessages = [...prev];
-                  const lastIdx = newMessages.length - 1;
-                  if (newMessages[lastIdx]?.steps) {
-                    newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                      i <= 3 ? { ...s, status: i === 3 ? 'loading' : 'complete' } : s
-                    );
-                  }
-                  return newMessages;
-                });
-              } else if (data.step === 'pdf_check' && data.status === 'complete') {
-                if (data.sources) {
-                  currentSources = data.sources;
-                }
-                setMessages(prev => {
-                  const newMessages = [...prev];
-                  const lastIdx = newMessages.length - 1;
-                    if (newMessages[lastIdx]?.steps) {
-                      newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                        i === 3 ? { ...s, status: 'complete' } : s
-                      );
-                      newMessages[lastIdx].sources = currentSources;
-                      if (currentEvidenceHierarchy) newMessages[lastIdx].evidenceHierarchy = currentEvidenceHierarchy;
-                    }
-                    return newMessages;
-                  });
-              } else if (data.step === 'generation' && data.status === 'complete') {
-                setMessages(prev => {
-                  const newMessages = [...prev];
-                  const lastIdx = newMessages.length - 1;
-                  if (newMessages[lastIdx]?.steps) {
-                    newMessages[lastIdx].steps = newMessages[lastIdx].steps?.map((s, i) =>
-                      i === 4 ? { ...s, status: 'complete' } : s
-                    );
-                  }
-                  return newMessages;
-                });
-              } else if (data.step === 'complete') {
-                currentAnswer = data.answer || currentAnswer;
-                if (data.sources && data.sources.length > 0) {
-                  currentSources = data.sources;
-                }
+              // ── Step 1: Retrieval ──
+            } else if (d.step === "retrieval" && d.status === "running") {
+              activateStep(1);
+            } else if (d.step === "retrieval" && d.status === "complete") {
+              completeUpTo(1);
 
-                setMessages(prev => {
-                  const newMessages = [...prev];
-                  const lastIdx = newMessages.length - 1;
-                  newMessages[lastIdx] = {
-                    ...newMessages[lastIdx],
-                    content: currentAnswer,
-                    sources: currentSources,
-                    evidenceHierarchy: currentEvidenceHierarchy || newMessages[lastIdx].evidenceHierarchy,
-                    steps: newMessages[lastIdx].steps?.map(s => ({ ...s, status: 'complete' }))
-                  };
-                  return newMessages;
-                });
+              // ── Step 2: Reranking ──
+            } else if (d.step === "reranking" && d.status === "running") {
+              activateStep(2);
+            } else if (d.step === "reranking" && d.status === "complete") {
+              if (d.sources?.length) sources = d.sources;
+              if (d.evidence_hierarchy?.levels) hierarchy = d.evidence_hierarchy;
+              updateMsg((m) => ({
+                ...m,
+                sources,
+                evidenceHierarchy: hierarchy,
+                steps: m.steps?.map((s, si) => ({
+                  ...s,
+                  status: si <= 2 ? "complete" : s.status,
+                })),
+              }));
+
+              // ── Step 3: PDF Check (runs in parallel with generation) ──
+            } else if (d.step === "pdf_check" && d.status === "running") {
+              activateStep(3);
+            } else if (d.step === "pdf_check" && d.status === "complete") {
+              if (d.sources?.length) sources = d.sources;
+              if (d.evidence_hierarchy?.levels) hierarchy = d.evidence_hierarchy;
+              updateMsg((m) => ({
+                ...m,
+                sources,
+                evidenceHierarchy: hierarchy,
+                steps: m.steps?.map((s, si) => ({
+                  ...s,
+                  status: si <= 3 ? "complete" : s.status,
+                })),
+              }));
+
+              // ── Step 4: Generation (streaming tokens) ──
+            } else if (d.step === "generation" && d.status === "running") {
+              if (d.token) {
+                answer += d.token;
+                updateMsg((m) => ({
+                  ...m,
+                  content: answer,
+                  steps: m.steps?.map((s, si) => ({
+                    ...s,
+                    status: si <= 3 ? "complete" : si === 4 ? "loading" : s.status,
+                  })),
+                }));
+              } else {
+                // generation started but no token yet
+                activateStep(4);
               }
-            } catch (e) {
-              if (dataStr.length > 10) {
-                console.warn('SSE parse warning:', dataStr.substring(0, 100) + '...');
-              }
+            } else if (d.step === "generation" && d.status === "complete") {
+              completeUpTo(4);
+
+              // ── Final complete event ──
+            } else if (d.step === "complete") {
+              if (d.answer) answer = d.answer;
+              if (d.sources?.length) sources = d.sources;
+              if (d.evidence_hierarchy?.levels) hierarchy = d.evidence_hierarchy;
+              updateMsg((m) => ({
+                ...m,
+                content: answer,
+                sources,
+                evidenceHierarchy: hierarchy || m.evidenceHierarchy,
+                steps: m.steps?.map((s) => ({ ...s, status: "complete" as const })),
+              }));
             }
+          } catch {
+            /* skip bad SSE lines */
           }
         }
       }
-    } catch (error) {
-      console.error('Chat error:', error);
-      setMessages(prev => {
-        const newMessages = [...prev];
-        const lastIdx = newMessages.length - 1;
-        newMessages[lastIdx].content = 'Error: Failed to get response from medical assistant.';
-        return newMessages;
+    } catch (err) {
+      console.error("Chat error:", err);
+      setMessages((prev) => {
+        const n = [...prev];
+        n[n.length - 1].content =
+          "⚠️ Failed to get a response. Make sure the backend is running on port 8000.";
+        return n;
       });
     } finally {
       setIsLoading(false);
     }
   };
 
-  // Format authors for display - handles both string[] and {name: string}[]
-  const formatAuthors = (authors: (string | { name: string })[]): string => {
-    if (!authors || authors.length === 0) return 'Unknown Authors';
-
-    // Normalize authors to strings
-    const authorStrings = authors.map(a => typeof a === 'string' ? a : a?.name || 'Unknown');
-
-    if (authorStrings.length === 1) return authorStrings[0];
-    if (authorStrings.length === 2) return `${authorStrings[0]}, ${authorStrings[1]}`;
-    return `${authorStrings[0]}, ${authorStrings[1]}, et al.`;
-  };
-
-
-  // Get article type badge color
-  const getTypeBadgeColor = (type: string): string => {
-    switch (type?.toLowerCase()) {
-      case 'practice guideline':
-      case 'guideline':
-        return '#10b981'; // green
-      case 'systematic_review':
-      case 'meta_analysis':
-        return '#8b5cf6'; // purple
-      case 'clinical_trial':
-        return '#f59e0b'; // amber
-      case 'review_article':
-        return '#3b82f6'; // blue
-      default:
-        return '#64748b'; // gray
-    }
-  };
-
-  // Get the latest assistant message with sources
-  const lastAssistantMessage = [...messages].reverse().find(m => m.role === 'assistant' && m.sources && m.sources.length > 0);
+  /* ═══════════════════════ RENDER ═══════════════════════════ */
 
   return (
-    <div className="app-container" style={{ display: 'flex', height: '100vh' }}>
-      {/* Sidebar */}
-      <aside className="sidebar" style={{ width: '200px', flexShrink: 0 }}>
-        <h2 className="title-gradient" style={{ marginBottom: '2rem', fontSize: '1.5rem' }}>Elixir AI</h2>
-        <nav style={{ flex: 1 }}>
-          <div style={{ color: 'var(--secondary)', fontSize: '0.8rem', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '1rem' }}>
-            History
-          </div>
-          <div style={{ fontSize: '0.9rem', color: '#64748b' }}>No recent searches</div>
-        </nav>
-        <div style={{ padding: '1rem', borderTop: '1px solid var(--border)', fontSize: '0.8rem', color: 'var(--secondary)' }}>
-          Grounded in 1.2M+ PMC Articles
+    <div className="app-container">
+      {/* ── Sidebar ── */}
+      <aside className="sidebar">
+        <div className="sidebar-logo">Elixir AI</div>
+        <div className="sidebar-subtitle">Medical Research</div>
+
+        <div className="sidebar-section-title">Suggested</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+          {SUGGESTED_QUERIES.map((q, i) => (
+            <button
+              key={i}
+              className="suggestion-chip"
+              style={{ textAlign: "left", fontSize: "0.78rem" }}
+              onClick={() => {
+                setInput(q);
+              }}
+            >
+              {q}
+            </button>
+          ))}
+        </div>
+
+        <div className="sidebar-footer">
+          Grounded in 1.2M+ peer-reviewed articles from PMC, PubMed &amp; DailyMed
         </div>
       </aside>
 
-      {/* Main Content Area - Flex container for chat and PDF */}
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        {/* Chat Main - Adjusts width based on PDF viewer */}
-        <main className="chat-main" style={{ flex: pdfUrl ? '0 0 50%' : '1', display: 'flex', flexDirection: 'column', overflow: 'hidden', transition: 'flex 0.3s ease' }}>
-          {/* Scrollable chat area */}
-          <div
-            ref={chatContainerRef}
-            style={{ flex: 1, overflowY: 'auto', padding: '2rem' }}
-          >
-            <div style={{ maxWidth: '800px', margin: '0 auto' }}>
+      {/* ── Main content area ── */}
+      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+        <main
+          className="chat-main"
+          style={{
+            flex: pdfUrl ? "0 0 50%" : "1",
+            transition: "flex 0.3s ease",
+          }}
+        >
+          {/* Scrollable chat */}
+          <div className="chat-scroll">
+            <div className="chat-inner">
               {messages.length === 0 ? (
-                <div style={{ marginTop: '20vh', textAlign: 'center' }}>
-                  <h1 style={{ fontSize: '2.5rem', marginBottom: '1rem' }} className="title-gradient">How can I assist your research today?</h1>
-                  <p style={{ color: 'var(--secondary)', fontSize: '1.1rem' }}>Ask complex medical questions backed by peer-reviewed evidence.</p>
+                <div className="empty-state">
+                  <h1>How can I assist your research?</h1>
+                  <p>
+                    Ask complex medical questions backed by peer-reviewed
+                    evidence from PMC, PubMed, and DailyMed.
+                  </p>
+                  <div className="suggestions">
+                    {SUGGESTED_QUERIES.map((q, i) => (
+                      <button
+                        key={i}
+                        className="suggestion-chip"
+                        onClick={() => setInput(q)}
+                      >
+                        {q}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               ) : (
                 messages.map((msg, idx) => {
-                  // Separate DailyMed sources from PMC sources
-                  // STRICT: Only sources with source='dailymed' or pmcid starting with 'dailymed_' 
-                  // are actual DailyMed drug labels
-                  const drugSources = msg.sources?.filter(s =>
-                    s.source === 'dailymed' || s.pmcid?.startsWith('dailymed_')
-                  ) || [];
+                  const drugSources =
+                    msg.sources?.filter(
+                      (s) =>
+                        s.source === "dailymed" ||
+                        s.pmcid?.startsWith("dailymed_"),
+                    ) || [];
                   const allSources = msg.sources || [];
-                  const evidenceHierarchy = msg.evidenceHierarchy;
-
-                  // Get current active tab for this message (default to 'answer')
-                  const activeTab = msg.activeTab || 'answer';
-
-                  // Helper to set active tab for this message
-                  const setActiveTab = (tab: 'answer' | 'drugs' | 'references') => {
-                    setMessages(prev => {
-                      const newMessages = [...prev];
-                      newMessages[idx] = { ...newMessages[idx], activeTab: tab };
-                      return newMessages;
-                    });
-                  };
-
-                  // Helper to get article URL
-                  const getArticleUrl = (source: Source) => {
-                    if (source.dailymed_url) return source.dailymed_url;
-                    if (source.doi) {
-                      const cleanDoi = source.doi.replace(/^https?:\/\/doi\.org\//, '');
-                      return `https://doi.org/${cleanDoi}`;
-                    }
-                    if (source.pmcid && !source.pmcid.toLowerCase().includes('dailymed')) {
-                      const pmcid = source.pmcid.toUpperCase().startsWith('PMC') ? source.pmcid : `PMC${source.pmcid}`;
-                      return `https://www.ncbi.nlm.nih.gov/pmc/articles/${pmcid}/`;
-                    }
-                    return '#';
-                  };
-
-                  // Render content with colorful citation badges
-                  const renderWithCitations = (content: string) => {
-                    const parts = content.split(/(\[\d+\])/g);
-                    return parts.map((part, i) => {
-                      const match = part.match(/\[(\d+)\]/);
-                      if (match) {
-                        const num = parseInt(match[1]);
-                        const color = CITATION_COLORS[(num - 1) % CITATION_COLORS.length];
-                        return (
-                          <span
-                            key={i}
-                            className="citation-badge"
-                            style={{ backgroundColor: color }}
-                            onClick={() => setActiveTab('references')}
-                            title={allSources[num - 1]?.title || `Reference ${num}`}
-                          >
-                            {num}
-                          </span>
-                        );
-                      }
-                      return part;
-                    });
-                  };
+                  const hierarchy = msg.evidenceHierarchy;
+                  const tab = msg.activeTab || "answer";
 
                   return (
-                    <div key={idx} style={{ marginBottom: '2rem', animation: 'fadeIn 0.3s ease-in-out' }}>
-                      <div style={{ fontWeight: 600, color: msg.role === 'user' ? '#1e293b' : 'var(--primary)', marginBottom: '0.5rem' }}>
-                        {msg.role === 'user' ? 'You' : 'Medical Assistant'}
+                    <div key={idx} className="msg-block">
+                      <div
+                        className={`msg-role ${msg.role === "user"
+                          ? "msg-role-user"
+                          : "msg-role-assistant"
+                          }`}
+                      >
+                        {msg.role === "user" ? "You" : "Elixir AI"}
                       </div>
 
-                      {/* User message - simple display */}
-                      {msg.role === 'user' && (
-                        <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
+                      {/* ── User message ── */}
+                      {msg.role === "user" && (
+                        <div className="msg-user-content">{msg.content}</div>
                       )}
 
-                      {/* Assistant message - tabbed display */}
-                      {msg.role === 'assistant' && (
-                        <div className="glass" style={{ padding: '1.5rem', borderRadius: '1rem' }}>
-
-                          {/* Tab Navigation - Only show when there's content or sources */}
+                      {/* ── Assistant message ── */}
+                      {msg.role === "assistant" && (
+                        <div className="msg-assistant-card">
+                          {/* Tabs */}
                           {(msg.content || allSources.length > 0) && (
                             <div className="tab-bar">
                               <button
-                                className={activeTab === 'answer' ? 'active' : ''}
-                                onClick={() => setActiveTab('answer')}
+                                className={tab === "answer" ? "active" : ""}
+                                onClick={() => setActiveTab(idx, "answer")}
                               >
                                 ○ Answer
                               </button>
                               {drugSources.length > 0 && (
                                 <button
-                                  className={activeTab === 'drugs' ? 'active' : ''}
-                                  onClick={() => setActiveTab('drugs')}
+                                  className={tab === "drugs" ? "active" : ""}
+                                  onClick={() => setActiveTab(idx, "drugs")}
                                 >
-                                  💊 Drug Information
-                                  <span className="tab-count">{drugSources.length}</span>
+                                  💊 Drugs
+                                  <span className="tab-count">
+                                    {drugSources.length}
+                                  </span>
                                 </button>
                               )}
                               {allSources.length > 0 && (
                                 <button
-                                  className={activeTab === 'references' ? 'active' : ''}
-                                  onClick={() => setActiveTab('references')}
+                                  className={
+                                    tab === "references" ? "active" : ""
+                                  }
+                                  onClick={() =>
+                                    setActiveTab(idx, "references")
+                                  }
                                 >
                                   📄 References
-                                  <span className="tab-count">{allSources.length}</span>
+                                  <span className="tab-count">
+                                    {allSources.length}
+                                  </span>
                                 </button>
                               )}
                             </div>
                           )}
 
-                          {/* ANSWER TAB */}
-                          {activeTab === 'answer' && (
-                            <div>
-                              {/* Steps indicator - show before content */}
+                          {/* ── ANSWER TAB ── */}
+                          {tab === "answer" && (
+                            <>
+                              {/* Steps indicator */}
                               {msg.steps && !msg.content && (
-                                <div style={{ display: 'grid', gap: '0.75rem' }}>
-                                  {msg.steps.map((step, sIdx) => (
-                                    <div key={sIdx} style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', color: step.status === 'pending' ? '#94a3b8' : '#1e293b' }}>
-                                      <div style={{
-                                        width: '18px', height: '18px', borderRadius: '50%',
-                                        border: `2px solid ${step.status === 'loading' ? 'var(--primary)' : step.status === 'complete' ? 'var(--medical-teal)' : '#e2e8f0'}`,
-                                        display: 'flex', alignItems: 'center', justifyContent: 'center'
-                                      }}>
-                                        {step.status === 'loading' && <div className="spinner" style={{ width: '8px', height: '8px', border: '2px solid var(--primary)', borderRightColor: 'transparent', borderRadius: '50%', animation: 'spin 1s linear infinite' }} />}
-                                        {step.status === 'complete' && <div style={{ width: '8px', height: '8px', backgroundColor: 'var(--medical-teal)', borderRadius: '50%' }} />}
+                                <div className="steps-grid">
+                                  {msg.steps.map((step, si) => (
+                                    <div
+                                      key={si}
+                                      className={`step-item ${step.status}`}
+                                    >
+                                      <div
+                                        className={`step-dot ${step.status}`}
+                                      >
+                                        {step.status === "loading" && (
+                                          <div className="spinner" />
+                                        )}
+                                        {step.status === "complete" && (
+                                          <div className="complete-dot" />
+                                        )}
                                       </div>
-                                      <span style={{ fontSize: '0.9rem' }}>{step.title}</span>
+                                      <span>{step.title}</span>
                                     </div>
                                   ))}
                                 </div>
                               )}
 
-                              {/* LLM Response with citations */}
+                              {/* Rendered markdown */}
                               {msg.content && (
-                                <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>
-                                  {renderWithCitations(msg.content)}
-                                </div>
+                                <MarkdownWithCitations
+                                  content={msg.content}
+                                  sources={allSources}
+                                  onCitationClick={() =>
+                                    setActiveTab(idx, "references")
+                                  }
+                                />
                               )}
-                            </div>
+                            </>
                           )}
 
-                          {/* DRUG INFORMATION TAB */}
-                          {activeTab === 'drugs' && drugSources.length > 0 && (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                              {drugSources.map((source, sIdx) => (
-                                <div key={sIdx} className="drug-info-card">
-                                  <h3>💊 {source.title}</h3>
-                                  <div style={{ fontSize: '0.85rem', color: '#475569', marginBottom: '0.5rem' }}>
-                                    {formatAuthors(source.authors)}
+                          {/* ── DRUGS TAB ── */}
+                          {tab === "drugs" && drugSources.length > 0 && (
+                            <div
+                              style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: "0.75rem",
+                              }}
+                            >
+                              {drugSources.map((s, si) => (
+                                <div key={si} className="drug-card">
+                                  <h3>💊 {s.title}</h3>
+                                  <div
+                                    style={{
+                                      fontSize: "0.8rem",
+                                      color: "var(--text-secondary)",
+                                      marginBottom: "0.35rem",
+                                    }}
+                                  >
+                                    {formatAuthors(s.authors)}
                                   </div>
                                   <a
-                                    href={source.dailymed_url || getArticleUrl(source)}
+                                    href={
+                                      s.dailymed_url || getArticleUrl(s)
+                                    }
                                     target="_blank"
                                     rel="noreferrer"
-                                    style={{
-                                      display: 'inline-flex',
-                                      alignItems: 'center',
-                                      gap: '0.35rem',
-                                      color: '#166534',
-                                      fontSize: '0.85rem',
-                                      fontWeight: 500
-                                    }}
                                   >
                                     📋 View on DailyMed →
                                   </a>
@@ -508,30 +550,35 @@ export default function Home() {
                             </div>
                           )}
 
-                          {/* REFERENCES TAB */}
-                          {activeTab === 'references' && allSources.length > 0 && (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-                              {evidenceHierarchy?.levels?.length ? (
-                                <div style={{ padding: '0.75rem', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }}>
-                                  <div style={{ fontSize: '0.8rem', color: '#475569', marginBottom: '0.5rem', fontWeight: 600 }}>
+                          {/* ── REFERENCES TAB ── */}
+                          {tab === "references" && allSources.length > 0 && (
+                            <div
+                              style={{
+                                display: "flex",
+                                flexDirection: "column",
+                                gap: "1rem",
+                              }}
+                            >
+                              {/* Evidence hierarchy */}
+                              {hierarchy?.levels?.length ? (
+                                <div className="evidence-hierarchy-box">
+                                  <div className="evidence-hierarchy-label">
                                     Evidence Hierarchy
                                   </div>
-                                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
-                                    {evidenceHierarchy.levels.map((lvl) => (
+                                  <div className="evidence-pills">
+                                    {hierarchy.levels.map((lvl) => (
                                       <span
                                         key={lvl.grade}
+                                        className="evidence-badge"
                                         style={{
-                                          display: 'inline-flex',
-                                          alignItems: 'center',
-                                          gap: '0.35rem',
-                                          fontSize: '0.75rem',
-                                          border: `1px solid ${EVIDENCE_COLORS[lvl.grade] || '#64748b'}`,
-                                          color: EVIDENCE_COLORS[lvl.grade] || '#64748b',
-                                          borderRadius: '999px',
-                                          padding: '0.2rem 0.55rem',
-                                          background: 'white'
+                                          color:
+                                            EVIDENCE_COLORS[lvl.grade] ||
+                                            "#64748b",
+                                          borderColor:
+                                            EVIDENCE_COLORS[lvl.grade] ||
+                                            "#64748b",
                                         }}
-                                        title={lvl.terms.join(', ')}
+                                        title={lvl.terms.join(", ")}
                                       >
                                         {lvl.grade} · L{lvl.level}
                                       </span>
@@ -540,122 +587,103 @@ export default function Home() {
                                 </div>
                               ) : null}
 
-                              {allSources.map((source, sIdx) => (
-                                <div key={sIdx} style={{ display: 'flex', gap: '1rem', position: 'relative' }}>
-                                  {/* Number badge */}
-                                  <div style={{
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'center',
-                                    width: '24px',
-                                    height: '24px',
-                                    borderRadius: '0.25rem',
-                                    backgroundColor: CITATION_COLORS[sIdx % CITATION_COLORS.length],
-                                    color: 'white',
-                                    fontSize: '0.75rem',
-                                    fontWeight: 600,
-                                    flexShrink: 0
-                                  }}>
-                                    {sIdx + 1}
+                              {/* Source cards */}
+                              {allSources.map((s, si) => (
+                                <div key={si} className="ref-card">
+                                  <div
+                                    className="ref-number"
+                                    style={{
+                                      backgroundColor:
+                                        CITATION_COLORS[
+                                        si % CITATION_COLORS.length
+                                        ],
+                                    }}
+                                  >
+                                    {si + 1}
                                   </div>
-
-                                  {/* Content */}
-                                  <div style={{ flex: 1 }}>
-                                    {/* Title */}
+                                  <div style={{ flex: 1, minWidth: 0 }}>
                                     <a
-                                      href={getArticleUrl(source)}
+                                      href={getArticleUrl(s)}
                                       target="_blank"
                                       rel="noreferrer"
+                                      className="ref-title"
                                       style={{
-                                        color: CITATION_COLORS[sIdx % CITATION_COLORS.length],
-                                        textDecoration: 'none',
-                                        fontWeight: 600,
-                                        fontSize: '0.95rem',
-                                        lineHeight: '1.4',
-                                        display: 'inline-block',
-                                        marginBottom: '0.25rem'
+                                        color:
+                                          CITATION_COLORS[
+                                          si % CITATION_COLORS.length
+                                          ],
                                       }}
                                     >
-                                      {source.title}
+                                      {s.title}
                                     </a>
-
-                                    {/* Authors */}
-                                    <div style={{ color: '#475569', fontSize: '0.85rem', marginBottom: '0.15rem' }}>
-                                      {formatAuthors(source.authors)}
+                                    <div className="ref-authors">
+                                      {formatAuthors(s.authors)}
                                     </div>
-
-                                    {/* Journal and DOI */}
-                                    <div style={{ color: '#64748b', fontSize: '0.85rem', lineHeight: '1.4' }}>
-                                      {source.journal && (
-                                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
-                                          {source.journal.toLowerCase().includes('cochrane') && <span>🌐</span>}
-                                          {source.journal}.
-                                        </span>
+                                    <div className="ref-meta">
+                                      {s.journal && (
+                                        <span>{s.journal}. </span>
                                       )}
-                                      {source.year && <span> {source.year}; </span>}
-                                      {source.doi && (
+                                      {s.year && <span>{s.year}; </span>}
+                                      {s.doi && (
                                         <a
-                                          href={`https://doi.org/${source.doi.replace(/^https?:\/\/doi\.org\//, '')}`}
+                                          href={`https://doi.org/${s.doi.replace(/^https?:\/\/doi\.org\//, "")}`}
                                           target="_blank"
                                           rel="noreferrer"
-                                          style={{ color: '#64748b', textDecoration: 'none' }}
                                         >
-                                          doi:{source.doi}
+                                          doi:{s.doi}
                                         </a>
                                       )}
                                     </div>
 
-                                    {/* Badge row */}
-                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginTop: '0.5rem' }}>
-                                      {source.evidence_grade && (
+                                    <div className="ref-badges">
+                                      {s.evidence_grade && (
                                         <span
+                                          className="evidence-badge"
                                           style={{
-                                            display: 'inline-flex',
-                                            alignItems: 'center',
-                                            gap: '0.35rem',
-                                            color: EVIDENCE_COLORS[source.evidence_grade] || '#64748b',
-                                            border: `1px solid ${EVIDENCE_COLORS[source.evidence_grade] || '#64748b'}`,
-                                            borderRadius: '999px',
-                                            padding: '0.15rem 0.5rem',
-                                            fontSize: '0.75rem',
-                                            fontWeight: 600,
-                                            background: 'white'
+                                            color:
+                                              EVIDENCE_COLORS[
+                                              s.evidence_grade
+                                              ] || "#64748b",
+                                            borderColor:
+                                              EVIDENCE_COLORS[
+                                              s.evidence_grade
+                                              ] || "#64748b",
                                           }}
-                                          title={source.evidence_source ? `Matched from ${source.evidence_source}` : 'Evidence grade'}
+                                          title={
+                                            s.evidence_source
+                                              ? `From ${s.evidence_source}`
+                                              : "Evidence grade"
+                                          }
                                         >
-                                          {source.evidence_grade}
-                                          {source.evidence_level ? ` · L${source.evidence_level}` : ''}
+                                          {s.evidence_grade}
+                                          {s.evidence_level
+                                            ? ` · L${s.evidence_level}`
+                                            : ""}
                                         </span>
                                       )}
-
-                                      {source.evidence_term && (
-                                        <span style={{
-                                          display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
-                                          color: '#475569',
-                                          fontSize: '0.78rem',
-                                          fontWeight: 500
-                                        }}>
-                                          🧪 {source.evidence_term}
+                                      {s.evidence_term && (
+                                        <span className="badge-article-type">
+                                          🧪 {s.evidence_term}
                                         </span>
                                       )}
-
-                                      {source.article_type && (
-                                        <span style={{
-                                          display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
-                                          color: '#64748b',
-                                          fontSize: '0.8rem',
-                                          fontWeight: 500
-                                        }}>
-                                          📋 {source.article_type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}
+                                      {s.article_type && (
+                                        <span className="badge-article-type">
+                                          📋{" "}
+                                          {s.article_type
+                                            .replace(/_/g, " ")
+                                            .replace(/\b\w/g, (c) =>
+                                              c.toUpperCase(),
+                                            )}
                                         </span>
                                       )}
-
-                                      {source.pdf_url && (
+                                      {s.pdf_url && (
                                         <button
-                                          onClick={() => setPdfUrl(source.pdf_url!)}
                                           className="pdf-badge"
+                                          onClick={() =>
+                                            setPdfUrl(s.pdf_url!)
+                                          }
                                         >
-                                          📕 PDF Available
+                                          📕 PDF
                                         </button>
                                       )}
                                     </div>
@@ -674,142 +702,60 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Input Area */}
-          <div style={{ padding: '1.5rem 2rem', borderTop: '1px solid var(--border)', background: 'rgba(255,255,255,0.8)', flexShrink: 0 }}>
-            <form onSubmit={handleSubmit} style={{ maxWidth: '800px', margin: '0 auto', position: 'relative' }}>
-
-
+          {/* ── Input ── */}
+          <div className="input-area">
+            <form onSubmit={handleSubmit} className="input-form">
               <input
                 type="text"
+                className="input-field"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
-                placeholder="Query medical literature..."
-                style={{
-                  width: '100%',
-                  padding: '1.25rem 4rem 1.25rem 1.5rem',
-                  borderRadius: '1rem',
-                  border: '1px solid var(--border)',
-                  outline: 'none',
-                  fontSize: '1rem',
-                  boxShadow: 'var(--soft-shadow)'
-                }}
-                className="glass"
+                placeholder="Ask a medical research question…"
               />
               <button
                 type="submit"
                 disabled={isLoading || !input.trim()}
-                style={{
-                  position: 'absolute',
-                  right: '0.75rem',
-                  top: '50%',
-                  transform: 'translateY(-50%)',
-                  padding: '0.6rem 1.25rem',
-                  backgroundColor: 'var(--primary)',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '0.75rem',
-                  cursor: 'pointer',
-                  opacity: (isLoading || !input.trim()) ? 0.5 : 1
-                }}
+                className="submit-btn"
               >
-                Ask
+                {isLoading ? "…" : "Ask"}
               </button>
             </form>
-            <div style={{ textAlign: 'center', marginTop: '0.75rem', fontSize: '0.75rem', color: 'var(--secondary)' }}>
-              Medical AI can make mistakes. Verify critical information with original sources.
+            <div className="input-disclaimer">
+              Elixir AI can make mistakes. Always verify with original sources.
             </div>
           </div>
         </main>
 
-        {/* PDF Viewer Panel */}
+        {/* ── PDF Viewer ── */}
         {pdfUrl && (
-          <div style={{
-            flex: '0 0 50%',
-            borderLeft: '1px solid var(--border)',
-            display: 'flex',
-            flexDirection: 'column',
-            backgroundColor: '#f8fafc'
-          }}>
-            {/* PDF Header */}
-            <div style={{
-              padding: '0.75rem 1rem',
-              borderBottom: '1px solid var(--border)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              backgroundColor: 'white'
-            }}>
-              <span style={{ fontWeight: 600, fontSize: '0.9rem' }}>📄 PDF Viewer</span>
-              <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <div className="pdf-panel">
+            <div className="pdf-header">
+              <span>📄 PDF Viewer</span>
+              <div className="pdf-actions">
                 <a
                   href={pdfUrl}
                   target="_blank"
                   rel="noreferrer"
-                  style={{
-                    padding: '0.35rem 0.75rem',
-                    fontSize: '0.8rem',
-                    backgroundColor: '#3b82f6',
-                    color: 'white',
-                    borderRadius: '0.375rem',
-                    textDecoration: 'none'
-                  }}
+                  className="pdf-open-btn"
                 >
-                  Open in New Tab
+                  Open in Tab
                 </a>
                 <button
+                  className="pdf-close-btn"
                   onClick={() => setPdfUrl(null)}
-                  style={{
-                    padding: '0.35rem 0.75rem',
-                    fontSize: '0.8rem',
-                    backgroundColor: '#ef4444',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '0.375rem',
-                    cursor: 'pointer'
-                  }}
                 >
                   ✕ Close
                 </button>
               </div>
             </div>
-
-            {/* PDF Embed */}
             <iframe
               src={pdfUrl}
-              style={{
-                flex: 1,
-                width: '100%',
-                border: 'none'
-              }}
+              style={{ flex: 1, width: "100%", border: "none" }}
               title="PDF Viewer"
             />
           </div>
         )}
       </div>
-
-      <style jsx global>{`
-        @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(10px); }
-          to { opacity: 1; transform: translateY(0); }
-        }
-        @keyframes spin {
-          to { transform: rotate(360deg); }
-        }
-        .icon-btn-small {
-          background: none;
-          border: none;
-          cursor: pointer;
-          padding: 2px;
-          font-size: 0.8rem;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-          transition: transform 0.1s ease;
-        }
-        .icon-btn-small:hover {
-          transform: scale(1.2);
-        }
-      `}</style>
     </div>
   );
 }
