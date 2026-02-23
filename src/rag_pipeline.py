@@ -349,7 +349,11 @@ class MedicalRAGPipeline:
         else:
             rerank_candidates = self._select_chunks_for_rerank(passages)
             logger.info(f"   Reranking {len(rerank_candidates)} chunk candidates")
-            reranked = self.paper_finder.rerank(query, rerank_candidates)
+            reranked = self.paper_finder.rerank(
+                query,
+                rerank_candidates,
+                medical_conditions=medical_conditions,
+            )
 
             # Aggregate to paper level and format as DataFrame
             papers_df = self.paper_finder.aggregate_into_dataframe(reranked)

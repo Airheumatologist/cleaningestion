@@ -117,6 +117,20 @@ RERANKER_PROVIDER = "deepinfra"  # Fixed: Only DeepInfra supported
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "Qwen/Qwen3-Reranker-0.6B")
 
 # =============================================================================
+# Reranker v2 — Configurable Scoring Constants
+# =============================================================================
+# Set RERANKER_V2_ENABLED=0 in env to roll back to original scoring behaviour.
+RERANKER_V2_ENABLED   = _env_bool("RERANKER_V2_ENABLED", default=True)
+# Evidence tier multipliers (v2 defaults — less aggressive than original 3.0/1.5/1.0/0.2)
+TIER_1_BOOST          = float(os.getenv("TIER_1_BOOST",   "2.00"))   # guidelines
+TIER_2_BOOST          = float(os.getenv("TIER_2_BOOST",   "1.25"))   # RCTs/reviews
+TIER_3_BOOST          = float(os.getenv("TIER_3_BOOST",   "1.00"))   # standard research
+TIER_4_PENALTY        = float(os.getenv("TIER_4_PENALTY", "0.40"))   # case reports
+# Combined score weights (v2: reranker 85%, entity 15%; legacy: 70%/30%)
+RERANKER_SCORE_WEIGHT = float(os.getenv("RERANKER_SCORE_WEIGHT", "0.85"))
+ENTITY_SCORE_WEIGHT   = float(os.getenv("ENTITY_SCORE_WEIGHT",   "0.15"))
+
+# =============================================================================
 # Query Preprocessing Configuration
 # =============================================================================
 QUERY_EXPANSION_COUNT = 2  # Number of expanded query variations (3 total with base query)
