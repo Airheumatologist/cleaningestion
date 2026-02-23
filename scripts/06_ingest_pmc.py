@@ -237,6 +237,7 @@ def create_payload(article: Dict[str, Any], source_type: str) -> Dict[str, Any]:
         "source_family": "pmc",
         "content_type": "full_text" if normalized_source == SOURCE_PMC_OA else "author_manuscript",
         "license": article.get("license") or content_flags.get("license", "unknown"),
+        "is_open_access": article.get("is_open_access") or content_flags.get("is_open_access", False),
     }
 
     if normalized_source == SOURCE_PMC_AUTHOR:
