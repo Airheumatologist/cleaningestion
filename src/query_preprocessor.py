@@ -425,10 +425,11 @@ class QueryPreprocessor:
             # Use corrected query if available (CRITICAL for retrieval), otherwise use rewritten
             rewritten = decomposed.corrected_query if decomposed.corrected_query else (decomposed.rewritten_query or expanded_query)
             
-            # For keywords, if we have a corrected query, we should ideally use it, but the LLM
-            # generated keywords based on the input. Let's trust the rewritten query update 
-            # will drive better semantic search, and keep keywords as is unless empty.
             keyword = decomposed.rewritten_query_for_keyword_search or expanded_query
+            # Append corrected medical terms so BM25 can match correctly-spelled documents
+            # (the LLM-generated keyword query may still contain the original typo)
+            if decomposed.corrected_medical_conditions:
+                keyword = keyword + " " + " ".join(decomposed.corrected_medical_conditions)
             
             # Ensure expanded terms are included if entity expansion was used
             if expanded_query != query:

@@ -9,6 +9,7 @@ Implements ai2-scholarqa-lib's exact reranking methodology:
 
 import logging
 import re
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from anyascii import anyascii
@@ -293,20 +294,22 @@ def get_evidence_multiplier(
 
 def apply_evidence_boosts(
     documents: list,
-    current_year: int = 2025
+    current_year: int = None
 ) -> list:
     """
     Apply evidence hierarchy boosts to reranked documents.
-    
-    Tier System (strong differentiation):
-    - Tier 1 (3.00x): Guidelines, systematic reviews, meta-analyses
-    - Tier 2 (1.50x): RCTs, clinical trials, review articles
+
+    Tier System (v2 defaults, configurable via env):
+    - Tier 1 (2.00x): Guidelines, systematic reviews, meta-analyses
+    - Tier 2 (1.25x): RCTs, clinical trials, review articles
     - Tier 3 (1.00x): Standard research
-    - Tier 4 (0.20x): Case reports, letters, editorials
+    - Tier 4 (0.40x): Case reports, letters, editorials
     
     Smart Recency: Only applies to non-case-reports to preserve seminal older papers.
     Journal Boost: High-impact journals get +15%.
     """
+    if current_year is None:
+        current_year = datetime.now().year
     for doc in documents:
         # Use combined_score (includes entity matching) as base
         base_score = doc.get("combined_score", doc.get("rerank_score", doc.get("score", 0.5)))
@@ -449,19 +452,37 @@ class DeepInfraReranker(AbstractReranker):
             
             # DeepInfra returns scores directly in "scores" array
             scores = data.get("scores", [])
-            
+
             if not scores:
-                logger.warning("Empty scores from reranker API")
+                logger.critical("RERANKER DEGRADED: Empty scores from API — all passages will receive uniform 0.5 scores")
                 return [0.5] * n_docs
-            
-            # Log token usage for monitoring
+
+            # Health check: detect all-identical scores (indicates API malfunction)
+            unique_scores = set(round(s, 6) for s in scores)
+            if len(unique_scores) <= 1:
+                logger.critical(
+                    "RERANKER HEALTH CHECK FAILED: All %d scores identical (%.4f). "
+                    "API may be returning dummy values — reranking is effectively disabled.",
+                    len(scores), scores[0]
+                )
+
+            # Log token usage and score distribution for monitoring
             input_tokens = data.get("input_tokens", 0)
-            logger.info(f"   Reranker API: {input_tokens} input tokens for {len(documents)} documents")
-            
+            score_min, score_max = min(scores), max(scores)
+            score_mean = sum(scores) / len(scores)
+            logger.info(
+                "   Reranker API: %d input tokens, %d docs | scores: min=%.3f, max=%.3f, mean=%.3f",
+                input_tokens, len(documents), score_min, score_max, score_mean
+            )
+
             return scores
-            
+
         except Exception as e:
-            logger.error(f"DeepInfra reranking failed: {e}")
+            logger.critical(
+                "RERANKER DEGRADED: DeepInfra API call failed: %s — "
+                "all %d passages will receive uniform 0.5 scores, reranking is disabled for this query",
+                e, n_docs
+            )
             return [0.5] * n_docs
 
 # =============================================================================
@@ -659,7 +680,7 @@ class PaperFinderWithReranker:
         else:
             text = content or title
 
-        return text[:2000]
+        return text[:4000]
 
     def _get_document_content(self, doc: Dict[str, Any]) -> str:
         """
