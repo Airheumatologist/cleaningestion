@@ -1,4 +1,5 @@
 .env
+.env.example
 api_keys.json
 venv/
 __pycache__/
