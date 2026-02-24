@@ -19,6 +19,26 @@ def _env_csv(name: str, default: str = "") -> list[str]:
     value = os.getenv(name, default)
     return [item.strip() for item in value.split(",") if item.strip()]
 
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
 # Load environment variables from .env file
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(env_path)
@@ -30,6 +50,15 @@ CORS_ALLOWED_ORIGINS = _env_csv(
     "CORS_ALLOWED_ORIGINS",
     default="http://localhost:3000,http://127.0.0.1:3000",
 )
+
+# Service-to-service auth
+API_AUTH_ENABLED = _env_bool("API_AUTH_ENABLED", default=True)
+API_KEYS_FILE = os.getenv("API_KEYS_FILE", "/opt/RAG-pipeline/api_keys.json")
+API_KEYS_CACHE_TTL_SECONDS = _env_int("API_KEYS_CACHE_TTL_SECONDS", 30)
+
+# Runtime graceful shutdown controls
+API_SHUTDOWN_GRACE_SECONDS = _env_int("API_SHUTDOWN_GRACE_SECONDS", 85)
+API_INFLIGHT_DRAIN_POLL_SECONDS = _env_float("API_INFLIGHT_DRAIN_POLL_SECONDS", 0.2)
 
 # =============================================================================
 # Qdrant Cloud Configuration
@@ -51,6 +80,9 @@ DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
 DEEPINFRA_BASE_URL = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
 DEEPINFRA_RETRY_COUNT = int(os.getenv("DEEPINFRA_RETRY_COUNT", "3"))  # Number of retries for transient DeepInfra failures
 DEEPINFRA_RETRY_DELAY = float(os.getenv("DEEPINFRA_RETRY_DELAY", "1.0"))  # Base delay in seconds (exponential backoff)
+DEEPINFRA_CHAT_TIMEOUT_SECONDS = _env_float("DEEPINFRA_CHAT_TIMEOUT_SECONDS", 300.0)
+DEEPINFRA_EMBED_TIMEOUT_SECONDS = _env_float("DEEPINFRA_EMBED_TIMEOUT_SECONDS", 120.0)
+DEEPINFRA_RERANK_TIMEOUT_SECONDS = _env_float("DEEPINFRA_RERANK_TIMEOUT_SECONDS", 60.0)
 
 # LLM Generation Parameters
 LLM_TEMPERATURE = 0.7  # Controls randomness (0=deterministic, 1=creative)

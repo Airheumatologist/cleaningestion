@@ -6,10 +6,11 @@
 #
 # Required env vars:
 #   QDRANT_API_KEY   - Qdrant service API key
-#   QDRANT_URL       - Qdrant base URL (default: http://localhost:6333)
-#   QDRANT_COLLECTION - collection name   (default: rag_pipeline)
 #
 # Optional env vars:
+#   QDRANT_URL       - Qdrant base URL; when unset, resolves from Docker container IP
+#   QDRANT_CONTAINER_NAME - container name used for IP resolution (default: qdrant)
+#   QDRANT_COLLECTION - collection name   (default: rag_pipeline)
 #   BACKUP_DIR       - local backup directory  (default: /data/backups)
 #   S3_BUCKET        - S3 destination URI, e.g. s3://my-bucket/qdrant-backups
 #                      MUST include the s3:// scheme prefix.
@@ -19,8 +20,9 @@
 # Adjust the awk 'NR>7' line below to change this.
 set -euo pipefail
 
-QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
+QDRANT_URL="${QDRANT_URL:-}"
 QDRANT_API_KEY="${QDRANT_API_KEY:-}"
+QDRANT_CONTAINER_NAME="${QDRANT_CONTAINER_NAME:-qdrant}"
 QDRANT_COLLECTION="${QDRANT_COLLECTION:-rag_pipeline}"
 BACKUP_DIR="${BACKUP_DIR:-/data/backups}"
 # S3_BUCKET must be a full URI including scheme, e.g.: s3://my-bucket/qdrant-backups
@@ -32,11 +34,31 @@ if [[ -z "${QDRANT_API_KEY}" ]]; then
   exit 1
 fi
 
+resolve_qdrant_url() {
+  if [[ -n "${QDRANT_URL}" ]]; then
+    printf '%s\n' "${QDRANT_URL}"
+    return 0
+  fi
+
+  local ip
+  ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${QDRANT_CONTAINER_NAME}" 2>/dev/null || true)"
+  if [[ -z "${ip}" ]]; then
+    return 1
+  fi
+  printf 'http://%s:6333\n' "${ip}"
+}
+
+TARGET_URL="$(resolve_qdrant_url || true)"
+if [[ -z "${TARGET_URL}" ]]; then
+  echo "Failed to resolve Qdrant URL. Set QDRANT_URL or ensure container '${QDRANT_CONTAINER_NAME}' is running."
+  exit 1
+fi
+
 mkdir -p "${BACKUP_DIR}"
 
 response="$(curl -fsS -X POST \
   -H "api-key: ${QDRANT_API_KEY}" \
-  "${QDRANT_URL}/collections/${QDRANT_COLLECTION}/snapshots")"
+  "${TARGET_URL}/collections/${QDRANT_COLLECTION}/snapshots")"
 
 snapshot_name="$(printf '%s' "${response}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["name"])')"
 

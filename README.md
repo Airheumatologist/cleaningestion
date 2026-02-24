@@ -338,6 +338,7 @@ docker run -d \
 # Update .env for local testing
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=""  # No auth for local
+API_AUTH_ENABLED=false
 
 # Run backend
 uvicorn src.api_server:app --host 0.0.0.0 --port 8000 --reload
@@ -345,6 +346,7 @@ uvicorn src.api_server:app --host 0.0.0.0 --port 8000 --reload
 # Run frontend (new terminal)
 cd frontend
 npm install
+export API_REWRITE_TARGET=http://localhost:8000
 npm run dev
 ```
 
@@ -506,7 +508,8 @@ client.update_collection(
 ### Chat Endpoint (Streaming) - PRIMARY
 
 ```bash
-curl -X POST http://localhost:8000/api/chat/stream \
+curl -X POST http://localhost:8000/api/v1/chat/stream \
+  -H "Authorization: Bearer <service_token>" \
   -H "Content-Type: application/json" \
   -d '{"query": "What are the latest treatments for rheumatoid arthritis?", "stream": true}'
 ```
@@ -525,7 +528,8 @@ data: [DONE]
 ### Non-Streaming Chat
 
 ```bash
-curl -X POST http://localhost:8000/api/chat \
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Authorization: Bearer <service_token>" \
   -H "Content-Type: application/json" \
   -d '{"query": "Management of IgG4-related disease"}'
 ```
@@ -533,10 +537,23 @@ curl -X POST http://localhost:8000/api/chat \
 ### Query Decomposition (Debug)
 
 ```bash
-curl -X POST http://localhost:8000/api/query/decompose \
+curl -X POST http://localhost:8000/api/v1/debug/decompose \
+  -H "Authorization: Bearer <service_token>" \
   -H "Content-Type: application/json" \
   -d '{"query": "Systematic reviews on SGLT2 inhibitors from 2020"}'
 ```
+
+### Health + OpenAPI
+
+```bash
+curl http://localhost:8000/api/v1/health
+curl http://localhost:8000/api/v1/openapi.json
+```
+
+Legacy aliases remain temporarily:
+- `/api/chat` -> `/api/v1/chat`
+- `/api/chat/stream` -> `/api/v1/chat/stream`
+- `/health` -> `/api/v1/health`
 
 ---
 
@@ -592,15 +609,19 @@ See `deploy/hetzner_setup.md` for:
 - Qdrant configuration
 - Firewall rules
 
+Co-located API + Qdrant compose deployment:
+- [deploy/hetzner/README.md](deploy/hetzner/README.md)
+- [deploy/integration/README.md](deploy/integration/README.md)
+
 ### Backend Deployment
 
 ```bash
-# Production with multiple workers
-uvicorn src.api_server:app \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --workers 4 \
-  --proxy-headers
+gunicorn src.api_server:app \
+  -k uvicorn.workers.UvicornWorker \
+  -w 2 \
+  --bind 0.0.0.0:8000 \
+  --timeout 300 \
+  --graceful-timeout 90
 ```
 
 ### Frontend Deployment

@@ -20,6 +20,7 @@ from openai import OpenAI
 from .config import (
     DEEPINFRA_API_KEY,
     DEEPINFRA_BASE_URL,
+    DEEPINFRA_CHAT_TIMEOUT_SECONDS,
     LLM_MODEL,
     LLM_TEMPERATURE,
     LLM_TOP_P,
@@ -90,8 +91,8 @@ class MedicalRAGPipeline:
         self.openai_client = OpenAI(
             api_key=DEEPINFRA_API_KEY,
             base_url=DEEPINFRA_BASE_URL,
-            timeout=300.0
-        )  # 5 minutes timeout
+            timeout=DEEPINFRA_CHAT_TIMEOUT_SECONDS,
+        )
         
         # Components
         self.preprocessor = QueryPreprocessor(model=model)

@@ -23,6 +23,7 @@ from .config import (
     QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY, USE_HYBRID_SEARCH,
     SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
     SPARSE_REMOVE_STOPWORDS, DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
+    DEEPINFRA_EMBED_TIMEOUT_SECONDS,
     QUANTIZATION_RESCORE, QUANTIZATION_OVERSAMPLING
 )
 from .bm25_sparse import BM25SparseEncoder
@@ -105,7 +106,8 @@ class QdrantRetriever(AbstractRetriever):
                 raise ValueError("DEEPINFRA_API_KEY not set in config")
             self.openai_client = OpenAI(
                 api_key=DEEPINFRA_API_KEY,
-                base_url=DEEPINFRA_BASE_URL
+                base_url=DEEPINFRA_BASE_URL,
+                timeout=DEEPINFRA_EMBED_TIMEOUT_SECONDS,
             )
             logger.info("✅ DeepInfra embedding initialized (model: %s)", EMBEDDING_MODEL)
         else:

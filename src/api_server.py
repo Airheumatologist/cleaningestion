@@ -1,49 +1,57 @@
-"""
-FastAPI Server for Medical RAG Pipeline.
+"""FastAPI server for Medical RAG pipeline."""
 
-Provides REST API endpoints for the Next.js frontend:
-- POST /api/chat - Full ScholarQA-style response
-- POST /api/chat/stream - Server-Sent Events for streaming
-- GET /health - Health check
+from __future__ import annotations
 
-Run with: uvicorn src.api_server:app --host 0.0.0.0 --port 8000 --reload
-"""
-
+import asyncio
 import json
 import logging
-import asyncio
-from typing import Optional, Any
+import os
+import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
+from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
-from .config import CORS_ALLOWED_ORIGINS
+from .config import (
+    API_AUTH_ENABLED,
+    API_INFLIGHT_DRAIN_POLL_SECONDS,
+    API_KEYS_CACHE_TTL_SECONDS,
+    API_KEYS_FILE,
+    API_SHUTDOWN_GRACE_SECONDS,
+    CORS_ALLOWED_ORIGINS,
+)
+from .service_auth import ServiceTokenStore
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Pipeline will be initialized at startup
 pipeline = None
+service_token_store = ServiceTokenStore(
+    keys_file=API_KEYS_FILE,
+    cache_ttl_seconds=API_KEYS_CACHE_TTL_SECONDS,
+)
+bearer_scheme = HTTPBearer(auto_error=False)
+_shutdown_event = threading.Event()
+_inflight_lock = threading.Lock()
+_inflight_requests = 0
+_stream_threads_lock = threading.Lock()
+_stream_threads: set[threading.Thread] = set()
 
 
 def make_json_serializable(obj: Any) -> Any:
-    """
-    Recursively convert objects to JSON-serializable types.
-    Handles generators, pandas Series, numpy types, and NaN values.
-    """
+    """Recursively convert objects to JSON-safe values."""
     import math
     import numpy as np
-    
-    # Handle None
+
     if obj is None:
         return None
-    
-    # Handle NaN/Infinity FIRST (before other float checks)
-    # This catches both Python float and numpy float types
+
     try:
         if isinstance(obj, (float, np.floating)):
             if math.isnan(obj) or math.isinf(obj):
@@ -51,50 +59,41 @@ def make_json_serializable(obj: Any) -> Any:
             return float(obj)
     except (TypeError, ValueError):
         pass
-    
-    # Handle numpy integer types
+
     if isinstance(obj, np.integer):
         return int(obj)
-    
-    # Handle basic JSON types
+
     if isinstance(obj, (str, int, bool)):
         return obj
-    
-    # Handle dict
+
     if isinstance(obj, dict):
         return {k: make_json_serializable(v) for k, v in obj.items()}
-    
-    # Handle list and tuple
+
     if isinstance(obj, (list, tuple)):
         return [make_json_serializable(item) for item in obj]
-    
-    # Handle pandas Series/DataFrame
-    if hasattr(obj, 'to_dict'):
+
+    if hasattr(obj, "to_dict"):
         try:
             return make_json_serializable(obj.to_dict())
         except Exception:
             pass
-    
-    # Handle numpy arrays
+
     if isinstance(obj, np.ndarray):
         return make_json_serializable(obj.tolist())
-    
-    # Handle generators and other iterables (but not strings/bytes)
-    if hasattr(obj, '__iter__') and not isinstance(obj, (str, bytes)):
+
+    if hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes)):
         try:
             iter(obj)
             return [make_json_serializable(item) for item in obj]
         except (TypeError, ValueError):
             pass
-    
-    # Handle custom objects with __dict__
-    if hasattr(obj, '__dict__'):
+
+    if hasattr(obj, "__dict__"):
         try:
             return make_json_serializable(obj.__dict__)
         except Exception:
             pass
-    
-    # Fallback: convert to string
+
     try:
         return str(obj)
     except Exception:
@@ -102,52 +101,138 @@ def make_json_serializable(obj: Any) -> Any:
 
 
 class ChatRequest(BaseModel):
-    """Request body for chat endpoint."""
     query: str
     stream: bool = False
 
 
 class ChatResponse(BaseModel):
-    """Response body for chat endpoint."""
     query: str
     report_title: str
     answer: str
-    sections: list
-    sources: list
-    evidence_hierarchy: dict = {}
-    full_text_articles: list = []  # Articles that received full text (not just abstracts)
-    retrieval_stats: dict
+    sections: list = Field(default_factory=list)
+    sources: list = Field(default_factory=list)
+    evidence_hierarchy: dict = Field(default_factory=dict)
+    full_text_articles: list = Field(default_factory=list)
+    retrieval_stats: dict = Field(default_factory=dict)
     status: str
 
 
+class AuthenticatedService(BaseModel):
+    service_id: str
+
+
+def _current_inflight_requests() -> int:
+    with _inflight_lock:
+        return _inflight_requests
+
+
+def _request_error_detail(request: Request, message: str) -> dict[str, str]:
+    return {
+        "message": message,
+        "request_id": getattr(request.state, "request_id", ""),
+        "retry_hint": "Retry with exponential backoff.",
+    }
+
+
+async def require_service_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> AuthenticatedService:
+    if not API_AUTH_ENABLED:
+        request.state.service_id = "auth-disabled"
+        return AuthenticatedService(service_id="auth-disabled")
+
+    if (
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not credentials.credentials.strip()
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    is_valid, service_id, enabled = service_token_store.validate_token(
+        credentials.credentials.strip()
+    )
+    if is_valid and service_id:
+        request.state.service_id = service_id
+        return AuthenticatedService(service_id=service_id)
+
+    if service_id and enabled is False:
+        raise HTTPException(status_code=403, detail="Token disabled")
+
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid bearer token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Initialize pipeline on startup."""
+async def lifespan(_: FastAPI):
+    """Initialize shared resources at startup and drain in-flight traffic on shutdown."""
     global pipeline
-    logger.info("🚀 Starting Medical RAG API Server...")
-    
-    try:
-        from .rag_pipeline import MedicalRAGPipeline
-        pipeline = MedicalRAGPipeline()  # No parameters needed - ScholarQA defaults
-        logger.info("✅ Pipeline initialized successfully")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize pipeline: {e}")
-        raise
-    
+    _shutdown_event.clear()
+    logger.info("Starting Medical RAG API server")
+
+    skip_pipeline_init = os.getenv("SKIP_PIPELINE_INIT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+    if not skip_pipeline_init:
+        try:
+            from .rag_pipeline import MedicalRAGPipeline
+
+            pipeline = MedicalRAGPipeline()
+            logger.info("Pipeline initialized")
+        except Exception as exc:
+            logger.error("Failed to initialize pipeline: %s", exc)
+            raise
+    else:
+        logger.warning("Skipping pipeline initialization (SKIP_PIPELINE_INIT is enabled)")
+
     yield
-    
-    logger.info("👋 Shutting down...")
+
+    logger.info("Shutdown requested, draining in-flight requests")
+    _shutdown_event.set()
+    deadline = time.monotonic() + max(1, API_SHUTDOWN_GRACE_SECONDS)
+
+    while time.monotonic() < deadline and _current_inflight_requests() > 0:
+        time.sleep(max(0.05, API_INFLIGHT_DRAIN_POLL_SECONDS))
+
+    with _stream_threads_lock:
+        stream_threads = list(_stream_threads)
+
+    for thread in stream_threads:
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0:
+            break
+        thread.join(timeout=remaining)
+
+    remaining_inflight = _current_inflight_requests()
+    if remaining_inflight > 0:
+        logger.warning(
+            "Shutdown grace period elapsed with %d in-flight request(s)",
+            remaining_inflight,
+        )
+    logger.info("Shutdown complete")
 
 
-# Create FastAPI app
 app = FastAPI(
     title="Elixir AI Medical RAG API",
-    description="ScholarQA-enhanced medical research assistant",
-    version="1.0.0",
-    lifespan=lifespan
+    description="Versioned Medical RAG API",
+    version="1.1.0",
+    openapi_url="/api/v1/openapi.json",
+    docs_url="/api/v1/docs",
+    redoc_url=None,
+    lifespan=lifespan,
 )
 
-# CORS for Next.js frontend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOWED_ORIGINS,
@@ -157,104 +242,181 @@ app.add_middleware(
 )
 
 
-@app.get("/health")
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """Attach request ids and emit structured per-request logs."""
+    global _inflight_requests
+
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+
+    with _inflight_lock:
+        _inflight_requests += 1
+
+    start_time = time.perf_counter()
+    status_code = 500
+    response = None
+    unhandled_error = None
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception as exc:
+        unhandled_error = type(exc).__name__
+        raise
+    finally:
+        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+        log_event = {
+            "request_id": request_id,
+            "service_id": getattr(request.state, "service_id", "anonymous"),
+            "endpoint": request.url.path,
+            "method": request.method,
+            "status": status_code,
+            "latency_ms": elapsed_ms,
+            "stream_flag": request.url.path.endswith("/stream"),
+            "upstream_error_type": unhandled_error,
+        }
+        logger.info(json.dumps(log_event, default=str, sort_keys=True))
+        with _inflight_lock:
+            _inflight_requests = max(0, _inflight_requests - 1)
+
+
+@app.get("/api/v1/health", tags=["health"])
+@app.get("/health", include_in_schema=False)
 async def health_check():
-    """Health check endpoint."""
-    return {"status": "healthy", "pipeline_ready": pipeline is not None}
+    return {
+        "status": "healthy",
+        "pipeline_ready": pipeline is not None,
+        "shutting_down": _shutdown_event.is_set(),
+    }
 
 
-@app.post("/api/chat")
-async def chat(request: ChatRequest):
-    """
-    Main chat endpoint for medical questions.
-    
-    Returns full ScholarQA-style response with sections and citations.
-    """
+@app.post("/api/v1/chat", response_model=ChatResponse, tags=["chat"])
+@app.post("/api/chat", include_in_schema=False)
+async def chat(
+    request: Request,
+    payload: ChatRequest,
+    _auth: AuthenticatedService = Depends(require_service_auth),
+):
+    if _shutdown_event.is_set():
+        raise HTTPException(status_code=503, detail="Server is shutting down")
+
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    
-    if not request.query.strip():
+
+    if not payload.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
-    
+
     try:
-        # Run pipeline in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
             pipeline.answer_scholarqa_style,
-            request.query
+            payload.query,
         )
-        
-        # Sanitize result to handle NaN values from pandas/numpy
         return make_json_serializable(result)
-        
-    except Exception as e:
-        logger.error(f"Chat error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Chat error: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=_request_error_detail(request, "Chat generation failed"),
+        )
 
 
-@app.post("/api/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """
-    Streaming chat endpoint with Server-Sent Events.
+@app.post("/api/v1/chat/stream", tags=["chat"])
+@app.post("/api/chat/stream", include_in_schema=False)
+async def chat_stream(
+    request: Request,
+    payload: ChatRequest,
+    _auth: AuthenticatedService = Depends(require_service_auth),
+):
+    if _shutdown_event.is_set():
+        raise HTTPException(status_code=503, detail="Server is shutting down")
 
-    Streams progress events and tokens progressively for real-time UI updates.
-    """
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
 
-    if not request.query.strip():
+    if not payload.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
+    request_id = getattr(request.state, "request_id", "")
+
     async def event_generator():
-        """Generate SSE events from streaming pipeline in real-time."""
-        import threading
-        queue = asyncio.Queue()
-        loop = asyncio.get_event_loop()
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        stop_event = threading.Event()
 
-        def producer():
-            """Runs the synchronous pipeline.answer_streaming in a background thread."""
+        def producer() -> None:
             try:
-                for event in pipeline.answer_streaming(request.query):
-                    # Put event into the queue
+                for event in pipeline.answer_streaming(payload.query):
+                    if _shutdown_event.is_set() or stop_event.is_set():
+                        break
                     asyncio.run_coroutine_threadsafe(queue.put(event), loop)
-                # Signal completion
-                asyncio.run_coroutine_threadsafe(queue.put("[DONE]"), loop)
-            except Exception as e:
-                logger.error(f"Producer error: {e}", exc_info=True)
-                asyncio.run_coroutine_threadsafe(queue.put({"step": "error", "status": "error", "message": str(e)}), loop)
+            except Exception as exc:
+                logger.error("Streaming producer error: %s", exc, exc_info=True)
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(
+                        {
+                            "step": "error",
+                            "status": "error",
+                            "message": "Streaming generation failed",
+                            "request_id": request_id,
+                            "retry_hint": "Retry with exponential backoff.",
+                        }
+                    ),
+                    loop,
+                )
+            finally:
                 asyncio.run_coroutine_threadsafe(queue.put("[DONE]"), loop)
 
-        # Start producer thread
-        thread = threading.Thread(target=producer)
+        thread = threading.Thread(target=producer, name=f"stream-{request_id}")
+        with _stream_threads_lock:
+            _stream_threads.add(thread)
         thread.start()
 
         try:
             while True:
-                event = await queue.get()
+                if await request.is_disconnected():
+                    stop_event.set()
+                    break
+
+                if _shutdown_event.is_set():
+                    stop_event.set()
+
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    if stop_event.is_set() and not thread.is_alive():
+                        break
+                    continue
+
                 if event == "[DONE]":
                     break
-                
-                # Ensure event is JSON-serializable
-                serializable_event = make_json_serializable(event)
-                
-                # Log critical events
-                if serializable_event.get("step") == "complete":
-                    ans = serializable_event.get("answer", "")
-                    logger.info(f"Streaming complete event: status={serializable_event.get('status')}, answer_length={len(ans) if ans else 0}")
-                
-                # [NEW] Log when sources are sent (helps verify fix)
-                if "sources" in serializable_event:
-                    logger.info(f"📡 Sending streaming event with {len(serializable_event['sources'])} sources (step: {serializable_event.get('step')})")
-                
-                data = json.dumps(serializable_event)
-                yield f"data: {data}\n\n"
-            
-            yield "data: [DONE]\n\n"
 
-        except Exception as e:
-            logger.error(f"Consumer error: {e}", exc_info=True)
-            yield f"data: {json.dumps({'step': 'error', 'message': str(e)})}\n\n"
+                serializable_event = make_json_serializable(event)
+                yield f"data: {json.dumps(serializable_event)}\n\n"
+
+            yield "data: [DONE]\n\n"
+        except Exception as exc:
+            logger.error("Streaming consumer error: %s", exc, exc_info=True)
+            failure_event = {
+                "step": "error",
+                "status": "error",
+                "message": "Stream terminated unexpectedly",
+                "request_id": request_id,
+                "retry_hint": "Retry with exponential backoff.",
+            }
+            yield f"data: {json.dumps(failure_event)}\n\n"
+            yield "data: [DONE]\n\n"
+        finally:
+            stop_event.set()
+            await asyncio.to_thread(thread.join, 1.0)
+            with _stream_threads_lock:
+                _stream_threads.discard(thread)
 
     return StreamingResponse(
         event_generator(),
@@ -262,41 +424,51 @@ async def chat_stream(request: ChatRequest):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"  # Disable nginx buffering
-        }
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
-@app.post("/api/query/decompose")
-async def decompose_query(request: ChatRequest):
-    """
-    Debug endpoint to test query decomposition.
-    """
+@app.post("/api/v1/debug/decompose", tags=["debug"])
+@app.post("/api/query/decompose", include_in_schema=False)
+async def decompose_query(
+    request: Request,
+    payload: ChatRequest,
+    _auth: AuthenticatedService = Depends(require_service_auth),
+):
+    if _shutdown_event.is_set():
+        raise HTTPException(status_code=503, detail="Server is shutting down")
+
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    
+
+    if not payload.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
     try:
-        result = pipeline.preprocess_query(request.query)
-        
+        result = pipeline.preprocess_query(payload.query)
         return {
             "original_query": result.original_query,
             "rewritten_query": result.rewritten_query,
             "keyword_query": result.keyword_query,
             "search_filters": result.search_filters,
-            "decomposed": result.decomposed.model_dump() if result.decomposed else None
+            "decomposed": result.decomposed.model_dump() if result.decomposed else None,
         }
-        
-    except Exception as e:
-        logger.error(f"Decomposition error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.error("Decomposition error: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=_request_error_detail(request, "Query decomposition failed"),
+        )
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         "src.api_server:app",
         host="0.0.0.0",
         port=8000,
         reload=True,
-        log_level="info"
+        log_level="info",
     )

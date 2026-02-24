@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from .config import (
     DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
     DEEPINFRA_RETRY_COUNT, DEEPINFRA_RETRY_DELAY,
+    DEEPINFRA_CHAT_TIMEOUT_SECONDS,
     LLM_MODEL, LLM_TEMPERATURE, LLM_TOP_P, QUERY_EXPANSION_COUNT
 )
 from .medical_entity_expander import MedicalEntityExpander
@@ -260,7 +261,7 @@ class QueryPreprocessor:
         self.openai_client = OpenAI(
             api_key=DEEPINFRA_API_KEY,
             base_url=DEEPINFRA_BASE_URL,
-            timeout=300.0
+            timeout=DEEPINFRA_CHAT_TIMEOUT_SECONDS,
         )
         self.model = model
         self.expansion_count = QUERY_EXPANSION_COUNT

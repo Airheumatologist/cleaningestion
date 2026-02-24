@@ -282,7 +282,7 @@ export default function Home() {
     setPdfUrl(null);
 
     try {
-      const res = await fetch("http://localhost:8000/api/chat/stream", {
+      const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: q, stream: true }),
@@ -428,7 +428,7 @@ export default function Home() {
       setMessages((prev) => {
         const n = [...prev];
         n[n.length - 1].content =
-          "⚠️ Failed to get a response. Make sure the backend is running on port 8000.";
+          "⚠️ Failed to get a response. Check the API rewrite target and backend availability.";
         return n;
       });
     } finally {

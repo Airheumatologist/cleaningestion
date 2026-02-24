@@ -18,6 +18,7 @@ from .config import (
     RERANKER_MODEL,
     DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
     DEEPINFRA_RETRY_COUNT, DEEPINFRA_RETRY_DELAY,
+    DEEPINFRA_RERANK_TIMEOUT_SECONDS,
     RERANKER_V2_ENABLED,
     TIER_1_BOOST as CFG_TIER_1_BOOST,
     TIER_2_BOOST as CFG_TIER_2_BOOST,
@@ -437,7 +438,12 @@ class DeepInfraReranker(AbstractReranker):
             }
             
             def _post_rerank() -> requests.Response:
-                response = requests.post(self.api_url, json=payload, headers=headers, timeout=60)
+                response = requests.post(
+                    self.api_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=DEEPINFRA_RERANK_TIMEOUT_SECONDS,
+                )
                 response.raise_for_status()
                 return response
 

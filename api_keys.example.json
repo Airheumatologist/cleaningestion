@@ -1,0 +1,9 @@
+{
+  "tokens": [
+    {
+      "service_id": "azure-nextjs-app",
+      "token_hash": "$2b$12$replace_with_bcrypt_hash",
+      "enabled": true
+    }
+  ]
+}

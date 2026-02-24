@@ -1,0 +1,5 @@
+# RAG API health check every 5 minutes
+# Install with: sudo cp deploy/hetzner/cron/api-health.cron /etc/cron.d/api-health
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root cd /opt/RAG-pipeline && /bin/bash -lc 'set -a && source .env && set +a && ./deploy/hetzner/api_healthcheck.sh' >> /var/log/api-health.log 2>&1

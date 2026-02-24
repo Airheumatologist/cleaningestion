@@ -1,6 +1,8 @@
-# Hetzner Self-Hosted Deployment (v4 – Dense + BM25 Sparse)
+# Hetzner Deployment: Co-Located RAG API + Qdrant
 
-This folder contains production assets to run Qdrant on a Hetzner dedicated server.
+This folder contains production assets for running both services on one Hetzner host:
+- `qdrant` (internal-only on Docker network)
+- `rag-api` (FastAPI/Gunicorn on port `8000`)
 
 ## 1) Prepare server
 
@@ -19,7 +21,6 @@ sudo git clone <your-repo-url> RAG-pipeline
 sudo chown -R "$USER":"$USER" /opt/RAG-pipeline
 mkdir -p /opt/qdrant/qdrant_storage /opt/qdrant/qdrant_config /data/ingestion /data/backups
 cp /opt/RAG-pipeline/deploy/hetzner/qdrant-production.yaml /opt/qdrant/qdrant_config/production.yaml
-cp /opt/RAG-pipeline/deploy/hetzner/docker-compose.yml /opt/qdrant/docker-compose.yml
 ```
 
 ## 3) Configure environment
@@ -30,46 +31,47 @@ Create `/opt/RAG-pipeline/.env` from `env.example`:
 cp /opt/RAG-pipeline/env.example /opt/RAG-pipeline/.env
 ```
 
-Edit `.env` with production values:
+Required production edits in `.env`:
 
 ```env
-QDRANT_URL=http://localhost:6333
-QDRANT_GRPC_URL=localhost:6334
+QDRANT_URL=http://qdrant:6333
+QDRANT_GRPC_URL=qdrant:6334
 QDRANT_API_KEY=<generate-with-openssl-rand-hex-32>
-QDRANT_COLLECTION=rag_pipeline
-COLLECTION_NAME=rag_pipeline
-QDRANT_CLOUD_INFERENCE=false
 
-EMBEDDING_PROVIDER=deepinfra
-EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B-batch
-EMBEDDING_BATCH_SIZE=64
+DEEPINFRA_API_KEY=<deepinfra-key>
+API_AUTH_ENABLED=true
+API_KEYS_FILE=/opt/RAG-pipeline/api_keys.json
 
-SPARSE_ENABLED=true
-SPARSE_MODE=bm25
-USE_HYBRID_SEARCH=true
-SPARSE_RETRIEVAL_MODE=bm25
-
-EMBED_FILTER_ENABLED=true
-EMBED_FILTER_MODE=conservative
-CHUNK_SIZE_TOKENS=2048
-CHUNK_OVERLAP_TOKENS=256
-
-DATA_DIR=/data/ingestion
-
-# Replace with your deployed frontend URL(s)
-CORS_ALLOWED_ORIGINS=https://app.example.com
+# Browser CORS can stay local-only if callers are backend services.
+CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
 
-## 4) Start Qdrant
+## 4) Create service token hash file
 
 ```bash
-cd /opt/qdrant
-cp /opt/RAG-pipeline/.env .env
-docker compose up -d
-curl -H "api-key: ${QDRANT_API_KEY}" http://localhost:6333/healthz
+cd /opt/RAG-pipeline
+cp api_keys.example.json api_keys.json
+
+# Generate bcrypt hash from a plaintext token
+python3 scripts/hash_service_token.py
 ```
 
-## 5) Install Python dependencies
+Place the resulting hash in `api_keys.json` under `token_hash`.
+
+## 5) Start Qdrant + API stack
+
+```bash
+cd /opt/RAG-pipeline/deploy/hetzner
+docker compose --env-file ../../.env up -d --build
+```
+
+Validate:
+
+```bash
+curl -s http://localhost:8000/api/v1/health | python3 -m json.tool
+```
+
+## 6) Install Python dependencies for ingestion jobs
 
 ```bash
 cd /opt/RAG-pipeline
@@ -78,87 +80,76 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 6) Create collection (with sparse config)
-
-This **must** be run to guarantee the sparse vector config (BM25 with IDF modifier) is applied:
+## 7) Create collection (with sparse config)
 
 ```bash
+cd /opt/RAG-pipeline
 source .env
 python scripts/05_setup_qdrant.py --collection-name rag_pipeline
 ```
 
-Verify schema includes sparse vector config:
-```bash
-curl -s -H "api-key: ${QDRANT_API_KEY}" http://localhost:6333/collections/rag_pipeline | python3 -m json.tool | grep -A3 sparse
-```
-
-Expected: `"sparse"` key with `"modifier": "idf"`.
-
-## 7) Pilot ingestion
-
-Run a small-scale ingestion to validate the pipeline:
+## 8) Pilot ingestion
 
 ```bash
-# PMC (limit to a small XML directory for pilot)
 python scripts/06_ingest_pmc.py --xml-dir /data/ingestion/pmc_xml
-
-# DailyMed
 python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
 ```
 
-## 8) Install cron jobs
-
-`medical-rag-update.cron` already chains `backup.sh` after a successful weekly update, so do not install `qdrant-backup.cron` as a standalone cron job.
+## 9) Install cron jobs
 
 ```bash
 sudo cp deploy/hetzner/cron/medical-rag-update.cron /etc/cron.d/medical-rag-update
 sudo cp deploy/hetzner/cron/qdrant-health.cron /etc/cron.d/qdrant-health
-sudo chmod 644 /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-health
+sudo cp deploy/hetzner/cron/api-health.cron /etc/cron.d/api-health
+sudo chmod 644 /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-health /etc/cron.d/api-health
+```
 
-# Optional cleanup if an old standalone backup job was previously installed
+Optional cleanup if legacy backup cron exists:
+
+```bash
 sudo rm -f /etc/cron.d/qdrant-backup
 ```
 
-## 9) Firewall allowlist
+## 10) Firewall baseline
 
 ```bash
 # Allow SSH
 ufw allow OpenSSH
 
-# Allow Qdrant only from specific IPs (ingestion host + prod app)
-ufw allow from <INGESTION_IP> to any port 6333
-ufw allow from <PROD_APP_IP> to any port 6333
+# Allow WireGuard (example default port)
+ufw allow 51820/udp
 
-# Block all other Qdrant access
-ufw deny 6333/tcp
+# Allow API only from private tunnel/network CIDR
+ufw allow from <WIREGUARD_CIDR> to any port 8000 proto tcp
+ufw deny 8000/tcp
 
+# Qdrant is not host-published in compose
 ufw enable
 ufw status
 ```
 
-## 10) API key rotation
+## 11) API key rotation
 
 ```bash
-# Generate new key
-NEW_KEY=$(openssl rand -hex 32)
-echo "New key: ${NEW_KEY}"
+# 1) Generate a new plaintext service token
+openssl rand -hex 32
 
-# Update docker-compose env
-sed -i "s/QDRANT_API_KEY=.*/QDRANT_API_KEY=${NEW_KEY}/" /opt/qdrant/.env
-cd /opt/qdrant && docker compose down && docker compose up -d
+# 2) Hash it
+cd /opt/RAG-pipeline
+python3 scripts/hash_service_token.py --token "<new-token>"
 
-# Update application .env
-sed -i "s/QDRANT_API_KEY=.*/QDRANT_API_KEY=${NEW_KEY}/" /opt/RAG-pipeline/.env
-
-# Update all external client .env files with the new key
+# 3) Replace token_hash in /opt/RAG-pipeline/api_keys.json
+# 4) Restart API container
+cd /opt/RAG-pipeline/deploy/hetzner
+docker compose --env-file ../../.env restart rag-api
 ```
 
-## 11) Acceptance checks
+## 12) Acceptance checks
 
 | Check | Command |
 |---|---|
-| Collection has sparse config | `curl -s -H "api-key: $QDRANT_API_KEY" localhost:6333/collections/rag_pipeline \| grep idf` |
-| Points have dense + sparse vectors | `curl -s -H "api-key: $QDRANT_API_KEY" "localhost:6333/collections/rag_pipeline/points/scroll?limit=1&with_vectors=true"` |
-| Cron installed | `ls /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-health` |
-| Firewall active | `ufw status` |
-| Monthly update runs | `tail -f /var/log/rag-update.log` |
+| API health | `curl -s localhost:8000/api/v1/health` |
+| Auth (missing token -> 401) | `curl -i -X POST localhost:8000/api/v1/chat -H "content-type: application/json" -d '{"query":"test"}'` |
+| Qdrant internal-only | `docker compose ps` (no host `6333`/`6334` published) |
+| Cron installed | `ls /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-health /etc/cron.d/api-health` |
+| Stream endpoint | `curl -N -X POST localhost:8000/api/v1/chat/stream -H "Authorization: Bearer <token>" -H "content-type: application/json" -d '{"query":"test", "stream": true}'` |
