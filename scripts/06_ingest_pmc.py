@@ -640,7 +640,7 @@ def process_batch(
             
             # Skip author manuscripts entirely (as requested for commercial use safety)
             if source_type == SOURCE_PMC_AUTHOR:
-                logger.debug("Skipping %s: author_manuscript", xml_path.name)
+                logger.info("Skipping %s: author_manuscript", xml_path.name)
                 continue
 
             stem_id = _extract_stem_id(xml_path)

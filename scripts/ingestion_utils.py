@@ -627,12 +627,12 @@ def parse_pmc_xml(
         license_type = _extract_license_type(article_meta)
         
         if require_open_access and not is_open_access:
-            logger.debug(f"Skipping {xml_path}: Not open access")
+            logger.info(f"Skipping {xml_path.name}: Not open access")
             return None
             
         if require_commercial_license:
             if not _is_commercial_license(license_type):
-                logger.debug(f"Skipping {xml_path}: Non-commercial license ({license_type})")
+                logger.info(f"Skipping {xml_path.name}: Non-commercial license ({license_type})")
                 return None
 
         # === 4. Controlled Vocabulary (PRD Section 1.4) ===
