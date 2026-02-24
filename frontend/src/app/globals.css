@@ -579,11 +579,14 @@ body {
 
 .badge-article-type {
   font-size: 0.72rem;
-  font-weight: 500;
-  color: var(--text-muted);
+  font-weight: 600;
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  line-height: 1.2;
 }
 
 /* ── PDF Badge ─────────────────────────────────────────────── */

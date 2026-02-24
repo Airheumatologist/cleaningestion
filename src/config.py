@@ -142,6 +142,15 @@ MAX_ABSTRACTS = FINAL_TOP_ARTICLES  # Context article cap
 MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)
 
 # =============================================================================
+# Query Caching Configuration
+# =============================================================================
+QUERY_CACHE_ENABLED = _env_bool("QUERY_CACHE_ENABLED", default=True)
+QUERY_CACHE_DIR = os.getenv("QUERY_CACHE_DIR", "data/cache")
+QUERY_CACHE_EXPIRY_DAYS = int(os.getenv("QUERY_CACHE_EXPIRY_DAYS", "30"))
+QUERY_CACHE_NAMESPACE = os.getenv("QUERY_CACHE_NAMESPACE", "default")
+QUERY_CACHE_KEY_VERSION = int(os.getenv("QUERY_CACHE_KEY_VERSION", "2"))
+
+# =============================================================================
 # Validation
 # =============================================================================
 def validate_config():

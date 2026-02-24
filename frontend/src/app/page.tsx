@@ -21,6 +21,7 @@ interface Source {
   evidence_level?: 1 | 2 | 3 | 4;
   evidence_term?: string;
   evidence_source?: string;
+  citation_index?: number;
 }
 
 interface EvidenceLevel {
@@ -52,6 +53,42 @@ const CITATION_COLORS = [
 
 const EVIDENCE_COLORS: Record<string, string> = {
   A: "#10b981", B: "#3b82f6", C: "#f59e0b", D: "#ef4444",
+};
+
+const ARTICLE_TYPE_COLORS: Record<
+  string,
+  { border: string; background: string; text: string }
+> = {
+  systematic_review: {
+    border: "rgba(20, 184, 166, 0.65)",
+    background: "rgba(20, 184, 166, 0.12)",
+    text: "#2dd4bf",
+  },
+  meta_analysis: {
+    border: "rgba(59, 130, 246, 0.7)",
+    background: "rgba(59, 130, 246, 0.12)",
+    text: "#60a5fa",
+  },
+  clinical_trial: {
+    border: "rgba(16, 185, 129, 0.75)",
+    background: "rgba(16, 185, 129, 0.12)",
+    text: "#34d399",
+  },
+  guideline: {
+    border: "rgba(245, 158, 11, 0.75)",
+    background: "rgba(245, 158, 11, 0.12)",
+    text: "#fbbf24",
+  },
+  review_article: {
+    border: "rgba(168, 85, 247, 0.75)",
+    background: "rgba(168, 85, 247, 0.12)",
+    text: "#c084fc",
+  },
+  drug_label: {
+    border: "rgba(249, 115, 22, 0.75)",
+    background: "rgba(249, 115, 22, 0.12)",
+    text: "#fb923c",
+  },
 };
 
 const SUGGESTED_QUERIES = [
@@ -90,6 +127,51 @@ function getArticleUrl(s: Source): string {
   return "#";
 }
 
+function getCitationIndex(s: Source, fallbackIndex: number): number {
+  if (typeof s.citation_index === "number" && Number.isFinite(s.citation_index)) {
+    return s.citation_index;
+  }
+  return fallbackIndex + 1;
+}
+
+function normalizeArticleType(v?: string): string {
+  return (v || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/[-\s]+/g, "_");
+}
+
+function toTitleCase(v: string): string {
+  return v
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function getArticleTypeBadge(source: Source): {
+  label: string;
+  style: React.CSSProperties;
+} | null {
+  const rawType = source.article_type || source.evidence_term;
+  if (!rawType) return null;
+
+  const normalized = normalizeArticleType(rawType);
+  const palette = ARTICLE_TYPE_COLORS[normalized] || {
+    border: "rgba(100, 116, 139, 0.75)",
+    background: "rgba(100, 116, 139, 0.12)",
+    text: "#94a3b8",
+  };
+
+  return {
+    label: toTitleCase(rawType),
+    style: {
+      borderColor: palette.border,
+      backgroundColor: palette.background,
+      color: palette.text,
+    },
+  };
+}
+
 /* ───────────────────── Markdown Renderer ─────────────────── */
 
 /**
@@ -106,6 +188,15 @@ function MarkdownWithCitations({
   sources: Source[];
   onCitationClick: () => void;
 }) {
+  const sourcesByCitation = React.useMemo(() => {
+    const m = new Map<number, Source>();
+    sources.forEach((s, i) => {
+      const n = getCitationIndex(s, i);
+      if (!m.has(n)) m.set(n, s);
+    });
+    return m;
+  }, [sources]);
+
   // Split on citation markers like [1], [2], [12] etc.
   const parts = content.split(/(\[\d+\])/g);
 
@@ -122,7 +213,7 @@ function MarkdownWithCitations({
               className="citation-badge"
               style={{ backgroundColor: color }}
               onClick={onCitationClick}
-              title={sources[num - 1]?.title || `Reference ${num}`}
+              title={sourcesByCitation.get(num)?.title || `Reference ${num}`}
             >
               {num}
             </span>
@@ -408,13 +499,15 @@ export default function Home() {
                 </div>
               ) : (
                 messages.map((msg, idx) => {
-                  const drugSources =
-                    msg.sources?.filter(
-                      (s) =>
-                        s.source === "dailymed" ||
-                        s.pmcid?.startsWith("dailymed_"),
-                    ) || [];
-                  const allSources = msg.sources || [];
+                  const allSources = (msg.sources || [])
+                    .map((s, i) => ({ source: s, citation: getCitationIndex(s, i) }))
+                    .sort((a, b) => a.citation - b.citation)
+                    .map((x) => x.source);
+                  const drugSources = allSources.filter(
+                    (s) =>
+                      s.source === "dailymed" ||
+                      s.pmcid?.startsWith("dailymed_"),
+                  );
                   const hierarchy = msg.evidenceHierarchy;
                   const tab = msg.activeTab || "answer";
 
@@ -524,9 +617,11 @@ export default function Home() {
                                 gap: "0.75rem",
                               }}
                             >
-                              {drugSources.map((s, si) => (
+                              {drugSources.map((s, si) => {
+                                const dmCitation = getCitationIndex(s, si);
+                                return (
                                 <div key={si} className="drug-card">
-                                  <h3>💊 {s.title}</h3>
+                                  <h3>💊 [{dmCitation}] {s.title}</h3>
                                   <div
                                     style={{
                                       fontSize: "0.8rem",
@@ -546,7 +641,8 @@ export default function Home() {
                                     📋 View on DailyMed →
                                   </a>
                                 </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           )}
 
@@ -588,108 +684,105 @@ export default function Home() {
                               ) : null}
 
                               {/* Source cards */}
-                              {allSources.map((s, si) => (
-                                <div key={si} className="ref-card">
+                              {allSources.map((s, si) => {
+                                const citationNumber = getCitationIndex(s, si);
+                                const articleTypeBadge = getArticleTypeBadge(s);
+                                return (
                                   <div
-                                    className="ref-number"
-                                    style={{
-                                      backgroundColor:
-                                        CITATION_COLORS[
-                                        si % CITATION_COLORS.length
-                                        ],
-                                    }}
+                                    key={`${s.pmcid || s.doi || s.title || "ref"}-${si}`}
+                                    className="ref-card"
                                   >
-                                    {si + 1}
-                                  </div>
-                                  <div style={{ flex: 1, minWidth: 0 }}>
-                                    <a
-                                      href={getArticleUrl(s)}
-                                      target="_blank"
-                                      rel="noreferrer"
-                                      className="ref-title"
+                                    <div
+                                      className="ref-number"
                                       style={{
-                                        color:
+                                        backgroundColor:
                                           CITATION_COLORS[
-                                          si % CITATION_COLORS.length
+                                            (citationNumber - 1) % CITATION_COLORS.length
                                           ],
                                       }}
                                     >
-                                      {s.title}
-                                    </a>
-                                    <div className="ref-authors">
-                                      {formatAuthors(s.authors)}
+                                      {citationNumber}
                                     </div>
-                                    <div className="ref-meta">
-                                      {s.journal && (
-                                        <span>{s.journal}. </span>
-                                      )}
-                                      {s.year && <span>{s.year}; </span>}
-                                      {s.doi && (
-                                        <a
-                                          href={`https://doi.org/${s.doi.replace(/^https?:\/\/doi\.org\//, "")}`}
-                                          target="_blank"
-                                          rel="noreferrer"
-                                        >
-                                          doi:{s.doi}
-                                        </a>
-                                      )}
-                                    </div>
+                                    <div style={{ flex: 1, minWidth: 0 }}>
+                                      <a
+                                        href={getArticleUrl(s)}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        className="ref-title"
+                                        style={{
+                                          color:
+                                            CITATION_COLORS[
+                                              (citationNumber - 1) % CITATION_COLORS.length
+                                            ],
+                                        }}
+                                      >
+                                        {s.title}
+                                      </a>
+                                      <div className="ref-meta">
+                                        {s.journal && (
+                                          <span>{s.journal}. </span>
+                                        )}
+                                        {s.year && <span>{s.year}; </span>}
+                                        {s.doi && (
+                                          <a
+                                            href={`https://doi.org/${s.doi.replace(/^https?:\/\/doi\.org\//, "")}`}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                          >
+                                            doi:{s.doi}
+                                          </a>
+                                        )}
+                                      </div>
 
-                                    <div className="ref-badges">
-                                      {s.evidence_grade && (
-                                        <span
-                                          className="evidence-badge"
-                                          style={{
-                                            color:
-                                              EVIDENCE_COLORS[
-                                              s.evidence_grade
-                                              ] || "#64748b",
-                                            borderColor:
-                                              EVIDENCE_COLORS[
-                                              s.evidence_grade
-                                              ] || "#64748b",
-                                          }}
-                                          title={
-                                            s.evidence_source
-                                              ? `From ${s.evidence_source}`
-                                              : "Evidence grade"
-                                          }
-                                        >
-                                          {s.evidence_grade}
-                                          {s.evidence_level
-                                            ? ` · L${s.evidence_level}`
-                                            : ""}
-                                        </span>
-                                      )}
-                                      {s.evidence_term && (
-                                        <span className="badge-article-type">
-                                          🧪 {s.evidence_term}
-                                        </span>
-                                      )}
-                                      {s.article_type && (
-                                        <span className="badge-article-type">
-                                          📋{" "}
-                                          {s.article_type
-                                            .replace(/_/g, " ")
-                                            .replace(/\b\w/g, (c) =>
-                                              c.toUpperCase(),
-                                            )}
-                                        </span>
-                                      )}
-                                      {s.pdf_url && (
-                                        <button
-                                          className="pdf-badge"
-                                          onClick={() =>
-                                            setPdfUrl(s.pdf_url!)
-                                          }
-                                        >
-                                          📕 PDF
-                                        </button>
-                                      )}
+                                      <div className="ref-badges">
+                                        {s.evidence_grade && (
+                                          <span
+                                            className="evidence-badge"
+                                            style={{
+                                              color:
+                                                EVIDENCE_COLORS[
+                                                  s.evidence_grade
+                                                ] || "#64748b",
+                                              borderColor:
+                                                EVIDENCE_COLORS[
+                                                  s.evidence_grade
+                                                ] || "#64748b",
+                                            }}
+                                            title={
+                                              s.evidence_source
+                                                ? `From ${s.evidence_source}`
+                                                : "Evidence grade"
+                                            }
+                                          >
+                                            {s.evidence_grade}
+                                            {s.evidence_level
+                                              ? ` · L${s.evidence_level}`
+                                              : ""}
+                                          </span>
+                                        )}
+                                        {articleTypeBadge && (
+                                          <span
+                                            className="badge-article-type"
+                                            style={articleTypeBadge.style}
+                                          >
+                                            📋 {articleTypeBadge.label}
+                                          </span>
+                                        )}
+                                        {s.pdf_url && (
+                                          <button
+                                            className="pdf-badge"
+                                            onClick={() =>
+                                              setPdfUrl(s.pdf_url!)
+                                            }
+                                          >
+                                            📕 PDF
+                                          </button>
+                                        )}
+                                      </div>
                                     </div>
                                   </div>
-                                </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           )}
                         </div>

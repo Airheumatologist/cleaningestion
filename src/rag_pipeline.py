@@ -12,6 +12,7 @@ Designed for speed and quality clinical decision support.
 
 import logging
 import re
+import hashlib
 from typing import List, Dict, Any, Generator
 from dataclasses import asdict
 from openai import OpenAI
@@ -36,6 +37,7 @@ from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
 from .reranker import PaperFinderWithReranker
 from .prompts import ELIXIR_SYSTEM_PROMPT
+from .query_cache import QueryCache
 try:
     from scripts.ingestion_utils import get_evidence_hierarchy_levels
 except Exception:
@@ -106,7 +108,37 @@ class MedicalRAGPipeline:
         logger.info("✅ Reranker initialized (DeepInfra Qwen3-Reranker-0.6B)")
         self.evidence_hierarchy = get_evidence_hierarchy_levels()
         
+        # Initialize Query Cache
+        self.cache = QueryCache()
+        prompt_hash = hashlib.sha256(ELIXIR_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:16]
+        reranker_model = getattr(getattr(self.paper_finder, "reranker_engine", None), "model", "unknown")
+        self._cache_key_context = {
+            "pipeline": "elixir",
+            "pipeline_cache_version": 2,
+            "llm_model": self.model,
+            "reranker_model": reranker_model,
+            "embedding_model": getattr(self.retriever, "embedding_model", "unknown"),
+            "collection_name": getattr(self.retriever, "collection_name", "unknown"),
+            "entity_filter_enabled": ENTITY_FILTER_ENABLED,
+            "prompt_hash": prompt_hash,
+            "n_retrieval": n_retrieval,
+            "n_rerank": n_rerank,
+            "final_top_articles": self.final_top_articles,
+        }
+        
         logger.info("✅ Pipeline initialized (Elixir direct synthesis)")
+
+    def _cache_get(self, query: str) -> Dict[str, Any] | None:
+        """Read query cache using pipeline context so stale entries are isolated."""
+        if not self.cache.enabled:
+            return None
+        return self.cache.get(query, **self._cache_key_context)
+
+    def _cache_set(self, query: str, response: Dict[str, Any]):
+        """Write query cache using pipeline context."""
+        if not self.cache.enabled:
+            return
+        self.cache.set(query, response, **self._cache_key_context)
     
     # =========================================================================
     # Step 1: Query Preprocessing
@@ -734,9 +766,12 @@ class MedicalRAGPipeline:
             source_num = len(context_parts) + 1
             
             if hasattr(row, 'to_dict'):
-                used_papers.append(row.to_dict())
+                paper_dict = row.to_dict()
             else:
-                used_papers.append(dict(row))
+                paper_dict = dict(row)
+            # Preserve canonical citation index so UI/reference ordering is stable.
+            paper_dict["citation_index"] = source_num
+            used_papers.append(paper_dict)
 
             paper_info = f"**[{source_num}]** {row.get('title', 'Untitled')}"
             if row.get('venue') or row.get('journal'):
@@ -854,6 +889,7 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
 2. **Provide comparative analyses**: Efficacy comparisons with data points and safety profiles.
 3. **Structure**: Use clear hierarchical headings, markdown tables for comparisons/staging, and evidence-based recommendations.
 4. **Citation**: Use inline citations **[1]**, **[2]**, etc. strictly.
+   - DailyMed drug labels use the same citation numbering namespace as journal articles.
 5. **Depth**: High technical detail for physician decision-making. No word count limit, but maintain density.
 """
 
@@ -1098,21 +1134,44 @@ Please provide a comprehensive clinical response based on your medical knowledge
         if not papers:
             return []
         
+        normalized_papers = []
+        for i, paper in enumerate(papers):
+            if hasattr(paper, 'to_dict'):
+                p = paper.to_dict()
+            else:
+                p = dict(paper)
+            if p.get("citation_index") in (None, ""):
+                p["citation_index"] = i + 1
+            normalized_papers.append(p)
+
         sources = []
         # Use ThreadPoolExecutor for parallel PDF checks (max 10 concurrent)
         with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_paper = {executor.submit(check_single_pdf, paper): paper for paper in papers}
-            for future in as_completed(future_to_paper):
+            future_to_order = {
+                executor.submit(check_single_pdf, paper): i
+                for i, paper in enumerate(normalized_papers)
+            }
+            for future in as_completed(future_to_order):
                 try:
                     source = future.result()
+                    source["_order_index"] = future_to_order[future]
                     sources.append(source)
                 except Exception as e:
                     logger.debug(f"PDF check thread failed: {e}")
-        
-        # Preserve original order (as_completed returns in completion order)
-        # Re-sort by matching against original papers list
-        paper_order = {(p.get("doi", "") or p.get("pmcid", "") or p.get("corpus_id", "")): i for i, p in enumerate(papers)}
-        sources.sort(key=lambda s: paper_order.get(s.get("doi", "") or s.get("pmcid", ""), 999))
+
+        # Preserve stable citation order for UI/inline citation mapping.
+        def _citation_rank(source: Dict[str, Any]) -> int:
+            val = source.get("citation_index")
+            try:
+                if val is None or val == "":
+                    return 10**9
+                return int(val)
+            except (TypeError, ValueError):
+                return 10**9
+
+        sources.sort(key=lambda s: (_citation_rank(s), s.get("_order_index", 10**9)))
+        for source in sources:
+            source.pop("_order_index", None)
         
         # Count and log PDFs found
         pdf_count = sum(1 for s in sources if s.get("pdf_url"))
@@ -1173,6 +1232,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "source": source_type,
             "set_id": set_id,
             "dailymed_url": f"https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid={set_id}" if set_id else None,
+            "citation_index": sanitize(p.get("citation_index"), None),
         }
     
     # =========================================================================
@@ -1189,6 +1249,13 @@ Please provide a comprehensive clinical response based on your medical knowledge
         logger.info(f"🔬 Elixir Pipeline: {query}")
         logger.info(f"{'='*60}")
         
+        # Step 0: Check Cache
+        cached_result = self._cache_get(query)
+        if cached_result:
+            # Add a marker that this was a cache hit
+            cached_result["status"] = "cache_hit"
+            return cached_result
+
         # Step 1: Preprocess
         processed_query = self.preprocess_query(query)
         
@@ -1208,7 +1275,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
             # No passages retrieved - use fallback LLM generation
             logger.info("📭 No passages retrieved, using fallback generation")
             answer, _ = self._run_fallback_generation(query, stream=False)
-            return {
+            result = {
                 "query": query,
                 "report_title": "Clinical Response (No Sources)",
                 "answer": answer,
@@ -1217,6 +1284,9 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "evidence_hierarchy": self.evidence_hierarchy,
                 "status": "fallback"
             }
+            # Cache the fallback result too
+            self._cache_set(query, result)
+            return result
         
         # Step 3: Rerank & Aggregate
         # Pass LLM-extracted medical conditions AND typo-corrected conditions for strict filtering
@@ -1233,7 +1303,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
             # No papers after filtering - use fallback LLM generation
             logger.info("📭 No papers after filtering, using fallback generation")
             answer, _ = self._run_fallback_generation(query, stream=False)
-            return {
+            result = {
                 "query": query,
                 "report_title": "Clinical Response (No Sources)",
                 "answer": answer,
@@ -1242,26 +1312,29 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "evidence_hierarchy": self.evidence_hierarchy,
                 "status": "fallback"
             }
+            # Cache fallback
+            self._cache_set(query, result)
+            return result
         
         # Step 4: Direct LLM Synthesis
-        result = self.run_generation(query, papers_df)
+        synth_result = self.run_generation(query, papers_df)
         
         # Handle tuple return (answer, used_papers) or error string
-        if isinstance(result, tuple):
-            if len(result) == 2:
-                answer, used_papers = result
+        if isinstance(synth_result, tuple):
+            if len(synth_result) == 2:
+                answer, used_papers = synth_result
             else:
-                answer = result[0]
+                answer = synth_result[0]
                 used_papers = []
         else:
             # Error case
-            answer = result
+            answer = synth_result
             used_papers = []
         
         # Step 5: Check PDF availability via Europe PMC for all used papers
         sources_with_pdf = self._check_pdf_availability(used_papers)
         
-        return {
+        final_result = {
             "query": query,
             "report_title": "Clinical Response",
             "answer": answer,
@@ -1275,6 +1348,11 @@ Please provide a comprehensive clinical response based on your medical knowledge
             },
             "status": "success"
         }
+        
+        # Step 6: Store in Cache
+        self._cache_set(query, final_result)
+        
+        return final_result
     
     def answer_streaming(
         self,
@@ -1282,6 +1360,21 @@ Please provide a comprehensive clinical response based on your medical knowledge
     ) -> Generator[Dict[str, Any], None, None]:
         """Streaming version for real-time UI updates with parallel PDF checks."""
         from concurrent.futures import ThreadPoolExecutor
+
+        cached_result = self._cache_get(query)
+        if cached_result:
+            cached_result["status"] = "cache_hit"
+            yield {
+                "step": "complete",
+                "status": "cache_hit",
+                "report_title": cached_result.get("report_title", "Clinical Response"),
+                "answer": cached_result.get("answer", ""),
+                "sources": cached_result.get("sources", []),
+                "evidence_hierarchy": cached_result.get("evidence_hierarchy", self.evidence_hierarchy),
+                "abstracts_used": cached_result.get("retrieval_stats", {}).get("abstracts_used", 0),
+                "cache_hit": True,
+            }
+            return
 
         # Step 1: Preprocess
         yield {"step": "query_expansion", "status": "running", "message": "Analyzing query..."}
@@ -1321,6 +1414,20 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "evidence_hierarchy": self.evidence_hierarchy,
                 "abstracts_used": 0
             }
+            self._cache_set(query, {
+                "query": query,
+                "report_title": "Clinical Response (No Sources)",
+                "answer": final_answer,
+                "sections": [],
+                "sources": [],
+                "evidence_hierarchy": self.evidence_hierarchy,
+                "status": "fallback",
+                "retrieval_stats": {
+                    "passages_retrieved": 0,
+                    "papers_after_aggregation": 0,
+                    "abstracts_used": 0
+                }
+            })
             return
 
         # Step 3: Reranking
@@ -1370,6 +1477,20 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "evidence_hierarchy": self.evidence_hierarchy,
                 "abstracts_used": 0
             }
+            self._cache_set(query, {
+                "query": query,
+                "report_title": "Clinical Response (No Sources)",
+                "answer": final_answer,
+                "sections": [],
+                "sources": initial_sources if initial_sources else [],
+                "evidence_hierarchy": self.evidence_hierarchy,
+                "status": "fallback",
+                "retrieval_stats": {
+                    "passages_retrieved": len(passages),
+                    "papers_after_aggregation": 0,
+                    "abstracts_used": 0
+                }
+            })
             return
 
         # used_papers already computed above; reuse for generation
@@ -1435,7 +1556,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
         logger.info(f"🔍 Streaming Complete: Returning {len(final_sources)} sources")
 
         # Final event
-        yield {
+        final_result = {
             "step": "complete",
             "status": "success",
             "report_title": "Clinical Response",
@@ -1445,6 +1566,21 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "abstracts_used": len(used_papers),
             "original_sources_count": len(pdf_results)
         }
+        yield final_result
+        self._cache_set(query, {
+            "query": query,
+            "report_title": final_result["report_title"],
+            "answer": final_result["answer"],
+            "sections": [],
+            "sources": final_result["sources"],
+            "evidence_hierarchy": final_result["evidence_hierarchy"],
+            "status": "success",
+            "retrieval_stats": {
+                "passages_retrieved": len(passages),
+                "papers_after_aggregation": len(papers_df),
+                "abstracts_used": len(used_papers),
+            }
+        })
     
     # Backward compatibility
     def answer_scholarqa_style(self, query: str) -> Dict[str, Any]:
