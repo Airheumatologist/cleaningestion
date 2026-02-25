@@ -55,8 +55,175 @@ A production-grade **Medical RAG (Retrieval-Augmented Generation) Pipeline** des
 4. Hybrid retrieval from Qdrant (dense + sparse vectors)
 5. Reranking with evidence hierarchy (DeepInfra Qwen3-Reranker)
 6. Context building (intelligent section selection)
-7. LLM synthesis (DeepInfra Nemotron/DeepSeek)
+7. LLM synthesis (DeepInfra `openai/gpt-oss-20b`)
 8. Streaming response to frontend
+
+---
+
+## 🧭 Production Stack Integration (Developer Guide)
+
+This section is the source of truth for integrating product frontend services into the production stack.
+
+### 1) Production network model
+
+```
+┌──────────────────────────┐
+│ Browser (User)           │
+└────────────┬─────────────┘
+             │ HTTPS
+             ▼
+┌──────────────────────────┐
+│ Azure App Service        │
+│ Next.js (server runtime) │
+│ - Route handlers/proxy   │
+└────────────┬─────────────┘
+             │ Private traffic only
+             │ (WireGuard tunnel)
+             ▼
+┌──────────────────────────┐
+│ Hetzner rag-api:8000     │
+│ FastAPI + Gunicorn       │
+└────────────┬─────────────┘
+             │ Docker internal network
+             ▼
+┌──────────────────────────┐
+│ Qdrant (qdrant:6333)     │
+└──────────────────────────┘
+```
+
+Rules:
+1. Do not call Hetzner API directly from browser code.
+2. Do not expose bearer service token to client-side JavaScript.
+3. Keep Qdrant non-public; only `rag-api` talks to Qdrant over Docker network.
+
+### 2) API contract used by frontend services
+
+```
+Primary:
+  POST /api/v1/chat
+  POST /api/v1/chat/stream
+  GET  /api/v1/health
+  POST /api/v1/debug/decompose  (debug, protected)
+
+Temporary legacy aliases:
+  /api/chat         -> /api/v1/chat
+  /api/chat/stream  -> /api/v1/chat/stream
+  /health           -> /api/v1/health
+```
+
+Auth:
+```
+Authorization: Bearer <service_token>
+```
+
+Non-health auth behavior:
+1. `401` missing/invalid token
+2. `403` token disabled
+
+### 3) Request path expected from frontend
+
+```
+Browser fetch("/api/chat/stream")
+        │
+        ▼
+Next.js route handler (server)
+  injects Authorization header
+  forwards to Hetzner /api/v1/chat/stream
+        │
+        ▼
+SSE stream returns through same path back to browser
+```
+
+### 4) Required environment variables (frontend runtime)
+
+Set these in Azure App Service:
+
+```env
+RAG_API_BASE_URL=http://<private-hetzner-ip-or-dns>:8000
+RAG_API_TOKEN=<service_token>
+```
+
+For local integration via SSH tunnel:
+
+```env
+RAG_API_BASE_URL=http://localhost:8001
+RAG_API_TOKEN=<same-test-token>
+```
+
+### 5) Minimal Next.js server proxy examples
+
+Use this server-proxy pattern for production. A pure rewrite-only approach cannot safely attach service auth.
+
+`app/api/chat/route.ts` (sync):
+
+```ts
+export async function POST(req: Request) {
+  const body = await req.text();
+  const upstream = await fetch(`${process.env.RAG_API_BASE_URL}/api/v1/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.RAG_API_TOKEN}`,
+    },
+    body,
+  });
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: {
+      "Content-Type": upstream.headers.get("content-type") ?? "application/json",
+    },
+  });
+}
+```
+
+`app/api/chat/stream/route.ts` (SSE):
+
+```ts
+export async function POST(req: Request) {
+  const body = await req.text();
+  const upstream = await fetch(`${process.env.RAG_API_BASE_URL}/api/v1/chat/stream`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.RAG_API_TOKEN}`,
+    },
+    body,
+  });
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    },
+  });
+}
+```
+
+Your browser/client components should call only relative paths:
+1. `/api/chat`
+2. `/api/chat/stream`
+
+### 6) Local test topology (Mac + tunnel)
+
+```
+Mac Browser (localhost:3000/3001)
+        │
+        ▼
+Local Next.js server
+        │ calls RAG_API_BASE_URL=http://localhost:8001
+        ▼
+SSH tunnel localhost:8001 -> Hetzner localhost:8000
+        │
+        ▼
+Hetzner rag-api
+```
+
+Reference docs:
+1. `deploy/hetzner/README.md`
+2. `deploy/integration/README.md`
 
 ---
 
@@ -99,7 +266,7 @@ RAG-pipeline/
 │   ├── medical_qdrant_client.py            # Qdrant client wrapper
 │   ├── medical_entity_expander.py          # MeSH acronym expansion
 │   ├── bm25_sparse.py                      # BM25 sparse encoder
-│   ├── bm25_sparse.py                      # BM25 sparse encoder for hybrid search
+│   ├── service_auth.py                     # Bearer token validation + hash utils
 │   └── specialty_journals.py               # Journal priority lists
 │
 ├── scripts/                                # Data ingestion pipeline
@@ -124,7 +291,8 @@ RAG-pipeline/
 │   └── next.config.ts                      # Next.js configuration
 │
 ├── deploy/                                 # Deployment configurations
-│   └── hetzner_setup.md                    # Self-hosted Qdrant guide
+│   ├── hetzner/README.md                   # Co-located Hetzner stack (Qdrant + rag-api)
+│   └── integration/README.md               # Service integration contract + examples
 │
 ├── start_ingestion.sh                      # Interactive ingestion starter
 ├── start_remaining_ingestion.sh            # Resume partial ingestion
@@ -141,6 +309,25 @@ RAG-pipeline/
 ### 1. Query Preprocessing (`src/query_preprocessor.py`)
 
 Uses LLM to decompose queries into structured components:
+
+```text
+                  ┌────────────────────┐
+                  │    Raw Query:      │
+                  │  "NUEROBROCELLOSIS │
+                  │     treatmnts"     │
+                  └─────────┬──────────┘
+                            │
+                  ┌─────────▼──────────┐
+                  │ LLM Decomposition  │
+                  └─────────┬──────────┘
+        ┌───────────────────┼───────────────────┐
+        ▼                   ▼                   ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│Corrected Query│   │   Entities    │   │  Query Vars   │
+│Neurobrucellosis   │ - Medications │   │ - Diagnosis   │
+│ treatments    │   │ - Conditions  │   │ - Treatment   │
+└───────────────┘   └───────────────┘   └───────────────┘
+```
 
 ```python
 class DecomposedQuery(BaseModel):
@@ -165,6 +352,19 @@ class DecomposedQuery(BaseModel):
 
 Implements batched hybrid search with RRF (Reciprocal Rank Fusion):
 
+```text
+┌──────────────┐     ┌───────────────────────┐
+│              │     │      Qdrant DB        │
+│    Query     ├────►│ ┌────────┐ ┌────────┐ │
+│  Variations  │     │ │ Dense  │ │ Sparse │ │
+│              │     │ │(Cosine)│ │ (BM25) │ │
+└──────────────┘     │ └────────┘ └────────┘ │
+                     │       Fusion (RRF)    │
+                     └───────────┬───────────┘
+                                 ▼
+                         400 Top Chunks
+```
+
 ```python
 # Dense + Sparse vectors combined
 dense_weight = 0.7    # Semantic similarity (Qwen3 embeddings)
@@ -185,6 +385,28 @@ batch_results = client.query_batch_points(
 ### 3. Reranker with Evidence Hierarchy (`src/reranker.py`)
 
 Multi-factor scoring system:
+
+```text
+┌───────────────┐    ┌────────────────────────┐
+│  400 Chunks   ├───►│     Qwen3 Reranker     │
+│  from Qdrant  │    │    (DeepInfra API)     │
+└───────────────┘    └───────────┬────────────┘
+                                 │ (Primary Score)
+                   ┌─────────────▼────────────┐
+                   │   Entity Match Filter    │
+                   │    (30% Score Weight)    │
+                   └─────────────┬────────────┘
+                                 │
+                   ┌─────────────▼────────────┐
+                   │ Evidence Tier Multiplier │
+                   │  Guidelines: x3.0 Boost  │
+                   │  RCTs:       x1.5 Boost  │
+                   │  Case Rep:  x0.2 Penalty │
+                   └─────────────┬────────────┘
+                                 ▼
+                       Final Top 100 Chunks 
+                        Passed to Context
+```
 
 ```python
 # Evidence tier multipliers (defined in reranker.py)
@@ -243,6 +465,9 @@ Intelligent context assembly in `_get_papers_for_context()`:
 
 ## 🛠️ Setup & Development
 
+If you are integrating an existing product frontend into production, start with the
+`Production Stack Integration (Developer Guide)` section above and use this section only for local pipeline development.
+
 ### Prerequisites
 
 - Python 3.11+
@@ -275,7 +500,7 @@ Edit `.env` with team credentials:
 # =============================================================================
 # QDRANT (Self-Hosted on Private Server - Hetzner)
 # =============================================================================
-QDRANT_URL=http://65.109.112.253:6333
+QDRANT_URL=http://qdrant:6333
 QDRANT_API_KEY=<ask-team-lead>
 QDRANT_COLLECTION=rag_pipeline
 COLLECTION_NAME=rag_pipeline
@@ -286,6 +511,16 @@ COLLECTION_NAME=rag_pipeline
 DEEPINFRA_API_KEY=<ask-team-lead>
 LLM_MODEL=openai/gpt-oss-20b
 DEEPINFRA_BASE_URL=https://api.deepinfra.com/v1/openai
+DEEPINFRA_CHAT_TIMEOUT_SECONDS=300
+DEEPINFRA_EMBED_TIMEOUT_SECONDS=120
+DEEPINFRA_RERANK_TIMEOUT_SECONDS=60
+
+# =============================================================================
+# API SERVICE AUTH
+# =============================================================================
+API_AUTH_ENABLED=true
+API_KEYS_FILE=/opt/RAG-pipeline/api_keys.json
+API_KEYS_CACHE_TTL_SECONDS=30
 
 # Embedding Model
 EMBEDDING_PROVIDER=deepinfra
@@ -459,6 +694,16 @@ government-authored articles.
 
 ### Chunking Strategy
 
+```text
+┌────────────────────────────────────────────────────────┐
+│                  Original Document                     │
+├──────────────────┬──────────────────┬──────────────────┤
+│   Chunk 1 (2k)   │   Chunk 2 (2k)   │   Chunk 3 (2k)   │
+└────────┬─────────┴────────┬─────────┴────────┬─────────┘
+         │      Overlap     │      Overlap     │
+         ◄────256 tokens────►────256 tokens────►
+```
+
 **PMC Articles:**
 - Abstract chunk (title + abstract)
 - Section chunks with context: "Title: X\n\nSection: Y\n\nContent"
@@ -505,7 +750,10 @@ client.update_collection(
 
 ## 🔌 API Endpoints
 
-### Chat Endpoint (Streaming) - PRIMARY
+These endpoints are for trusted service-to-service calls.
+Frontend browser code should call your app's internal Next.js API routes only.
+
+### `POST /api/v1/chat/stream` (Primary SSE)
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/chat/stream \
@@ -525,7 +773,7 @@ data: {"step": "complete", "status": "success", "answer": "...", "sources": [...
 data: [DONE]
 ```
 
-### Non-Streaming Chat
+### `POST /api/v1/chat` (Non-streaming)
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/chat \
@@ -534,7 +782,7 @@ curl -X POST http://localhost:8000/api/v1/chat \
   -d '{"query": "Management of IgG4-related disease"}'
 ```
 
-### Query Decomposition (Debug)
+### `POST /api/v1/debug/decompose` (Debug, auth required)
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/debug/decompose \
@@ -543,7 +791,7 @@ curl -X POST http://localhost:8000/api/v1/debug/decompose \
   -d '{"query": "Systematic reviews on SGLT2 inhibitors from 2020"}'
 ```
 
-### Health + OpenAPI
+### `GET /api/v1/health` + OpenAPI
 
 ```bash
 curl http://localhost:8000/api/v1/health
@@ -551,9 +799,17 @@ curl http://localhost:8000/api/v1/openapi.json
 ```
 
 Legacy aliases remain temporarily:
-- `/api/chat` -> `/api/v1/chat`
-- `/api/chat/stream` -> `/api/v1/chat/stream`
-- `/health` -> `/api/v1/health`
+1. `/api/chat` -> `/api/v1/chat`
+2. `/api/chat/stream` -> `/api/v1/chat/stream`
+3. `/health` -> `/api/v1/health`
+
+Auth behavior on non-health endpoints:
+1. `401` missing or invalid bearer token
+2. `403` disabled token
+
+Production rule:
+1. Never place `Authorization: Bearer ...` in client-side code.
+2. Keep token injection in server-side route handlers only.
 
 ---
 
@@ -603,15 +859,9 @@ python src/query_preprocessor.py
 
 Qdrant is self-hosted on Hetzner AX52 (64GB RAM, AMD Ryzen 7000).
 
-See `deploy/hetzner_setup.md` for:
-- Server provisioning
-- Docker setup
-- Qdrant configuration
-- Firewall rules
-
-Co-located API + Qdrant compose deployment:
-- [deploy/hetzner/README.md](deploy/hetzner/README.md)
-- [deploy/integration/README.md](deploy/integration/README.md)
+Use these production docs:
+1. [deploy/hetzner/README.md](deploy/hetzner/README.md)
+2. [deploy/integration/README.md](deploy/integration/README.md)
 
 ### Backend Deployment
 
@@ -631,6 +881,12 @@ cd frontend
 npm run build
 npm start  # Production mode
 ```
+
+Production frontend integration checklist:
+1. Browser calls only relative routes (for example `/api/chat/stream`).
+2. Next.js server routes inject `Authorization: Bearer <service_token>`.
+3. `RAG_API_BASE_URL` points to private Hetzner API endpoint.
+4. `RAG_API_TOKEN` stays server-only (`NEXT_PUBLIC_*` must not include tokens).
 
 ---
 
@@ -662,10 +918,13 @@ npm start  # Production mode
 
 ## 🔒 Security Notes
 
-- **Qdrant**: Protected by API key, firewall restricted to team IPs
-- **DeepInfra**: API key stored in environment variables only
-- **CORS**: Configure allowed frontend origins via `CORS_ALLOWED_ORIGINS` in `.env`
-- **No PII**: Pipeline processes only public medical literature
+1. **Qdrant**: keep private on Docker internal network in production.
+2. **Service auth**: non-health endpoints require bearer token validation from `API_KEYS_FILE`.
+3. **Token storage**: store hashed tokens only in `api_keys.json`; rotate on schedule/incidents.
+4. **Frontend security**: no service token in browser code, browser storage, or `NEXT_PUBLIC_*` envs.
+5. **DeepInfra key**: keep in server environment only.
+6. **CORS**: keep production origin list minimal.
+7. **No PII**: pipeline processes public medical literature only.
 
 ---
 

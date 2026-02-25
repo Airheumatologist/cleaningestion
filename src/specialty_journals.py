@@ -8,9 +8,14 @@ This module provides multiple journal identification methods:
 """
 
 import re
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from anyascii import anyascii
+
+
+def _normalize_journal_name(value: Any) -> str:
+    """Normalize journal names for exact token-boundary set membership checks."""
+    return re.sub(r"[^a-z0-9]+", " ", anyascii(str(value or "")).lower()).strip()
 
 # =============================================================================
 # NLM UNIQUE IDs (PREFERRED IDENTIFIER)
@@ -19,7 +24,7 @@ from anyascii import anyascii
 # https://www.ncbi.nlm.nih.gov/nlmcatalog/
 # NLM Unique IDs are the most stable journal identifiers available
 
-PRIORITY_JOURNALS_NLM = {
+_ALL_PRIORITY_JOURNALS_NLM = {
     # General/Multi-specialty High-Impact
     '7501160',  # JAMA
     '0255562',  # New England Journal of Medicine
@@ -304,6 +309,41 @@ PRIORITY_JOURNALS_NLM = {
     '9800481',  # Occupational and Environmental Medicine
 }
 
+# Explicit general/high-impact tier used for score boosts.
+GENERAL_HIGH_IMPACT_NLM = {
+    '7501160',    # JAMA
+    '0255562',    # New England Journal of Medicine
+    '2985213',    # The Lancet
+    '8900488',    # BMJ
+    '101589534',  # JAMA Internal Medicine
+    '0372351',    # Annals of Internal Medicine
+    '101231360',  # PLOS Medicine
+    '9502015',    # Nature Medicine
+    '101729235',  # JAMA Network Open
+    '101613665',  # The Lancet Global Health
+    '0267200',    # The American Journal of Medicine
+    '0405543',    # Mayo Clinic Proceedings
+    '8904841',    # Journal of Internal Medicine
+    '9711805',    # CMAJ
+    '101190723',  # BMC Medicine
+    '8605834',    # Journal of General Internal Medicine
+    '100959882',  # Journal of Medical Internet Research (JMIR)
+    '7802877',    # The Journal of Clinical Investigation
+    '8303128',    # Health Affairs
+    '101769500',  # JAMA Health Forum
+    '101672103',  # Nature Reviews. Disease Primers
+    '100909747',  # Cochrane Database of Systematic Reviews
+    '101505086',  # Science Translational Medicine
+    '101751302',  # The Lancet Digital Health
+    '101731738',  # npj Digital Medicine
+}
+
+SPECIALTY_JOURNALS_NLM = _ALL_PRIORITY_JOURNALS_NLM - GENERAL_HIGH_IMPACT_NLM
+PRIORITY_JOURNALS_NLM = GENERAL_HIGH_IMPACT_NLM | SPECIALTY_JOURNALS_NLM
+
+if not GENERAL_HIGH_IMPACT_NLM.issubset(_ALL_PRIORITY_JOURNALS_NLM):
+    raise ValueError("GENERAL_HIGH_IMPACT_NLM must be a subset of _ALL_PRIORITY_JOURNALS_NLM")
+
 # =============================================================================
 # JOURNAL NAME MATCHING (FALLBACK)
 # =============================================================================
@@ -508,10 +548,48 @@ Occupational and Environmental Medicine
 """
 
 PRIORITY_JOURNAL_NAMES = {
-    re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+    _normalize_journal_name(name)
     for name in _PRIORITY_JOURNAL_NAME_TEXT.splitlines()
     if name.strip()
 }
+
+_GENERAL_HIGH_IMPACT_NAME_TEXT = """
+JAMA
+New England Journal of Medicine
+The Lancet
+BMJ
+JAMA Internal Medicine
+Annals of Internal Medicine
+PLOS Medicine
+Nature Medicine
+JAMA Network Open
+The Lancet Global Health
+The American Journal of Medicine
+Mayo Clinic Proceedings
+Journal of Internal Medicine
+CMAJ
+BMC Medicine
+Journal of General Internal Medicine
+Journal of Medical Internet Research (JMIR)
+The Journal of Clinical Investigation
+Health Affairs
+JAMA Health Forum
+Nature Reviews. Disease Primers
+Cochrane Database of Systematic Reviews
+Science Translational Medicine
+The Lancet Digital Health
+npj Digital Medicine
+"""
+
+GENERAL_HIGH_IMPACT_NAMES = {
+    _normalize_journal_name(name)
+    for name in _GENERAL_HIGH_IMPACT_NAME_TEXT.splitlines()
+    if name.strip()
+}
+SPECIALTY_JOURNALS_NAMES = PRIORITY_JOURNAL_NAMES - GENERAL_HIGH_IMPACT_NAMES
+
+if not GENERAL_HIGH_IMPACT_NAMES.issubset(PRIORITY_JOURNAL_NAMES):
+    raise ValueError("GENERAL_HIGH_IMPACT_NAMES must be a subset of PRIORITY_JOURNAL_NAMES")
 
 # =============================================================================
 # COMBINED PRIORITY SETS
@@ -927,6 +1005,30 @@ def detect_guideline_society_signal(
     }
 
 
+def get_journal_tier(
+    journal_name: Optional[str] = None,
+    nlm_id: Optional[str] = None,
+) -> Literal["specialty", "general", "none"]:
+    """
+    Classify a journal into specialty/general/none using NLM ID first, then name.
+    """
+    normalized_nlm_id = str(nlm_id or "").strip()
+    if normalized_nlm_id:
+        if normalized_nlm_id in SPECIALTY_JOURNALS_NLM:
+            return "specialty"
+        if normalized_nlm_id in GENERAL_HIGH_IMPACT_NLM:
+            return "general"
+
+    normalized_name = _normalize_journal_name(journal_name)
+    if normalized_name:
+        if normalized_name in SPECIALTY_JOURNALS_NAMES:
+            return "specialty"
+        if normalized_name in GENERAL_HIGH_IMPACT_NAMES:
+            return "general"
+
+    return "none"
+
+
 def is_priority_journal(
     nlm_unique_id: Optional[str] = None,
     journal_name: Optional[str] = None,
@@ -941,12 +1043,4 @@ def is_priority_journal(
     Returns:
         True if the journal is a priority journal
     """
-    if nlm_unique_id and nlm_unique_id in PRIORITY_JOURNALS_NLM:
-        return True
-        
-    if journal_name:
-        normalized = re.sub(r"[^a-z0-9]+", " ", journal_name.lower()).strip()
-        if normalized in PRIORITY_JOURNAL_NAMES:
-            return True
-            
-    return False
+    return get_journal_tier(journal_name=journal_name, nlm_id=nlm_unique_id) != "none"

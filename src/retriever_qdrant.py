@@ -170,6 +170,26 @@ class QdrantRetriever(AbstractRetriever):
         """Stable document ID for paper-level aggregation."""
         return str(payload.get("pmcid") or payload.get("doc_id") or payload.get("pmid") or "")
 
+    @staticmethod
+    def _chunk_sort_key(payload: Dict[str, Any]) -> tuple:
+        """Stable chunk ordering key for article reconstruction."""
+        def _as_int(value: Any, default: int = 10**9) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        chunk_index = _as_int(payload.get("chunk_index"))
+        char_offset = _as_int(
+            payload.get("char_offset")
+            or payload.get("char_start_offset")
+            or payload.get("start_offset")
+            or payload.get("offset")
+        )
+        chunk_id = str(payload.get("chunk_id") or "")
+        section_id = str(payload.get("section_id") or "")
+        return (chunk_index, char_offset, section_id, chunk_id)
+
     def _extract_evidence_metadata(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Extract normalized evidence metadata from Qdrant payload."""
         return {
@@ -914,6 +934,56 @@ class QdrantRetriever(AbstractRetriever):
         except Exception as e:
             logger.error(f"Additional papers retrieval error: {e}")
             return []
+
+    def get_all_chunks_for_doc(self, doc_id: str) -> List[Dict[str, Any]]:
+        """
+        Fetch all chunks for a document ID via scroll pagination.
+
+        Chunks are returned in deterministic article order for full-text reconstruction.
+        """
+        normalized_doc_id = str(doc_id or "").strip()
+        if not normalized_doc_id:
+            return []
+
+        def _scroll_all(field_name: str, value: str) -> List[Dict[str, Any]]:
+            query_filter = Filter(
+                must=[FieldCondition(key=field_name, match=MatchValue(value=value))]
+            )
+            all_payloads: List[Dict[str, Any]] = []
+            offset = None
+
+            while True:
+                results, offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=query_filter,
+                    offset=offset,
+                    limit=256,
+                    with_payload=True,
+                )
+
+                if not results:
+                    break
+
+                for point in results:
+                    payload = point.payload or {}
+                    if payload:
+                        all_payloads.append(payload)
+
+                if offset is None:
+                    break
+
+            return all_payloads
+
+        try:
+            all_chunks = _scroll_all("doc_id", normalized_doc_id)
+            if not all_chunks and normalized_doc_id.upper().startswith("PMC"):
+                all_chunks = _scroll_all("pmcid", normalized_doc_id.upper())
+        except Exception as e:
+            logger.warning("Failed to fetch chunks for doc_id=%s: %s", normalized_doc_id, e)
+            return []
+
+        all_chunks.sort(key=self._chunk_sort_key)
+        return all_chunks
     
     def _drug_name_matches(self, search_term: str, label_name: str, additional_text: str = "") -> bool:
         """

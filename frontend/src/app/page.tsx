@@ -284,7 +284,10 @@ export default function Home() {
     try {
       const res = await fetch("/api/chat/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer elixir-dev-token-2024-xyz789"
+        },
         body: JSON.stringify({ query: q, stream: true }),
       });
       if (!res.ok) throw new Error("API request failed");
@@ -620,27 +623,27 @@ export default function Home() {
                               {drugSources.map((s, si) => {
                                 const dmCitation = getCitationIndex(s, si);
                                 return (
-                                <div key={si} className="drug-card">
-                                  <h3>💊 [{dmCitation}] {s.title}</h3>
-                                  <div
-                                    style={{
-                                      fontSize: "0.8rem",
-                                      color: "var(--text-secondary)",
-                                      marginBottom: "0.35rem",
-                                    }}
-                                  >
-                                    {formatAuthors(s.authors)}
+                                  <div key={si} className="drug-card">
+                                    <h3>💊 [{dmCitation}] {s.title}</h3>
+                                    <div
+                                      style={{
+                                        fontSize: "0.8rem",
+                                        color: "var(--text-secondary)",
+                                        marginBottom: "0.35rem",
+                                      }}
+                                    >
+                                      {formatAuthors(s.authors)}
+                                    </div>
+                                    <a
+                                      href={
+                                        s.dailymed_url || getArticleUrl(s)
+                                      }
+                                      target="_blank"
+                                      rel="noreferrer"
+                                    >
+                                      📋 View on DailyMed →
+                                    </a>
                                   </div>
-                                  <a
-                                    href={
-                                      s.dailymed_url || getArticleUrl(s)
-                                    }
-                                    target="_blank"
-                                    rel="noreferrer"
-                                  >
-                                    📋 View on DailyMed →
-                                  </a>
-                                </div>
                                 );
                               })}
                             </div>
@@ -697,7 +700,7 @@ export default function Home() {
                                       style={{
                                         backgroundColor:
                                           CITATION_COLORS[
-                                            (citationNumber - 1) % CITATION_COLORS.length
+                                          (citationNumber - 1) % CITATION_COLORS.length
                                           ],
                                       }}
                                     >
@@ -712,7 +715,7 @@ export default function Home() {
                                         style={{
                                           color:
                                             CITATION_COLORS[
-                                              (citationNumber - 1) % CITATION_COLORS.length
+                                            (citationNumber - 1) % CITATION_COLORS.length
                                             ],
                                         }}
                                       >
@@ -741,11 +744,11 @@ export default function Home() {
                                             style={{
                                               color:
                                                 EVIDENCE_COLORS[
-                                                  s.evidence_grade
+                                                s.evidence_grade
                                                 ] || "#64748b",
                                               borderColor:
                                                 EVIDENCE_COLORS[
-                                                  s.evidence_grade
+                                                s.evidence_grade
                                                 ] || "#64748b",
                                             }}
                                             title={

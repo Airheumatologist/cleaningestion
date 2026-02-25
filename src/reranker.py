@@ -29,7 +29,7 @@ from .config import (
     ENTITY_SCORE_WEIGHT,
 )
 from .retry_utils import retry_with_exponential_backoff
-from .specialty_journals import detect_guideline_society_signal
+from .specialty_journals import detect_guideline_society_signal, get_journal_tier
 
 # Try to import medical entity expander for entity matching
 try:
@@ -136,40 +136,6 @@ GUIDELINE_TITLE_KEYWORDS = [
     # Specific patterns
     "acr/vasculitis", "aha/acc",
 ]
-
-# High-impact medical journals
-HIGH_IMPACT_JOURNALS = {
-    # Top general medical
-    "new england journal of medicine", "nejm",
-    "the lancet", "lancet",
-    "jama", "journal of the american medical association",
-    "bmj", "british medical journal",
-    "nature medicine",
-    "annals of internal medicine",
-    "jama internal medicine",
-    # Cardiology
-    "circulation", "european heart journal",
-    # Hematology/Oncology
-    "blood", "the lancet oncology", "lancet oncology",
-    "journal of clinical oncology",
-    # Gastroenterology/Hepatology
-    "gastroenterology", "hepatology", "gut",
-    "journal of hepatology",
-    "united european gastroenterology journal",  # IgG4-RD guidelines
-    "clinical gastroenterology and hepatology",
-    # Rheumatology
-    "arthritis & rheumatology", "arthritis care & research",
-    "annals of the rheumatic diseases",
-    "the lancet rheumatology", "lancet rheumatology",
-    "nature reviews rheumatology",
-    "rheumatology",
-    "autoimmunity reviews",
-    # Other specialties
-    "diabetes care", "chest",
-    # Drug labels
-    "dailymed",
-}
-
 
 def _normalize_match_text(value: Any) -> str:
     """Normalize free text for token-boundary matching."""
@@ -308,7 +274,9 @@ def apply_evidence_boosts(
     - Tier 4 (0.40x): Case reports, letters, editorials
     
     Smart Recency: Only applies to non-case-reports to preserve seminal older papers.
-    Journal Boost: High-impact journals get +15%.
+    Journal Boost:
+    - Specialty journals: +20%
+    - General/high-impact journals: +15%
     """
     if current_year is None:
         current_year = datetime.now().year
@@ -359,16 +327,23 @@ def apply_evidence_boosts(
                 except (ValueError, TypeError):
                     pass
         
-        # 3. High-impact journal boost (+15%)
+        # 3. Journal-tier boost (specialty > general/high-impact)
         journal_mult = 1.0
-        journal = (doc.get("journal") or doc.get("venue") or "").lower()
-        if any(j in journal for j in HIGH_IMPACT_JOURNALS):
+        journal_tier = get_journal_tier(
+            journal_name=doc.get("journal") or doc.get("venue"),
+            nlm_id=doc.get("nlm_unique_id"),
+        )
+        if journal_tier == "specialty":
+            journal_mult = 1.20
+        elif journal_tier == "general":
             journal_mult = 1.15
         
         # Calculate final boosted score
         doc["boosted_score"] = base_score * tier_mult * recency_mult * journal_mult
         doc["evidence_tier"] = tier_mult
         doc["boost_multiplier"] = tier_mult * recency_mult * journal_mult
+        doc["journal_tier"] = journal_tier
+        doc["journal_boost"] = journal_mult
         doc["is_case_report"] = is_case_report  # Track for debugging
         doc["guideline_society_match"] = society_signal["is_match"]
         doc["matched_guideline_societies"] = society_signal["matched_societies"]
@@ -666,7 +641,15 @@ class PaperFinderWithReranker:
         retrieved_ctxs = apply_evidence_boosts(retrieved_ctxs)
         
         # Log boost effects
-        boosted = [(d.get("article_type", "?"), d.get("boost_multiplier", 1.0)) for d in retrieved_ctxs[:5]]
+        boosted = [
+            (
+                d.get("article_type", "?"),
+                d.get("journal_tier", "none"),
+                d.get("journal_boost", 1.0),
+                d.get("boost_multiplier", 1.0),
+            )
+            for d in retrieved_ctxs[:5]
+        ]
         logger.info(f"Evidence boosts applied: {boosted}")
         
         # Sort by boosted_score (includes evidence hierarchy and entity matching)

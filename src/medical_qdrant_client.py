@@ -14,6 +14,9 @@ from qdrant_client.models import (
     ScalarQuantization,
     ScalarQuantizationConfig,
     ScalarType,
+    Filter,
+    FieldCondition,
+    MatchValue,
 )
 
 from .config import (
@@ -303,6 +306,68 @@ class MedicalQdrantClient:
         
         print(f"✅ Retrieved {len(all_articles)} unique articles")
         return all_articles
+
+    def get_all_chunks_for_doc(self, doc_id: str) -> List[Dict[str, Any]]:
+        """
+        Retrieve all chunk payloads for a given doc_id using scroll pagination.
+        """
+        normalized_doc_id = str(doc_id or "").strip()
+        if not normalized_doc_id:
+            return []
+
+        def _as_int(value: Any, default: int = 10**9) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _scroll_all(field_name: str, value: str) -> List[Dict[str, Any]]:
+            query_filter = Filter(
+                must=[FieldCondition(key=field_name, match=MatchValue(value=value))]
+            )
+            payloads: List[Dict[str, Any]] = []
+            next_offset = None
+
+            while True:
+                results, next_offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=query_filter,
+                    offset=next_offset,
+                    limit=256,
+                    with_payload=True,
+                )
+
+                if not results:
+                    break
+
+                for point in results:
+                    payload = point.payload or {}
+                    if payload:
+                        payloads.append(payload)
+
+                if next_offset is None:
+                    break
+
+            return payloads
+
+        all_chunks = _scroll_all("doc_id", normalized_doc_id)
+        if not all_chunks and normalized_doc_id.upper().startswith("PMC"):
+            all_chunks = _scroll_all("pmcid", normalized_doc_id.upper())
+
+        all_chunks.sort(
+            key=lambda payload: (
+                _as_int(payload.get("chunk_index")),
+                _as_int(
+                    payload.get("char_offset")
+                    or payload.get("char_start_offset")
+                    or payload.get("start_offset")
+                    or payload.get("offset")
+                ),
+                str(payload.get("section_id") or ""),
+                str(payload.get("chunk_id") or ""),
+            )
+        )
+        return all_chunks
 
 
 if __name__ == "__main__":

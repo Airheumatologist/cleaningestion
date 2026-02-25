@@ -733,7 +733,11 @@ class MedicalRAGPipeline:
         - Always: highlights + clinical_studies
         """
         from .specialty_journals import PRIORITY_JOURNALS, PRIORITY_JOURNALS_NLM
+        import math
+
         HIGH_VALUE_TYPES = {'review_article', 'clinical_trial', 'systematic_review', 'meta_analysis', 'guideline'}
+        MAX_ABSTRACT_CHARS = 1200
+        MAX_PMC_FULL_TEXT_CHARS = 30000
         
         priority_journal_papers = []
         other_papers = []
@@ -763,6 +767,14 @@ class MedicalRAGPipeline:
         used_papers = []
         context_parts = []
         dailymed_section_count = 0
+        pmc_full_text_included = 0
+
+        def _safe_str(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, float) and math.isnan(value):
+                return ""
+            return str(value).strip()
 
         for i, (idx, row) in enumerate(all_papers[:MAX_ABSTRACTS]):
             article_type = row.get('article_type', 'other')
@@ -824,15 +836,63 @@ class MedicalRAGPipeline:
                 text_content = self._clean_source_text(text_content)
                 paper_info += f"\n{text_content}"
             else:
-                # PMC articles: use abstract with 1200 char limit
-                text_content = row.get('abstract', '') or row.get('text', '')
+                pmcid = _safe_str(row.get('pmcid') or row.get('corpus_id')).upper()
+                doc_id = _safe_str(row.get('doc_id') or row.get('corpus_id') or row.get('pmcid'))
+                is_pmc_article = pmcid.startswith('PMC')
+
+                text_content = ""
+                if is_pmc_article and pmc_full_text_included < 2 and doc_id:
+                    chunks = self.retriever.get_all_chunks_for_doc(doc_id)
+                    reconstructed_text = self._reconstruct_full_text_from_chunks(chunks)
+                    if reconstructed_text:
+                        text_content = reconstructed_text[:MAX_PMC_FULL_TEXT_CHARS]
+                        pmc_full_text_included += 1
+
+                if not text_content:
+                    # For remaining PMC + PubMed, keep abstract-only context.
+                    text_content = (row.get('abstract', '') or row.get('text', ''))[:MAX_ABSTRACT_CHARS]
+
                 text_content = self._clean_source_text(text_content)
-                paper_info += f"\n{text_content[:1200]}"
+                paper_info += f"\n{text_content}"
             
             context_parts.append(paper_info)
             
-        logger.info(f"Context built: {len(context_parts)} papers ({dailymed_section_count} DailyMed with section selection).")
+        logger.info(
+            "Context built: %d papers (%d DailyMed with section selection, %d PMC full-text sources).",
+            len(context_parts),
+            dailymed_section_count,
+            pmc_full_text_included,
+        )
         return context_parts, used_papers
+
+    def _reconstruct_full_text_from_chunks(self, chunks: List[Dict[str, Any]]) -> str:
+        """
+        Reconstruct document text from ordered chunks while deduplicating section text.
+        """
+        if not chunks:
+            return ""
+
+        ordered_sections = []
+        seen_sections = set()
+
+        for chunk in chunks:
+            section_text = str(
+                chunk.get("full_section_text")
+                or chunk.get("page_content")
+                or chunk.get("text")
+                or ""
+            ).strip()
+            if not section_text:
+                continue
+
+            normalized = re.sub(r"\s+", " ", section_text).strip()
+            if not normalized or normalized in seen_sections:
+                continue
+
+            seen_sections.add(normalized)
+            ordered_sections.append(section_text)
+
+        return "\n\n".join(ordered_sections)
 
     def _clean_source_text(self, text: str) -> str:
         """
