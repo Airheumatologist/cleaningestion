@@ -1042,7 +1042,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
     def _check_pdf_availability(self, papers: list) -> list:
         """
         Check PDF availability for papers via Europe PMC API.
-        Uses DOI or PMCID to find open access PDFs.
+        Uses one batched Europe PMC query built from DOI/PMCID identifiers.
         
         Europe PMC API returns:
         - isOpenAccess: "Y" or "N" (string)
@@ -1059,78 +1059,53 @@ Please provide a comprehensive clinical response based on your medical knowledge
             List of source dicts with pdf_url field added where available
         """
         import requests
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        def check_single_pdf(paper) -> dict:
-            """Check PDF for a single paper via Europe PMC API."""
-            source = self._map_paper_to_source(paper)
-            
-            doi = source.get("doi", "")
-            pmcid = source.get("pmcid", "")
-            pmid = source.get("pmid", "")
-            
-            try:
-                # Build query - try DOI first, then PMCID, then PMID
-                query = None
-                if doi:
-                    query = f"DOI:{doi}"
-                elif pmcid:
-                    # Keep PMC prefix if present, add if not
-                    if str(pmcid).upper().startswith("PMC"):
-                        query = f"PMCID:{pmcid}"
-                    else:
-                        query = f"PMCID:PMC{pmcid}"
-                elif pmid:
-                    query = f"EXT_ID:{pmid}"
-                    
-                if not query:
-                    return self._map_paper_to_source(paper)
-                
-                api_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query={requests.utils.quote(query)}&format=json&resultType=core&pageSize=1"
-                
-                response = requests.get(api_url, timeout=10)
-                source = self._map_paper_to_source(paper)
-                if response.status_code == 200:
-                    data = response.json()
-                    results = data.get("resultList", {}).get("result", [])
-                    
-                    if results:
-                        article = results[0]
-                        
-                        # Method 1: Check fullTextUrlList for Open Access PDF (most reliable)
-                        url_list = article.get("fullTextUrlList", {}).get("fullTextUrl", [])
-                        for url_info in url_list:
-                            # Look for Open Access PDF
-                            doc_style = url_info.get("documentStyle", "").lower()
-                            avail_code = url_info.get("availabilityCode", "")
-                            availability = url_info.get("availability", "").lower()
-                            
-                            if doc_style == "pdf" and (avail_code == "OA" or "open access" in availability):
-                                source["pdf_url"] = url_info.get("url")
-                                logger.debug(f"Found PDF via fullTextUrlList: {source['pdf_url']}")
-                                break
-                        
-                        # Method 2: If no PDF found in fullTextUrlList, check hasPDF flag
-                        if not source["pdf_url"]:
-                            is_open_access = article.get("isOpenAccess") == "Y"
-                            in_epmc = article.get("inEPMC") == "Y"
-                            has_pdf = article.get("hasPDF") == "Y"
-                            
-                            if has_pdf and (is_open_access or in_epmc):
-                                article_pmcid = article.get("pmcid")
-                                if article_pmcid:
-                                    # Correct PDF URL format for Europe PMC
-                                    source["pdf_url"] = f"https://europepmc.org/articles/{article_pmcid}?pdf=render"
-                                    logger.debug(f"Constructed PDF URL from PMCID: {source['pdf_url']}")
-                                    
-            except requests.exceptions.Timeout:
-                logger.debug(f"PDF check timed out for {doi or pmcid or pmid}")
-                source = self._map_paper_to_source(paper)
-            except Exception as e:
-                logger.debug(f"PDF check failed for {doi or pmcid or pmid}: {e}")
-                source = self._map_paper_to_source(paper)
-            
-            return source
+
+        def _normalize_doi(doi: Any) -> str:
+            raw = str(doi or "").strip()
+            if not raw:
+                return ""
+            raw = re.sub(r"^https?://(dx\.)?doi\.org/", "", raw, flags=re.IGNORECASE)
+            raw = re.sub(r"^doi:\s*", "", raw, flags=re.IGNORECASE)
+            return raw.strip().lower()
+
+        def _normalize_pmcid(pmcid: Any) -> str:
+            raw = str(pmcid or "").strip().upper()
+            if not raw:
+                return ""
+            raw = raw.replace("PMCID:", "").strip()
+            raw = re.sub(r"\s+", "", raw)
+            if raw.startswith("PMC"):
+                return raw
+            if raw.isdigit():
+                return f"PMC{raw}"
+            return raw
+
+        def _extract_pdf_url(article: Dict[str, Any]) -> str:
+            url_list = article.get("fullTextUrlList", {}).get("fullTextUrl", [])
+            if isinstance(url_list, dict):
+                url_list = [url_list]
+
+            for url_info in url_list:
+                if not isinstance(url_info, dict):
+                    continue
+                doc_style = str(url_info.get("documentStyle", "")).lower()
+                avail_code = str(url_info.get("availabilityCode", "")).upper()
+                availability = str(url_info.get("availability", "")).lower()
+
+                if doc_style == "pdf" and (avail_code == "OA" or "open access" in availability):
+                    pdf_url = url_info.get("url")
+                    if pdf_url:
+                        return pdf_url
+
+            is_open_access = article.get("isOpenAccess") == "Y"
+            in_epmc = article.get("inEPMC") == "Y"
+            has_pdf = article.get("hasPDF") == "Y"
+            if has_pdf and (is_open_access or in_epmc):
+                article_pmcid = _normalize_pmcid(article.get("pmcid") or article.get("id"))
+                if article_pmcid:
+                    return f"https://europepmc.org/articles/{article_pmcid}?pdf=render"
+
+            return ""
 
         logger.info("📄 Step 5: Checking PDF availability via Europe PMC")
         
@@ -1147,20 +1122,77 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 p["citation_index"] = i + 1
             normalized_papers.append(p)
 
-        sources = []
-        # Use ThreadPoolExecutor for parallel PDF checks (max 10 concurrent)
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_order = {
-                executor.submit(check_single_pdf, paper): i
-                for i, paper in enumerate(normalized_papers)
+        sources: List[Dict[str, Any]] = []
+        doi_to_indices: Dict[str, List[int]] = {}
+        pmcid_to_indices: Dict[str, List[int]] = {}
+        query_terms: List[str] = []
+        seen_dois = set()
+        seen_pmcids = set()
+
+        for i, paper in enumerate(normalized_papers):
+            source = self._map_paper_to_source(paper)
+            source["_order_index"] = i
+            sources.append(source)
+
+            doi_key = _normalize_doi(source.get("doi"))
+            if doi_key:
+                doi_to_indices.setdefault(doi_key, []).append(i)
+                if doi_key not in seen_dois:
+                    query_terms.append(f'DOI:"{doi_key}"')
+                    seen_dois.add(doi_key)
+
+            pmcid_key = _normalize_pmcid(source.get("pmcid"))
+            if pmcid_key:
+                pmcid_to_indices.setdefault(pmcid_key, []).append(i)
+                if pmcid_key not in seen_pmcids:
+                    query_terms.append(f"PMCID:{pmcid_key}")
+                    seen_pmcids.add(pmcid_key)
+
+        if query_terms:
+            batch_query = "(" + " OR ".join(query_terms) + ")"
+            api_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+            params = {
+                "query": batch_query,
+                "format": "json",
+                "resultType": "core",
+                "pageSize": 1000,
             }
-            for future in as_completed(future_to_order):
-                try:
-                    source = future.result()
-                    source["_order_index"] = future_to_order[future]
-                    sources.append(source)
-                except Exception as e:
-                    logger.debug(f"PDF check thread failed: {e}")
+
+            try:
+                response = requests.get(api_url, params=params, timeout=20)
+                if response.status_code == 200:
+                    data = response.json()
+                    results = data.get("resultList", {}).get("result", [])
+
+                    for article in results:
+                        pdf_url = _extract_pdf_url(article)
+                        if not pdf_url:
+                            continue
+
+                        matched_indices = set()
+
+                        doi_key = _normalize_doi(article.get("doi"))
+                        if doi_key:
+                            matched_indices.update(doi_to_indices.get(doi_key, []))
+
+                        pmcid_key = _normalize_pmcid(article.get("pmcid"))
+                        if pmcid_key:
+                            matched_indices.update(pmcid_to_indices.get(pmcid_key, []))
+
+                        # Some records expose PMCID in the generic "id" field.
+                        pmcid_id_key = _normalize_pmcid(article.get("id"))
+                        if pmcid_id_key:
+                            matched_indices.update(pmcid_to_indices.get(pmcid_id_key, []))
+
+                        for idx in matched_indices:
+                            if not sources[idx].get("pdf_url"):
+                                sources[idx]["pdf_url"] = pdf_url
+                else:
+                    logger.debug(f"Batch PDF check failed with status {response.status_code}")
+            except requests.exceptions.Timeout:
+                logger.debug("Batch PDF check timed out")
+            except Exception as e:
+                logger.debug(f"Batch PDF check failed: {e}")
 
         # Preserve stable citation order for UI/inline citation mapping.
         def _citation_rank(source: Dict[str, Any]) -> int:
