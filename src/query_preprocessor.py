@@ -336,52 +336,54 @@ class QueryPreprocessor:
     
     def _generate_query_variations(self, rewritten: str, keyword: str, expanded: str, decomposed: Optional[DecomposedQuery] = None) -> List[str]:
         """
-        Generate semantically diverse query variations for multi-query retrieval.
-        
-        Creates queries exploring different aspects: treatment, diagnosis, guidelines, etc.
+        Generate exactly two query variations for multi-query retrieval:
+        1) primary rewritten/corrected query
+        2) spelling-aware condensed keyword variant (condition + intent keywords)
         """
         base_query = rewritten or keyword or expanded
-        condition = self._extract_condition(base_query, decomposed)
-        logger.info(f"Extracted condition for expansion: '{condition}'")
-        
-        # Optimization: Detect query intent to avoid redundant variations
-        query_lower = base_query.lower()
-        is_dosing = any(word in query_lower for word in ["dose", "dosing", "dosage", "amount", "mg", "frequency"])
-        is_treatment = any(word in query_lower for word in ["treat", "therapy", "management", "drug", "medication"])
-        is_diagnosis = any(word in query_lower for word in ["diagnose", "diagnosis", "criteria", "test", "screening"])
-        
-        # Define query angles with templates
-        query_templates = [base_query]
-        
-        # Add intent-specific queries first
-        if is_dosing:
-            query_templates.append(f"{condition} dosing protocol administration")
-        if is_treatment or is_dosing:
-            query_templates.append(f"treatment therapy management of {condition}")
-        if is_diagnosis:
-            query_templates.append(f"diagnosis clinical features criteria of {condition}")
-            
-        # Add general medical angles
-        query_templates.extend([
-            f"guidelines recommendations for {condition}",
-            f"pathogenesis pathophysiology mechanism of {condition}",
-            f"clinical trial outcomes {condition}",
-        ])
-        
-        # Deduplicate while preserving order
-        seen = set()
-        variations = []
-        for q in query_templates:
-            if q and q.lower() not in seen:
-                variations.append(q)
-                seen.add(q.lower())
-            if len(variations) >= self.expansion_count:
-                break
-        
-        logger.info(f"Generated {len(variations)} diverse query variations")
+        corrected_query = (
+            decomposed.corrected_query.strip()
+            if decomposed and decomposed.corrected_query
+            else ""
+        )
+        primary_query = corrected_query or base_query
+
+        # Prefer corrected medical conditions for keyword matching when available.
+        condition_terms: List[str] = []
+        if decomposed:
+            if decomposed.corrected_medical_conditions:
+                condition_terms = [c.strip() for c in decomposed.corrected_medical_conditions if c.strip()]
+            elif decomposed.medical_conditions:
+                condition_terms = [c.strip() for c in decomposed.medical_conditions if c.strip()]
+        if not condition_terms:
+            extracted = self._extract_condition(primary_query, decomposed).strip()
+            if extracted:
+                condition_terms = [extracted]
+
+        query_text = f"{primary_query} {keyword}".lower().strip()
+        intent_keywords: List[str] = []
+        if any(word in query_text for word in ["treat", "therapy", "management", "drug", "medication", "dose", "dosing", "dosage"]):
+            intent_keywords.append("treatment")
+        if any(word in query_text for word in ["guideline", "guidelines", "recommendation", "consensus"]):
+            intent_keywords.append("guideline")
+        if any(word in query_text for word in ["diagnose", "diagnosis", "criteria", "test", "screening"]):
+            intent_keywords.append("diagnosis")
+        if not intent_keywords:
+            intent_keywords = ["treatment", "guideline", "diagnosis"]
+
+        condition_phrase = " ".join(dict.fromkeys(condition_terms))
+        keyword_variant = " ".join([condition_phrase, " ".join(intent_keywords)]).strip()
+        if not keyword_variant:
+            keyword_variant = (keyword or expanded or primary_query).strip()
+        if keyword_variant.lower() == primary_query.lower():
+            keyword_variant = " ".join([condition_phrase, "treatment guideline diagnosis"]).strip() or keyword_variant
+
+        variations = [primary_query, keyword_variant]
+
+        logger.info("Generated 2 query variations")
         for i, v in enumerate(variations, 1):
             logger.info(f"  {i}. {v}")
-        
+
         return variations
 
     def _chat_completion_with_retry(self, messages: List[Dict[str, str]], operation_name: str):

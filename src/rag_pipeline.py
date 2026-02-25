@@ -178,7 +178,9 @@ class MedicalRAGPipeline:
         
         # Get queries and drug names
         queries_to_run = processed_query.expanded_queries or [processed_query.rewritten_query]
-        if processed_query.keyword_query and processed_query.keyword_query not in queries_to_run:
+        # If expanded queries are already present, trust them as the complete set.
+        # Only append keyword query for fallback paths that do not generate expansions.
+        if not processed_query.expanded_queries and processed_query.keyword_query and processed_query.keyword_query not in queries_to_run:
             queries_to_run.append(processed_query.keyword_query)
             
         drug_names = []
@@ -188,7 +190,7 @@ class MedicalRAGPipeline:
             # Fallback to manual extraction if decomposition failed
             drug_names = self._extract_drug_names(processed_query.original_query, processed_query.rewritten_query)
 
-        logger.info(f"   PMC Queries: {len(queries_to_run)} | DailyMed Drugs: {len(drug_names)}")
+        logger.info(f"   PMC+PubMed Queries: {len(queries_to_run)} | DailyMed Drugs: {len(drug_names)}")
         
         # ========================================================================
         # OPTIMIZATION 1: Batch encode ALL query variations with configured sparse mode
@@ -233,7 +235,7 @@ class MedicalRAGPipeline:
             except Exception as e:
                 logger.warning(f"DailyMed task failed: {e}")
         
-        logger.info(f"   Retrieved {len(all_passages)} unique PMC passages")
+        logger.info(f"   Retrieved {len(all_passages)} unique passages (PMC+PubMed)")
         return all_passages, dailymed_results
 
     
