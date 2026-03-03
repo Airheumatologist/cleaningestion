@@ -135,7 +135,7 @@ ENTITY_FILTER_ENABLED = _env_bool("ENTITY_FILTER_ENABLED", default=False)
 
 # Chunk retrieval/reranking profile for chunk-level indexing
 # Aligned with .env values for 2048-token chunks (larger chunks = fewer needed)
-RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "400"))
+RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "200"))
 MAX_CHUNKS_PER_ARTICLE_PRE_RERANK = int(os.getenv("MAX_CHUNKS_PER_ARTICLE_PRE_RERANK", "2"))
 RERANK_INPUT_CHUNK_LIMIT = int(os.getenv("RERANK_INPUT_CHUNK_LIMIT", "100"))
 RERANK_TOP_CHUNKS = int(os.getenv("RERANK_TOP_CHUNKS", "100"))
@@ -167,7 +167,7 @@ ENTITY_SCORE_WEIGHT   = float(os.getenv("ENTITY_SCORE_WEIGHT",   "0.15"))
 # =============================================================================
 QUERY_EXPANSION_COUNT = int(os.getenv("QUERY_EXPANSION_COUNT", "2"))  # Number of expanded query variations
 # Bulk retrieval limits (adjusted for larger 2048-token chunks)
-BULK_RETRIEVAL_LIMIT = 300  # Reduced from 600 - larger chunks need fewer candidates
+BULK_RETRIEVAL_LIMIT = 200  # Balanced: enough diversity without excessive payload overhead
 BULK_RETRIEVAL_PER_QUERY = 100  # Reduced from 150 - more efficient with larger chunks
 RERANK_TOP_K = FINAL_TOP_ARTICLES  # Final articles after paper-level aggregation
 MAX_ABSTRACTS = FINAL_TOP_ARTICLES  # Context article cap

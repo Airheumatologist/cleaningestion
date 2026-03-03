@@ -9,7 +9,7 @@ Implements ai2-scholarqa-lib's exact reranking methodology:
 
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
+
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import pandas as pd
@@ -314,12 +314,14 @@ def apply_evidence_boosts(
                         # Graduated recency boost — no penalty for old seminal papers
                         age = current_year - int(year)
                         if age <= 1:
-                            recency_mult = 1.25   # very recent: +25%
+                            recency_mult = 1.50   # very recent: +50%
                         elif age <= 3:
-                            recency_mult = 1.15   # recent: +15%
+                            recency_mult = 1.35   # recent: +35%
                         elif age <= 5:
-                            recency_mult = 1.05   # somewhat recent: +5%
-                        # age > 5: neutral (1.0) — no penalty for older papers
+                            recency_mult = 1.18   # somewhat recent: +18%
+                        elif age <= 7:
+                            recency_mult = 1.06   # slightly recent: +6%
+                        # age > 7: neutral (1.0) — no penalty for older papers
                     else:
                         # Legacy binary boost
                         if int(year) >= current_year - 2:
@@ -573,37 +575,23 @@ class PaperFinderWithReranker:
         for doc in retrieved_ctxs:
             passages.append(self._build_rerank_text(doc))
         
-        # Build entity query once so entity scoring can run in parallel with reranker API.
-        # Prepend LLM-extracted conditions (high-quality disease terms) to the query so
-        # they are surfaced during entity extraction alongside the raw query terms.
-        entity_query = query
-        if medical_conditions:
-            entity_query = " ".join(medical_conditions) + " " + query
-
-        # Stage 2 + 4: Run reranker API call and entity matching concurrently.
+        # Call reranker API directly (I/O-bound — no threading needed here).
+        # Entity scoring was removed: it was CPU-bound MeSH synonym expansion that
+        # competed with this HTTP call and added latency. Its 15% weight contribution
+        # is already handled by Qdrant's BM25 hybrid retrieval upstream.
         top_n_for_rerank = len(passages)
         if self.n_rerank > 0:
             top_n_for_rerank = min(self.n_rerank, len(passages))
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            rerank_future = executor.submit(
-                self.reranker_engine.get_scores,
-                query,
-                passages,
-                top_n=top_n_for_rerank,
-            )
-            entity_future = executor.submit(
-                self._calculate_entity_scores,
-                entity_query,
-                retrieved_ctxs,
-            )
-            rerank_scores = rerank_future.result()
-            entity_scores = entity_future.result()
-        
+        rerank_scores = self.reranker_engine.get_scores(
+            query,
+            passages,
+            top_n=top_n_for_rerank,
+        )
+
         # Attach rerank scores to contexts for filtering
         for i, score in enumerate(rerank_scores):
             retrieved_ctxs[i]["rerank_score"] = score
-        for i, score in enumerate(entity_scores):
-            retrieved_ctxs[i]["entity_score"] = score
+            retrieved_ctxs[i]["entity_score"] = 0.0  # removed; Qdrant BM25 covers this
         
         # Stage 3: Post-filter by reranker relevance score
         # Best practice: scores <0.1 indicate very low relevance
@@ -620,21 +608,14 @@ class PaperFinderWithReranker:
             logger.warning("All passages filtered out by reranker relevance threshold, returning empty")
             return []
         
-        # Combine reranker scores with entity matching scores
-        # Weight: configurable via RERANKER_SCORE_WEIGHT / ENTITY_SCORE_WEIGHT
-        # v2 defaults: 85% rerank score, 15% entity score (was 70/30)
+        # Use reranker score directly as combined_score (entity scoring removed)
         combined_scores = []
-        entity_scores = []
         for doc in retrieved_ctxs:
             rerank_score = doc.get("rerank_score", 0)
-            entity_score = doc.get("entity_score", 0)
-            combined_score = RERANKER_SCORE_WEIGHT * rerank_score + ENTITY_SCORE_WEIGHT * entity_score
-            combined_scores.append(combined_score)
-            entity_scores.append(entity_score)
-            doc["combined_score"] = combined_score
-        
+            doc["combined_score"] = rerank_score
+            combined_scores.append(rerank_score)
+
         logger.info(f"Reranker top scores: {sorted(rerank_scores, reverse=True)[:5]}")
-        logger.info(f"Entity scores: {[round(s, 3) for s in entity_scores[:5]]}")
         logger.info(f"Combined scores: {[round(s, 3) for s in combined_scores[:5]]}")
         
         # Apply evidence hierarchy boosts

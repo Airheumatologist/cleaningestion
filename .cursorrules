@@ -1,0 +1,13 @@
+# Global Rule: strict protection of Qdrant
+- NEVER delete, stop, restart, or recreate the `qdrant` Docker container under any circumstances.
+- NEVER modify or delete the Qdrant collections or any data inside `/opt/qdrant/qdrant_storage`.
+- Ingestion for Qdrant took weeks. Any data loss is considered catastrophic.
+- If a docker-compose command might affect `qdrant`, you must isolate the target container (e.g., using `--no-deps rag-api` or running standalone `docker run`) or manually edit the target out of the compose file.
+
+# Server Connection & Deployment
+- **SSH Connection**: run `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new root@65.109.112.253` from the workspace directory (or use `.ssh/id_ed25519` relative to workspace).
+- **Server App Path**: `/opt/RAG-pipeline`
+- **Deploying Changes**:
+  1. Sync modified files: `rsync -avz -e "ssh -i .ssh/id_ed25519" ./src/ root@65.109.112.253:/opt/RAG-pipeline/src/`
+  2. Rebuild & Restart backend safely: `ssh -i .ssh/id_ed25519 root@65.109.112.253 "cd /opt/RAG-pipeline/deploy/hetzner && docker compose up -d --build --no-deps rag-api"`
+- **Critical**: Always append `--no-deps rag-api` to docker compose commands so the `qdrant` container remains completely untouched.

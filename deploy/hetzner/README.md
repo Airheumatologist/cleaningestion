@@ -60,6 +60,17 @@ Place the resulting hash in `api_keys.json` under `token_hash`.
 
 ## 5) Start Qdrant + API stack
 
+First, pre-download the massive NLM MeSH Dictionary files directly to the host to prevent concurrent worker download corruption:
+
+```bash
+mkdir -p /opt/RAG-pipeline/data/mesh
+cd /opt/RAG-pipeline/data/mesh
+curl -O https://nlmpubs.nlm.nih.gov/projects/mesh/MESH_FILES/xmlmesh/desc2026.xml
+curl -O https://nlmpubs.nlm.nih.gov/projects/mesh/MESH_FILES/xmlmesh/supp2026.xml
+```
+
+Then, start the stack:
+
 ```bash
 cd /opt/RAG-pipeline/deploy/hetzner
 docker compose --env-file ../../.env up -d --build
@@ -139,9 +150,9 @@ cd /opt/RAG-pipeline
 python3 scripts/hash_service_token.py --token "<new-token>"
 
 # 3) Replace token_hash in /opt/RAG-pipeline/api_keys.json
-# 4) Restart API container
+# 4) Restart API container (NOTE: isolate rag-api to avoid touching qdrant)
 cd /opt/RAG-pipeline/deploy/hetzner
-docker compose --env-file ../../.env restart rag-api
+docker compose --env-file ../../.env up -d --no-deps rag-api
 ```
 
 ## 12) Acceptance checks

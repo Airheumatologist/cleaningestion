@@ -14,8 +14,37 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText, Range, SparseVector, SearchParams, QuantizationSearchParams, QueryRequest
+from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText, Range, SparseVector, SearchParams, QuantizationSearchParams, QueryRequest, PayloadSelectorInclude
 from qdrant_client.http.models import Document
+
+# =============================================================================
+# Payload Selectors for retrieving data without huge redundant payloads
+# =============================================================================
+SEARCH_PAYLOAD_FIELDS = PayloadSelectorInclude(include=[
+    "pmcid", "doc_id", "pmid", "doi", "title", "page_content", "abstract",
+    "full_text", "has_full_text",
+    "section_title", "section_type", "chunk_id", "chunk_index",
+    "journal", "nlm_unique_id", "year", "article_type", "publication_type", "source",
+    "evidence_grade", "evidence_level", "evidence_term", "evidence_source",
+    "set_id", "drug_name", "manufacturer", "is_gov_affiliated", "gov_agencies"
+])
+
+DAILYMED_LOOKUP_FIELDS = PayloadSelectorInclude(include=["set_id"])
+
+DAILYMED_FULL_FIELDS = PayloadSelectorInclude(include=[
+    "set_id", "drug_name", "title", "manufacturer", "publication_type",
+    "evidence_grade", "evidence_level", "evidence_term", "evidence_source",
+    "section_type", "table_type", "text", "page_content", "chunk_id", "chunk_index",
+    "highlights", "boxed_warning", "indications", "dosage", "contraindications", 
+    "warnings", "adverse_reactions", "interactions", "use_in_specific_populations", 
+    "clinical_pharmacology", "clinical_studies"
+])
+
+DOC_RECONSTRUCTION_FIELDS = PayloadSelectorInclude(include=[
+    "full_section_text", "page_content", "text",
+    "chunk_index", "chunk_id", "section_id",
+    "char_offset", "char_start_offset", "start_offset", "offset"
+])
 
 from .config import (
     QDRANT_URL, QDRANT_API_KEY, COLLECTION_NAME, SCORE_THRESHOLD, 
@@ -429,7 +458,7 @@ class QdrantRetriever(AbstractRetriever):
                 limit=self.n_retrieval,
                 score_threshold=self.score_threshold,
                 query_filter=search_filter,
-                with_payload=True,
+                with_payload=SEARCH_PAYLOAD_FIELDS,
                 search_params=SearchParams(
                     quantization=QuantizationSearchParams(
                         rescore=QUANTIZATION_RESCORE,
@@ -536,7 +565,7 @@ class QdrantRetriever(AbstractRetriever):
                     limit=self.n_retrieval * 2,  # Get more for fusion
                     score_threshold=self.score_threshold,
                     query_filter=search_filter,
-                    with_payload=True,
+                    with_payload=SEARCH_PAYLOAD_FIELDS,
                     search_params=SearchParams(
                         quantization=QuantizationSearchParams(
                             rescore=True,
@@ -556,7 +585,7 @@ class QdrantRetriever(AbstractRetriever):
                 using="sparse",
                 limit=self.n_retrieval * 2,  # Get more for fusion
                 query_filter=search_filter,
-                with_payload=True
+                with_payload=SEARCH_PAYLOAD_FIELDS
             )
         except Exception as e:
             logger.warning(f"Sparse search failed: {e}")
@@ -729,7 +758,7 @@ class QdrantRetriever(AbstractRetriever):
                 filter=search_filter,
                 limit=self.n_retrieval * 2,  # Get more for fusion
                 score_threshold=self.score_threshold,
-                with_payload=True,
+                with_payload=SEARCH_PAYLOAD_FIELDS,
                 params=search_params  # Enable quantization rescore
             )
             batch_requests.append(dense_request)
@@ -741,7 +770,7 @@ class QdrantRetriever(AbstractRetriever):
                     using="sparse",
                     filter=search_filter,
                     limit=self.n_retrieval * 2,
-                    with_payload=True
+                    with_payload=SEARCH_PAYLOAD_FIELDS
                 )
                 batch_requests.append(sparse_request)
 
@@ -879,7 +908,7 @@ class QdrantRetriever(AbstractRetriever):
                 limit=self.n_keyword_search,
                 score_threshold=max(self.score_threshold - 0.1, 0.2),  # Lower threshold
                 query_filter=search_filter,
-                with_payload=True,
+                with_payload=SEARCH_PAYLOAD_FIELDS,
                 search_params=SearchParams(
                     quantization=QuantizationSearchParams(
                         rescore=QUANTIZATION_RESCORE,
@@ -958,7 +987,7 @@ class QdrantRetriever(AbstractRetriever):
                     scroll_filter=query_filter,
                     offset=offset,
                     limit=256,
-                    with_payload=True,
+                    with_payload=DOC_RECONSTRUCTION_FIELDS,
                 )
 
                 if not results:
@@ -1135,7 +1164,7 @@ class QdrantRetriever(AbstractRetriever):
                     scroll_filter=filter_by_id,
                     offset=next_offset,
                     limit=256,
-                    with_payload=True,
+                    with_payload=DAILYMED_FULL_FIELDS,
                 )
 
                 if not results:
@@ -1192,7 +1221,7 @@ class QdrantRetriever(AbstractRetriever):
                 using="sparse",
                 query_filter=source_filter,
                 limit=max(limit * 8, 40),
-                with_payload=True
+                with_payload=DAILYMED_LOOKUP_FIELDS
             )
             
             passages = []
@@ -1245,7 +1274,7 @@ class QdrantRetriever(AbstractRetriever):
                 collection_name=self.collection_name,
                 scroll_filter=keyword_filter,
                 limit=max(limit * 10, 50),
-                with_payload=True
+                with_payload=DAILYMED_LOOKUP_FIELDS
             )
             
             passages = []

@@ -946,6 +946,32 @@ QDRANT_TIMEOUT = 180  # seconds
 
 ---
 
+## 🚑 Troubleshooting & Lessons Learned
+
+### Qdrant Container Protection
+**CRITICAL**: `qdrant` ingestion takes weeks. Absolutely **NEVER** recreate, stop, or delete the `qdrant` container during routine API updates.
+- **Rule**: If restarting `rag-api`, isolate it using `docker compose up -d --no-deps rag-api` so that Docker Compose does not mistakenly try to recreate the `qdrant` container and trigger name conflicts.
+- A global `.cursorrules` file enforces this rule across all AI agents in this repository.
+
+### MeSH Dictionary Downloads & Concurrency
+The API utilizes the NLM MeSH Dictionary for query expansion, which rolls over to a new year annually (e.g., `desc2026.xml`).
+- **The Issue**: Gunicorn runs multiple concurrent API workers. Previously, each worker tried downloading the 750MB MeSH file to the same temporary path simultaneously on boot, causing file corruption and race conditions.
+- **The Solution**: MeSH XML files MUST be downloaded manually on the host server to `/opt/RAG-pipeline/data/mesh` and mounted as a read-only volume (`/app/data/mesh`) in `docker-compose.yml`. This explicitly prevents simultaneous worker downloads.
+- Run `curl -O` directly into the mounted data directory on the host if NLM URLs change or roll over to a new year.
+
+### Docker Networking Issues
+- `rag-api` and `qdrant` must share the same Docker network for DNS resolution to work.
+- If `rag-api` throws `Temporary failure in name resolution` for `http://qdrant:6333`, ensure that both containers are attached to `qdrant_default` (or `rag_internal`) inside `docker-compose.yml`.
+
+### Frontend API Routing
+- The local Next.js frontend defaults to routing `/api/*` to `http://localhost:8000`.
+- To avoid port firewall blocking on the remote server during local development, do not point `.env.local` to the server IP. Instead, proxy the connection securely via an SSH tunnel:
+  ```bash
+  ssh -i ~/.ssh/key -N -f -L 8000:localhost:8000 root@server-ip
+  ```
+
+---
+
 ## 📞 Team Contacts
 
 - **Infrastructure/Deployment**: See team wiki
