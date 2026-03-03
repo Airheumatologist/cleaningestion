@@ -36,8 +36,10 @@ services:
       QUERY_CACHE_DIR: /app/data/cache
       API_KEYS_FILE: /opt/RAG-pipeline/api_keys.json
       API_AUTH_ENABLED: "true"
+      MESH_YEAR: "2026"
     volumes:
       - ../../data/cache:/app/data/cache
+      - ../../data/mesh:/app/data/mesh
       - ../../api_keys.json:/opt/RAG-pipeline/api_keys.json:ro
     ports:
       - "8000:8000"

@@ -10,6 +10,7 @@ Implements retrieval from Qdrant Vector Database with:
 
 import logging
 import threading
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -53,7 +54,10 @@ from .config import (
     SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
     SPARSE_REMOVE_STOPWORDS, DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
     DEEPINFRA_EMBED_TIMEOUT_SECONDS,
-    QUANTIZATION_RESCORE, QUANTIZATION_OVERSAMPLING
+    QUANTIZATION_RESCORE, QUANTIZATION_OVERSAMPLING,
+    RETRIEVAL_RECENCY_BOOST_ENABLED, RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER,
+    RETRIEVAL_RECENCY_Y1_MULT, RETRIEVAL_RECENCY_Y3_MULT,
+    RETRIEVAL_RECENCY_Y5_MULT, RETRIEVAL_RECENCY_Y7_MULT,
 )
 from .bm25_sparse import BM25SparseEncoder
 from .retry_utils import retry_with_exponential_backoff
@@ -93,6 +97,16 @@ class QdrantRetriever(AbstractRetriever):
     - Bulk search with multiple query embeddings
     - Integration with ScholarQA pipeline patterns
     """
+    LOW_EVIDENCE_TERMS = {
+        "case_report",
+        "case_series",
+        "letter",
+        "editorial",
+        "comment",
+        "commentary",
+        "news",
+        "correspondence",
+    }
     
     def __init__(
         self,
@@ -256,6 +270,118 @@ class QdrantRetriever(AbstractRetriever):
 
         cleaned = _normalize_item(value)
         return [cleaned] if cleaned else []
+
+    @staticmethod
+    def _normalize_evidence_label(value: Any) -> str:
+        """Normalize evidence/publication labels for robust comparisons."""
+        return re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+
+    def _is_low_evidence_type(self, article_type: Any, publication_type: Any) -> bool:
+        """
+        Return True when article/publication metadata indicates low-evidence content.
+        """
+        article_norm = self._normalize_evidence_label(article_type)
+        if any(term in article_norm for term in self.LOW_EVIDENCE_TERMS):
+            return True
+
+        for pub_type in self._normalize_publication_type_list(publication_type):
+            pub_norm = self._normalize_evidence_label(pub_type)
+            if any(term in pub_norm for term in self.LOW_EVIDENCE_TERMS):
+                return True
+        return False
+
+    @staticmethod
+    def _coerce_year(value: Any) -> Optional[int]:
+        """Best-effort year coercion from payload values."""
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            match = re.search(r"\b(19|20)\d{2}\b", str(value))
+            if not match:
+                return None
+            try:
+                return int(match.group(0))
+            except (TypeError, ValueError):
+                return None
+
+    def _compute_retrieval_recency_mult(
+        self,
+        year: Any,
+        article_type: Any,
+        publication_type: Any,
+        current_year: Optional[int] = None,
+    ) -> float:
+        """Compute retrieval-time recency multiplier (soft boost only, no old-paper penalty)."""
+        if not RETRIEVAL_RECENCY_BOOST_ENABLED:
+            return 1.0
+
+        if self._is_low_evidence_type(article_type, publication_type):
+            return 1.0
+
+        year_value = self._coerce_year(year)
+        if year_value is None:
+            return 1.0
+
+        year_now = current_year if current_year is not None else datetime.now().year
+        age = max(0, year_now - year_value)
+
+        if age <= 1:
+            return RETRIEVAL_RECENCY_Y1_MULT
+        if age <= 3:
+            return RETRIEVAL_RECENCY_Y3_MULT
+        if age <= 5:
+            return RETRIEVAL_RECENCY_Y5_MULT
+        if age <= 7:
+            return RETRIEVAL_RECENCY_Y7_MULT
+        return 1.0
+
+    def _apply_retrieval_recency_boost(
+        self,
+        passage: Dict[str, Any],
+        filter_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Attach retrieval recency scoring fields and set score to boosted value.
+        """
+        raw_score = float(passage.get("raw_score", passage.get("score", 0.0)) or 0.0)
+        year_filter_present = bool((filter_kwargs or {}).get("year"))
+        if year_filter_present and not RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER:
+            recency_mult = 1.0
+        else:
+            recency_mult = self._compute_retrieval_recency_mult(
+                year=passage.get("year"),
+                article_type=passage.get("article_type"),
+                publication_type=passage.get("publication_type"),
+            )
+
+        boosted_score = raw_score * recency_mult
+        passage["raw_score"] = raw_score
+        passage["retrieval_recency_mult"] = recency_mult
+        passage["boosted_score"] = boosted_score
+        passage["score"] = boosted_score
+        return passage
+
+    def _log_retrieval_recency_stats(self, passages: List[Dict[str, Any]], stage: str) -> None:
+        """Emit concise recency-boost diagnostics for retrieval output."""
+        if not passages:
+            return
+
+        boosted_count = sum(
+            1 for passage in passages if float(passage.get("retrieval_recency_mult", 1.0)) > 1.0
+        )
+        top_passages = passages[: min(5, len(passages))]
+        top_mults = [round(float(p.get("retrieval_recency_mult", 1.0)), 3) for p in top_passages]
+        top_scores = [round(float(p.get("score", 0.0)), 6) for p in top_passages]
+        logger.info(
+            "   %s recency boost: boosted=%s/%s | top multipliers=%s | top scores=%s",
+            stage,
+            boosted_count,
+            len(passages),
+            top_mults,
+            top_scores,
+        )
 
     def _embed_query(self, query: str, use_instruction: bool = True):
         """
@@ -518,6 +644,13 @@ class QdrantRetriever(AbstractRetriever):
 
             passages.append(passage)
 
+        passages = [
+            self._apply_retrieval_recency_boost(passage, filter_kwargs=filter_kwargs)
+            for passage in passages
+        ]
+        passages.sort(key=lambda p: float(p.get("score", 0.0)), reverse=True)
+        self._log_retrieval_recency_stats(passages, stage="Dense")
+
         logger.info(f"Retrieved {len(passages)} passages for query: {query[:50]}...")
         return passages
     
@@ -633,10 +766,28 @@ class QdrantRetriever(AbstractRetriever):
                 if key not in all_points:
                     all_points[key] = point
 
-        # Sort by combined score
+        # Apply retrieval recency boosts before top-K truncation.
+        recency_mults: Dict[str, float] = {}
+        boosted_scores: Dict[str, float] = {}
+        for key in all_keys:
+            point = all_points.get(key)
+            payload = point.payload if point else {}
+            year_filter_present = bool((filter_kwargs or {}).get("year"))
+            if year_filter_present and not RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER:
+                recency_mult = 1.0
+            else:
+                recency_mult = self._compute_retrieval_recency_mult(
+                    year=payload.get("year"),
+                    article_type=payload.get("article_type"),
+                    publication_type=payload.get("publication_type"),
+                )
+            recency_mults[key] = recency_mult
+            boosted_scores[key] = combined_scores[key] * recency_mult
+
+        # Sort by boosted score
         sorted_keys = sorted(
             all_keys,
-            key=lambda p: combined_scores[p],
+            key=lambda p: boosted_scores[p],
             reverse=True
         )[:self.n_retrieval]
         
@@ -651,9 +802,13 @@ class QdrantRetriever(AbstractRetriever):
             is_dailymed = source == "dailymed" or article_type == "drug_label"
             
             if is_dailymed:
-                passage = self._transform_dailymed_payload(point.payload, combined_scores[key])
+                passage = self._transform_dailymed_payload(point.payload, boosted_scores[key])
                 passage["dense_score"] = dense_scores.get(key, 0)
                 passage["sparse_score"] = sparse_scores.get(key, 0)
+                passage["raw_score"] = combined_scores[key]
+                passage["retrieval_recency_mult"] = recency_mults.get(key, 1.0)
+                passage["boosted_score"] = boosted_scores[key]
+                passage["score"] = boosted_scores[key]
                 passage["stype"] = "hybrid_search"
             else:
                 doc_id = self._doc_id_from_payload(point.payload)
@@ -680,7 +835,10 @@ class QdrantRetriever(AbstractRetriever):
                     "publication_type": self._normalize_publication_type_list(
                         point.payload.get("publication_type")
                     ),
-                    "score": combined_scores[key],
+                    "raw_score": combined_scores[key],
+                    "retrieval_recency_mult": recency_mults.get(key, 1.0),
+                    "boosted_score": boosted_scores[key],
+                    "score": boosted_scores[key],
                     "dense_score": dense_scores.get(key, 0),
                     "sparse_score": sparse_scores.get(key, 0),
                     "stype": "hybrid_search",
@@ -689,6 +847,7 @@ class QdrantRetriever(AbstractRetriever):
             
             passages.append(passage)
         
+        self._log_retrieval_recency_stats(passages, stage="Hybrid")
         logger.info(f"✅ Hybrid search successful, retrieved {len(passages)} passages")
         return passages
     
@@ -833,10 +992,28 @@ class QdrantRetriever(AbstractRetriever):
                 if key not in all_points:
                     all_points[key] = point
         
-        # Sort by score and limit total results
+        # Apply retrieval recency boosts before top-K truncation.
+        recency_mults: Dict[str, float] = {}
+        boosted_scores: Dict[str, float] = {}
+        year_filter_present = bool(filter_kwargs.get("year"))
+        for key, raw_score in combined_scores.items():
+            point = all_points.get(key)
+            payload = point.payload if point else {}
+            if year_filter_present and not RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER:
+                recency_mult = 1.0
+            else:
+                recency_mult = self._compute_retrieval_recency_mult(
+                    year=payload.get("year"),
+                    article_type=payload.get("article_type"),
+                    publication_type=payload.get("publication_type"),
+                )
+            recency_mults[key] = recency_mult
+            boosted_scores[key] = raw_score * recency_mult
+
+        # Sort by boosted score and limit total results
         sorted_keys = sorted(
             combined_scores.keys(),
-            key=lambda p: combined_scores[p],
+            key=lambda p: boosted_scores[p],
             reverse=True
         )[:self.n_retrieval]
 
@@ -848,7 +1025,11 @@ class QdrantRetriever(AbstractRetriever):
             is_dailymed = source == "dailymed" or article_type == "drug_label"
 
             if is_dailymed:
-                passage = self._transform_dailymed_payload(point.payload, combined_scores[key])
+                passage = self._transform_dailymed_payload(point.payload, boosted_scores[key])
+                passage["raw_score"] = combined_scores[key]
+                passage["retrieval_recency_mult"] = recency_mults.get(key, 1.0)
+                passage["boosted_score"] = boosted_scores[key]
+                passage["score"] = boosted_scores[key]
                 passage["stype"] = "batch_hybrid_search"
             else:
                 doc_id = self._doc_id_from_payload(point.payload)
@@ -875,12 +1056,16 @@ class QdrantRetriever(AbstractRetriever):
                     "publication_type": self._normalize_publication_type_list(
                         point.payload.get("publication_type")
                     ),
-                    "score": combined_scores[key],
+                    "raw_score": combined_scores[key],
+                    "retrieval_recency_mult": recency_mults.get(key, 1.0),
+                    "boosted_score": boosted_scores[key],
+                    "score": boosted_scores[key],
                     "stype": "batch_hybrid_search",
                     **self._extract_evidence_metadata(point.payload),
                 }
             all_passages.append(passage)
         
+        self._log_retrieval_recency_stats(all_passages, stage="Batch hybrid")
         logger.info(f"✅ Batch hybrid search complete: {len(all_passages)} unique passages")
         return all_passages
 
@@ -952,12 +1137,16 @@ class QdrantRetriever(AbstractRetriever):
                         "publication_type": self._normalize_publication_type_list(
                             point.payload.get("publication_type")
                         ),
+                        "raw_score": point.score,
                         "score": point.score,
                         "stype": "keyword_search",
                         **self._extract_evidence_metadata(point.payload),
                     }
+                paper = self._apply_retrieval_recency_boost(paper, filter_kwargs=filter_kwargs)
                 papers.append(paper)
 
+            papers.sort(key=lambda p: float(p.get("score", 0.0)), reverse=True)
+            self._log_retrieval_recency_stats(papers, stage="Additional")
             return papers
 
         except Exception as e:

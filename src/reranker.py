@@ -487,7 +487,8 @@ class PaperFinderWithReranker:
         self,
         reranker: AbstractReranker = None,
         n_rerank: int = -1,
-        context_threshold: float = 0.0
+        context_threshold: float = 0.0,
+        entity_expander = None
     ):
         """
         Initialize paper finder.
@@ -505,14 +506,19 @@ class PaperFinderWithReranker:
         self.n_rerank = n_rerank
         self.context_threshold = context_threshold
         
-        # Initialize medical entity expander for entity matching
-        self.entity_expander = None
-        if ENTITY_EXPANDER_AVAILABLE:
+        # Initialize or use injected medical entity expander for entity matching
+        if entity_expander is not None:
+            self.entity_expander = entity_expander
+            logger.info("✅ Reusing injected MedicalEntityExpander instance")
+        elif ENTITY_EXPANDER_AVAILABLE:
             try:
                 self.entity_expander = MedicalEntityExpander()
                 logger.info("✅ Medical entity expander initialized for reranking")
             except Exception as e:
+                self.entity_expander = None
                 logger.warning(f"Medical entity expander not available for reranking: {e}")
+        else:
+            self.entity_expander = None
     
     def rerank(
         self,

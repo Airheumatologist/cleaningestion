@@ -155,33 +155,52 @@ class MedicalEntityExpander:
 
     def _ensure_valid_mesh_file(self, local_path: Path, source_url: str, expected_root_tag: str) -> None:
         """Validate local cache and download/retry once when invalid or missing."""
-        if local_path.exists():
-            if self._is_valid_mesh_xml(local_path, expected_root_tag):
-                logger.info("MeSH file exists and validated: %s", local_path)
-                return
-            logger.warning("Invalid cached MeSH file detected, removing: %s", local_path)
-            try:
-                local_path.unlink()
-            except FileNotFoundError:
-                pass
+        import fcntl
+        lock_path = local_path.with_suffix(".lock")
+        
+        # Fast path: check if it already exists and is valid without acquiring lock
+        if local_path.exists() and self._is_valid_mesh_xml(local_path, expected_root_tag):
+            logger.info("MeSH file exists and validated: %s", local_path)
+            return
 
-        for attempt in range(2):
+        # Slow path: acquire cross-process lock to prevent multiple Gunicorn workers from downloading simultaneously
+        logger.info("Waiting for MeSH download lock on %s...", local_path.name)
+        with open(lock_path, "w") as lock_file:
             try:
-                logger.info("Downloading MeSH file from %s...", source_url)
-                self._download_file(source_url, local_path, expected_root_tag)
-                return
-            except Exception as exc:
-                try:
-                    local_path.unlink()
-                except FileNotFoundError:
-                    pass
-                if attempt == 0:
-                    logger.warning("Download validation failed for %s, retrying once: %s", local_path.name, exc)
-                    continue
-                raise RuntimeError(
-                    f"Unable to download valid MeSH XML file '{local_path.name}' from {source_url}. "
-                    f"See {MESH_DOWNLOAD_PAGE} for updated URLs."
-                ) from exc
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                logger.info("Acquired MeSH download lock for %s", local_path.name)
+
+                # Double check inside the lock (another worker might have just finished downloading it)
+                if local_path.exists():
+                    if self._is_valid_mesh_xml(local_path, expected_root_tag):
+                        logger.info("Worker already downloaded valid MeSH file: %s. Skipping download.", local_path)
+                        return
+                    logger.warning("Invalid cached MeSH file detected, removing: %s", local_path)
+                    try:
+                        local_path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+                for attempt in range(2):
+                    try:
+                        logger.info("Downloading MeSH file from %s...", source_url)
+                        self._download_file(source_url, local_path, expected_root_tag)
+                        return
+                    except Exception as exc:
+                        try:
+                            local_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                        if attempt == 0:
+                            logger.warning("Download validation failed for %s, retrying once: %s", local_path.name, exc)
+                            continue
+                        raise RuntimeError(
+                            f"Unable to download valid MeSH XML file '{local_path.name}' from {source_url}. "
+                            f"See {MESH_DOWNLOAD_PAGE} for updated URLs."
+                        ) from exc
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                logger.info("Released MeSH download lock for %s", local_path.name)
 
     def _is_valid_mesh_xml(self, path: Path, expected_root_tag: str) -> bool:
         """Check XML parseability and expected root tag."""

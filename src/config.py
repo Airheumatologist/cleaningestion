@@ -135,11 +135,19 @@ ENTITY_FILTER_ENABLED = _env_bool("ENTITY_FILTER_ENABLED", default=False)
 
 # Chunk retrieval/reranking profile for chunk-level indexing
 # Aligned with .env values for 2048-token chunks (larger chunks = fewer needed)
-RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "200"))
+RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "400"))
 MAX_CHUNKS_PER_ARTICLE_PRE_RERANK = int(os.getenv("MAX_CHUNKS_PER_ARTICLE_PRE_RERANK", "2"))
 RERANK_INPUT_CHUNK_LIMIT = int(os.getenv("RERANK_INPUT_CHUNK_LIMIT", "100"))
 RERANK_TOP_CHUNKS = int(os.getenv("RERANK_TOP_CHUNKS", "100"))
 FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "50"))
+RETRIEVAL_RECENCY_BOOST_ENABLED = _env_bool("RETRIEVAL_RECENCY_BOOST_ENABLED", default=True)
+RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER = _env_bool("RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER", default=True)
+RETRIEVAL_RECENCY_Y1_MULT = float(os.getenv("RETRIEVAL_RECENCY_Y1_MULT", "1.20"))
+RETRIEVAL_RECENCY_Y3_MULT = float(os.getenv("RETRIEVAL_RECENCY_Y3_MULT", "1.14"))
+RETRIEVAL_RECENCY_Y5_MULT = float(os.getenv("RETRIEVAL_RECENCY_Y5_MULT", "1.08"))
+RETRIEVAL_RECENCY_Y7_MULT = float(os.getenv("RETRIEVAL_RECENCY_Y7_MULT", "1.03"))
+PRE_RERANK_RECENT_WINDOW_YEARS = int(os.getenv("PRE_RERANK_RECENT_WINDOW_YEARS", "7"))
+PRE_RERANK_RECENT_QUOTA_RATIO = float(os.getenv("PRE_RERANK_RECENT_QUOTA_RATIO", "0.35"))
 
 # =============================================================================
 # Reranker Configuration

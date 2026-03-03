@@ -13,7 +13,8 @@ Designed for speed and quality clinical decision support.
 import logging
 import re
 import hashlib
-from typing import List, Dict, Any, Generator
+from datetime import datetime
+from typing import List, Dict, Any, Generator, Optional
 from dataclasses import asdict
 from openai import OpenAI
 
@@ -33,6 +34,8 @@ from .config import (
     RERANK_TOP_CHUNKS,
     FINAL_TOP_ARTICLES,
     ENTITY_FILTER_ENABLED,
+    PRE_RERANK_RECENT_WINDOW_YEARS,
+    PRE_RERANK_RECENT_QUOTA_RATIO,
 )
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
@@ -87,6 +90,8 @@ class MedicalRAGPipeline:
         self.model = model
         self.max_chunks_per_article_pre_rerank = MAX_CHUNKS_PER_ARTICLE_PRE_RERANK
         self.rerank_input_chunk_limit = RERANK_INPUT_CHUNK_LIMIT
+        self.pre_rerank_recent_window_years = PRE_RERANK_RECENT_WINDOW_YEARS
+        self.pre_rerank_recent_quota_ratio = PRE_RERANK_RECENT_QUOTA_RATIO
         self.final_top_articles = FINAL_TOP_ARTICLES
         self.openai_client = OpenAI(
             api_key=DEEPINFRA_API_KEY,
@@ -104,7 +109,8 @@ class MedicalRAGPipeline:
         # Initialize reranker (DeepInfra Qwen only)
         self.paper_finder = PaperFinderWithReranker(
             n_rerank=n_rerank,
-            context_threshold=context_threshold
+            context_threshold=context_threshold,
+            entity_expander=self.entity_expander
         )
         logger.info("✅ Reranker initialized (DeepInfra Qwen3-Reranker-0.6B)")
         self.evidence_hierarchy = get_evidence_hierarchy_levels()
@@ -298,42 +304,147 @@ class MedicalRAGPipeline:
     # Step 3: Reranking & Aggregation
     # =========================================================================
 
+    @staticmethod
+    def _to_int_year(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            match = re.search(r"\b(19|20)\d{2}\b", str(value))
+            if not match:
+                return None
+            try:
+                return int(match.group(0))
+            except (TypeError, ValueError):
+                return None
+
+    @staticmethod
+    def _chunk_identity_for_preselection(passage: Dict[str, Any], idx: int) -> str:
+        chunk_id = passage.get("chunk_id")
+        if chunk_id:
+            return str(chunk_id)
+        article_id = (
+            passage.get("pmcid")
+            or passage.get("corpus_id")
+            or passage.get("doc_id")
+            or passage.get("pmid")
+            or "unknown"
+        )
+        chunk_index = passage.get("chunk_index")
+        return f"{article_id}:{chunk_index}:{idx}"
+
+    def _article_identity_for_preselection(self, passage: Dict[str, Any], idx: int) -> str:
+        article_id = (
+            passage.get("pmcid")
+            or passage.get("corpus_id")
+            or passage.get("doc_id")
+            or passage.get("pmid")
+        )
+        if article_id:
+            return str(article_id)
+        return f"unknown:{self._chunk_identity_for_preselection(passage, idx)}"
+
+    def _is_recent_eligible_for_quota(self, passage: Dict[str, Any], current_year: int) -> bool:
+        year = self._to_int_year(passage.get("year"))
+        if year is None:
+            return False
+        age = max(0, current_year - year)
+        if age > self.pre_rerank_recent_window_years:
+            return False
+        return not self.retriever._is_low_evidence_type(
+            passage.get("article_type"),
+            passage.get("publication_type"),
+        )
+
     def _select_chunks_for_rerank(self, passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Preserve chunk-level recall while controlling rerank cost:
-        - sort by retrieval score
-        - keep at most N chunks per article
-        - cap total rerank input chunks
+        Quota-based preselection:
+        1) reserve recent high-signal first chunks per article
+        2) fill remaining first-pass slots by score
+        3) fill remaining chunk slots globally by score (max chunks/article respected)
         """
         if not passages:
             return []
 
-        sorted_passages = sorted(passages, key=lambda p: p.get("score", 0), reverse=True)
-        per_article_counts: Dict[str, int] = {}
-        selected: List[Dict[str, Any]] = []
+        limit = self.rerank_input_chunk_limit
+        max_per_article = self.max_chunks_per_article_pre_rerank
+        recent_quota = max(0, min(limit, int(limit * self.pre_rerank_recent_quota_ratio)))
+        current_year = datetime.now().year
 
-        for p in sorted_passages:
-            article_id = (
-                p.get("pmcid")
-                or p.get("corpus_id")
-                or p.get("doc_id")
-                or p.get("pmid")
-                or "unknown"
-            )
-            if per_article_counts.get(article_id, 0) >= self.max_chunks_per_article_pre_rerank:
+        sorted_with_ids = sorted(
+            enumerate(passages),
+            key=lambda pair: float(pair[1].get("score", 0.0)),
+            reverse=True,
+        )
+
+        # First chunk candidate per article (highest score only).
+        first_chunk_candidates: List[tuple[int, Dict[str, Any], str, str]] = []
+        seen_articles: set[str] = set()
+        for idx, passage in sorted_with_ids:
+            article_id = self._article_identity_for_preselection(passage, idx)
+            if article_id in seen_articles:
                 continue
+            seen_articles.add(article_id)
+            chunk_key = self._chunk_identity_for_preselection(passage, idx)
+            first_chunk_candidates.append((idx, passage, article_id, chunk_key))
 
+        recent_candidates = [
+            item for item in first_chunk_candidates
+            if self._is_recent_eligible_for_quota(item[1], current_year)
+        ]
+        recent_available = len(recent_candidates)
+
+        selected: List[Dict[str, Any]] = []
+        selected_chunk_keys: set[str] = set()
+        per_article_counts: Dict[str, int] = {}
+        selected_meta: List[tuple[str, Dict[str, Any]]] = []
+
+        def _try_add(candidate: tuple[int, Dict[str, Any], str, str]) -> bool:
+            _, passage, article_id, chunk_key = candidate
+            if chunk_key in selected_chunk_keys:
+                return False
+            if per_article_counts.get(article_id, 0) >= max_per_article:
+                return False
+            selected.append(passage)
+            selected_chunk_keys.add(chunk_key)
             per_article_counts[article_id] = per_article_counts.get(article_id, 0) + 1
-            selected.append(p)
+            selected_meta.append((article_id, passage))
+            return True
 
-            if len(selected) >= self.rerank_input_chunk_limit:
+        # First pass A: enforce recent quota on first chunks.
+        for candidate in recent_candidates:
+            if len(selected) >= recent_quota:
                 break
+            _try_add(candidate)
+
+        # First pass B: fill first-chunk slots by score regardless of age.
+        for candidate in first_chunk_candidates:
+            if len(selected) >= limit:
+                break
+            _try_add(candidate)
+
+        # Second pass: fill remaining slots globally by score.
+        for idx, passage in sorted_with_ids:
+            if len(selected) >= limit:
+                break
+            article_id = self._article_identity_for_preselection(passage, idx)
+            chunk_key = self._chunk_identity_for_preselection(passage, idx)
+            _try_add((idx, passage, article_id, chunk_key))
+
+        recent_selected = sum(
+            1 for _, passage in selected_meta
+            if self._is_recent_eligible_for_quota(passage, current_year)
+        )
 
         logger.info(
-            "   Chunk preselection: %s passages → %s rerank candidates (%s chunks/article max)",
+            "   Chunk preselection: %s passages → %s rerank candidates | recent quota target=%s achieved=%s available=%s | max chunks/article=%s",
             len(passages),
             len(selected),
-            self.max_chunks_per_article_pre_rerank,
+            recent_quota,
+            recent_selected,
+            recent_available,
+            max_per_article,
         )
         return selected
     
