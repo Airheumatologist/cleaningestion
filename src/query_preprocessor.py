@@ -13,13 +13,14 @@ import logging
 import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional, NamedTuple, Union
+from groq import Groq
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .config import (
-    DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
-    DEEPINFRA_RETRY_COUNT, DEEPINFRA_RETRY_DELAY,
-    DEEPINFRA_CHAT_TIMEOUT_SECONDS,
+    DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, GROQ_API_KEY,
+    LLM_PROVIDER, LLM_RETRY_COUNT, LLM_RETRY_DELAY, LLM_CHAT_TIMEOUT_SECONDS,
+    LLM_MAX_COMPLETION_TOKENS, LLM_REASONING_EFFORT,
     LLM_MODEL, LLM_TEMPERATURE, LLM_TOP_P, QUERY_EXPANSION_COUNT
 )
 from .medical_entity_expander import MedicalEntityExpander
@@ -254,21 +255,33 @@ class QueryPreprocessor:
     """
     
     def __init__(self, model: str = LLM_MODEL, use_entity_expansion: bool = True):
-        """Initialize with DeepInfra client."""
-        if not DEEPINFRA_API_KEY:
-            raise ValueError("DEEPINFRA_API_KEY not set")
+        """Initialize query decomposition LLM client."""
+        if LLM_PROVIDER == "groq":
+            if not GROQ_API_KEY:
+                raise ValueError("GROQ_API_KEY not set")
+            self.llm_client = Groq(
+                api_key=GROQ_API_KEY,
+                timeout=LLM_CHAT_TIMEOUT_SECONDS,
+            )
+        elif LLM_PROVIDER == "deepinfra":
+            if not DEEPINFRA_API_KEY:
+                raise ValueError("DEEPINFRA_API_KEY not set")
+            self.llm_client = OpenAI(
+                api_key=DEEPINFRA_API_KEY,
+                base_url=DEEPINFRA_BASE_URL,
+                timeout=LLM_CHAT_TIMEOUT_SECONDS,
+            )
+        else:
+            raise ValueError(f"Unsupported LLM_PROVIDER: {LLM_PROVIDER}")
 
-        self.openai_client = OpenAI(
-            api_key=DEEPINFRA_API_KEY,
-            base_url=DEEPINFRA_BASE_URL,
-            timeout=DEEPINFRA_CHAT_TIMEOUT_SECONDS,
-        )
+        self.llm_provider = LLM_PROVIDER
         self.model = model
         self.expansion_count = QUERY_EXPANSION_COUNT
-        self.retry_count = DEEPINFRA_RETRY_COUNT
-        self.retry_delay = DEEPINFRA_RETRY_DELAY
+        self.retry_count = LLM_RETRY_COUNT
+        self.retry_delay = LLM_RETRY_DELAY
         self.use_entity_expansion = use_entity_expansion
         self._entity_expander = None
+        logger.info("LLM query preprocessor provider initialized: %s (%s)", self.llm_provider, self.model)
         
         if use_entity_expansion:
             try:
@@ -387,14 +400,20 @@ class QueryPreprocessor:
         return variations
 
     def _chat_completion_with_retry(self, messages: List[Dict[str, str]], operation_name: str):
-        """Execute DeepInfra chat completion with exponential-backoff retry."""
+        """Execute chat completion with exponential-backoff retry."""
+        request_kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": LLM_TEMPERATURE,
+            "top_p": LLM_TOP_P,
+        }
+        if self.llm_provider == "groq":
+            request_kwargs["max_completion_tokens"] = LLM_MAX_COMPLETION_TOKENS
+            if LLM_REASONING_EFFORT:
+                request_kwargs["reasoning_effort"] = LLM_REASONING_EFFORT
+
         return retry_with_exponential_backoff(
-            lambda: self.openai_client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P
-            ),
+            lambda: self.llm_client.chat.completions.create(**request_kwargs),
             max_attempts=self.retry_count + 1,
             base_delay=float(self.retry_delay),
             operation_name=operation_name,
@@ -416,7 +435,7 @@ class QueryPreprocessor:
                     {"role": "system", "content": self._get_query_decomposer_prompt()},
                     {"role": "user", "content": expanded_query}
                 ],
-                operation_name="DeepInfra query decomposition"
+                operation_name=f"{self.llm_provider} query decomposition"
             )
 
             decomposed = self._parse_llm_response(response.choices[0].message.content.strip())
@@ -482,7 +501,7 @@ RULES:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": f'Generate {self.expansion_count} alternative medical search queries for:\n\n"{query}"\n\nOutput only the queries, one per line:'}
                 ],
-                operation_name="DeepInfra query expansion"
+                operation_name=f"{self.llm_provider} query expansion"
             )
 
             expanded = []

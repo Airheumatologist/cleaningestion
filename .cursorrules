@@ -4,6 +4,10 @@
 - Ingestion for Qdrant took weeks. Any data loss is considered catastrophic.
 - If a docker-compose command might affect `qdrant`, you must isolate the target container (e.g., using `--no-deps rag-api` or running standalone `docker run`) or manually edit the target out of the compose file.
 
+# Model Provider Guardrails
+- Use `GROQ` as the LLM provider for `openai/gpt-oss-20b` generation/query decomposition.
+- Keep Qwen `0.6B` embedding and reranking on `DeepInfra` with no provider changes.
+
 # Server Connection & Deployment
 - **SSH Connection**: run `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new root@65.109.112.253` from the workspace directory (or use `.ssh/id_ed25519` relative to workspace).
 - **Server App Path**: `/opt/RAG-pipeline`

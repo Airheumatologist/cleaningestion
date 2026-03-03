@@ -18,11 +18,11 @@ A production-grade **Medical RAG (Retrieval-Augmented Generation) Pipeline** des
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  ┌──────────────┐      ┌──────────────┐      ┌──────────────────────────┐   │
-│  │   Next.js    │      │   FastAPI    │      │    DeepInfra API         │   │
-│  │   Frontend   │◄────►│   Backend    │◄────►│  • Embeddings            │   │
-│  │  (Port 3000) │  SSE │  (Port 8000) │      │  • Reranking             │   │
-│  └──────────────┘      └──────┬───────┘      │  • LLM Inference         │   │
-│                               │              └──────────────────────────┘   │
+│  │   Next.js    │      │   FastAPI    │      │ Groq + DeepInfra APIs    │   │
+│  │   Frontend   │◄────►│   Backend    │◄────►│  • LLM (Groq)            │   │
+│  │  (Port 3000) │  SSE │  (Port 8000) │      │  • Embed/Rerank (DI)     │   │
+│  └──────────────┘      └──────┬───────┘      └──────────────────────────┘   │
+│                               │                                              │
 │                               │                                              │
 │                               ▼                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
@@ -55,7 +55,7 @@ A production-grade **Medical RAG (Retrieval-Augmented Generation) Pipeline** des
 4. Hybrid retrieval from Qdrant (dense + sparse vectors)
 5. Reranking with evidence hierarchy (DeepInfra Qwen3-Reranker)
 6. Context building (intelligent section selection)
-7. LLM synthesis (DeepInfra `openai/gpt-oss-20b`)
+7. LLM synthesis (Groq `openai/gpt-oss-20b`)
 8. Streaming response to frontend
 
 ---
@@ -458,7 +458,7 @@ Intelligent context assembly in `_get_papers_for_context()`:
 - No general disclaimers (peer-to-peer professional communication)
 
 **Model:**
-- **LLM**: `openai/gpt-oss-20b` via DeepInfra
+- **LLM**: `openai/gpt-oss-20b` via Groq
 - **Reranker**: `Qwen/Qwen3-Reranker-0.6B` via DeepInfra
 
 ---
@@ -473,6 +473,7 @@ If you are integrating an existing product frontend into production, start with 
 - Python 3.11+
 - Node.js 18+ (for frontend)
 - Docker (for local Qdrant testing)
+- Groq API key (ask team lead)
 - DeepInfra API key (ask team lead)
 
 ### 1. Clone & Install
@@ -506,10 +507,16 @@ QDRANT_COLLECTION=rag_pipeline
 COLLECTION_NAME=rag_pipeline
 
 # =============================================================================
-# DEEPINFRA API (Team Account)
+# PROVIDER API KEYS (Team Account)
 # =============================================================================
+GROQ_API_KEY=<ask-team-lead>
 DEEPINFRA_API_KEY=<ask-team-lead>
+
+LLM_PROVIDER=groq
 LLM_MODEL=openai/gpt-oss-20b
+LLM_MAX_COMPLETION_TOKENS=8192
+LLM_REASONING_EFFORT=medium
+GROQ_CHAT_TIMEOUT_SECONDS=300
 DEEPINFRA_BASE_URL=https://api.deepinfra.com/v1/openai
 DEEPINFRA_CHAT_TIMEOUT_SECONDS=300
 DEEPINFRA_EMBED_TIMEOUT_SECONDS=120
@@ -827,7 +834,7 @@ Production rule:
 |-------|------------|-------|
 | Qwen/Qwen3-Reranker-0.6B | 32K | **Default** |
 
-### LLM Models (via DeepInfra)
+### LLM Models (via Groq)
 
 | Model | Use Case |
 |-------|----------|
@@ -922,7 +929,7 @@ Production frontend integration checklist:
 2. **Service auth**: non-health endpoints require bearer token validation from `API_KEYS_FILE`.
 3. **Token storage**: store hashed tokens only in `api_keys.json`; rotate on schedule/incidents.
 4. **Frontend security**: no service token in browser code, browser storage, or `NEXT_PUBLIC_*` envs.
-5. **DeepInfra key**: keep in server environment only.
+5. **Provider keys**: keep `GROQ_API_KEY` and `DEEPINFRA_API_KEY` in server environment only.
 6. **CORS**: keep production origin list minimal.
 7. **No PII**: pipeline processes public medical literature only.
 
@@ -936,9 +943,9 @@ Production frontend integration checklist:
 QDRANT_TIMEOUT = 180  # seconds
 ```
 
-### DeepInfra Rate Limiting
-- Batch size is set to 64 for embeddings
-- Retries enabled with exponential backoff
+### Provider Rate Limiting
+- DeepInfra (embeddings/reranker): batch size is set to 64 and retries use exponential backoff
+- Groq (LLM): retries are enabled for generation/query decomposition calls
 
 ### Out of Memory During Ingestion
 - Reduce `BATCH_SIZE` in `scripts/config_ingestion.py`

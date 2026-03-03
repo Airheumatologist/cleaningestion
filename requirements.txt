@@ -1,7 +1,9 @@
-# RAG Pipeline Dependencies - DeepInfra-Only Configuration (47 packages)
+# RAG Pipeline Dependencies - Groq LLM + DeepInfra Embed/Rerank Configuration
 # Install with: pip install -r requirements.txt
 #
-# NOTE: This is a MINIMAL configuration using DeepInfra API for embeddings & reranking
+# NOTE: This is a MINIMAL configuration using:
+#       - Groq API for GPT-OSS generation/query decomposition
+#       - DeepInfra API for embeddings & reranking
 #       and BM25 for sparse search. Local ML packages (torch, transformers, etc.) are excluded.
 
 # Core API & Server
@@ -19,8 +21,9 @@ grpcio>=1.78.0
 protobuf>=6.0.0
 portalocker>=3.0.0
 
-# LLM & Embeddings API (DeepInfra uses OpenAI-compatible API)
+# LLM/Provider SDKs
 openai>=2.21.0
+groq>=0.11.0
 distro>=1.9.0
 jiter>=0.13.0
 

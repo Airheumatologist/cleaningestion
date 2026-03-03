@@ -5,7 +5,7 @@ Optimized pipeline for fast, comprehensive medical responses:
 1. Query preprocessing with decomposition
 2. Qdrant hybrid retrieval (dense + BM25 sparse)
 3. DeepInfra Qwen3-Reranker with paper aggregation and evidence hierarchy
-4. Direct LLM synthesis with ELIXIR system prompt (DeepInfra GPT-OSS-20B)
+4. Direct LLM synthesis with ELIXIR system prompt (Groq/DeepInfra GPT-OSS-20B)
 
 Designed for speed and quality clinical decision support.
 """
@@ -16,12 +16,17 @@ import hashlib
 from datetime import datetime
 from typing import List, Dict, Any, Generator, Optional
 from dataclasses import asdict
+from groq import Groq
 from openai import OpenAI
 
 from .config import (
     DEEPINFRA_API_KEY,
     DEEPINFRA_BASE_URL,
-    DEEPINFRA_CHAT_TIMEOUT_SECONDS,
+    GROQ_API_KEY,
+    LLM_PROVIDER,
+    LLM_CHAT_TIMEOUT_SECONDS,
+    LLM_MAX_COMPLETION_TOKENS,
+    LLM_REASONING_EFFORT,
     LLM_MODEL,
     LLM_TEMPERATURE,
     LLM_TOP_P,
@@ -72,7 +77,7 @@ class MedicalRAGPipeline:
     2. Retrieve passages from Qdrant
     3. Rerank passages with DeepInfra Qwen3-Reranker
     4. Aggregate to paper level
-    5. Direct LLM synthesis with ELIXIR prompt
+    5. Direct LLM synthesis with ELIXIR prompt (Groq/DeepInfra)
     """
     
     def __init__(
@@ -113,11 +118,22 @@ class MedicalRAGPipeline:
         self._last_context_stats = {
             "pmc_recent_fulltext_used": 0,
         }
-        self.openai_client = OpenAI(
-            api_key=DEEPINFRA_API_KEY,
-            base_url=DEEPINFRA_BASE_URL,
-            timeout=DEEPINFRA_CHAT_TIMEOUT_SECONDS,
-        )
+        self.llm_provider = LLM_PROVIDER
+        if self.llm_provider == "groq":
+            if not GROQ_API_KEY:
+                raise ValueError("GROQ_API_KEY not set")
+            self.llm_client = Groq(
+                api_key=GROQ_API_KEY,
+                timeout=LLM_CHAT_TIMEOUT_SECONDS,
+            )
+        elif self.llm_provider == "deepinfra":
+            self.llm_client = OpenAI(
+                api_key=DEEPINFRA_API_KEY,
+                base_url=DEEPINFRA_BASE_URL,
+                timeout=LLM_CHAT_TIMEOUT_SECONDS,
+            )
+        else:
+            raise ValueError(f"Unsupported LLM_PROVIDER: {self.llm_provider}")
         
         # Components
         self.preprocessor = QueryPreprocessor(model=model)
@@ -153,7 +169,7 @@ class MedicalRAGPipeline:
             "final_top_articles": self.final_top_articles,
         }
         
-        logger.info("✅ Pipeline initialized (Elixir direct synthesis)")
+        logger.info("✅ Pipeline initialized (Elixir direct synthesis, provider=%s)", self.llm_provider)
 
     def _cache_get(self, query: str) -> Dict[str, Any] | None:
         """Read query cache using pipeline context so stale entries are isolated."""
@@ -1269,14 +1285,12 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
                 # Return a generator for tokens
                 return self._stream_generation(query, user_prompt, used_papers)
             
-            response = self.openai_client.chat.completions.create(
+            response = self._create_chat_completion(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P
             )
 
             answer = response.choices[0].message.content.strip()
@@ -1293,15 +1307,13 @@ Analyze and synthesize the medical literature above to create a detailed, clinic
             # Use ELIXIR_SYSTEM_PROMPT for deep research
             system_prompt = ELIXIR_SYSTEM_PROMPT
             
-            response = self.openai_client.chat.completions.create(
+            response = self._create_chat_completion(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
                 stream=True,
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P
             )
             
             full_answer = ""
@@ -1358,14 +1370,12 @@ Please provide a comprehensive clinical response based on your medical knowledge
             if stream:
                 return self._stream_fallback_generation(fallback_system_prompt, user_prompt)
             
-            response = self.openai_client.chat.completions.create(
+            response = self._create_chat_completion(
                 model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": fallback_system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P
             )
             
             answer = response.choices[0].message.content.strip()
@@ -1379,15 +1389,13 @@ Please provide a comprehensive clinical response based on your medical knowledge
     def _stream_fallback_generation(self, system_prompt: str, user_prompt: str) -> Generator[Dict[str, Any], None, None]:
         """Stream fallback generation tokens."""
         try:
-            response = self.openai_client.chat.completions.create(
+            response = self._create_chat_completion(
                 model=LLM_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role": "user", "content": user_prompt},
                 ],
                 stream=True,
-                temperature=LLM_TEMPERATURE,
-                top_p=LLM_TOP_P
             )
             
             full_answer = ""
@@ -1402,6 +1410,26 @@ Please provide a comprehensive clinical response based on your medical knowledge
         except Exception as e:
             logger.error(f"Fallback streaming failed: {e}")
             yield {"step": "error", "message": str(e)}
+
+    def _create_chat_completion(
+        self,
+        model: str,
+        messages: List[Dict[str, str]],
+        stream: bool = False,
+    ):
+        request_kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": LLM_TEMPERATURE,
+            "top_p": LLM_TOP_P,
+        }
+        if stream:
+            request_kwargs["stream"] = True
+        if self.llm_provider == "groq":
+            request_kwargs["max_completion_tokens"] = LLM_MAX_COMPLETION_TOKENS
+            if LLM_REASONING_EFFORT:
+                request_kwargs["reasoning_effort"] = LLM_REASONING_EFFORT
+        return self.llm_client.chat.completions.create(**request_kwargs)
     
     # =========================================================================
     # PDF Availability Check via Europe PMC

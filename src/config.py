@@ -73,10 +73,9 @@ QDRANT_RETRY_COUNT = 3  # Number of retries for transient failures
 QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
 
 # =============================================================================
-# LLM Configuration (DeepInfra)
+# API Provider Configuration
 # =============================================================================
 DEEPINFRA_API_KEY = os.getenv("DEEPINFRA_API_KEY")
-
 DEEPINFRA_BASE_URL = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
 DEEPINFRA_RETRY_COUNT = int(os.getenv("DEEPINFRA_RETRY_COUNT", "3"))  # Number of retries for transient DeepInfra failures
 DEEPINFRA_RETRY_DELAY = float(os.getenv("DEEPINFRA_RETRY_DELAY", "1.0"))  # Base delay in seconds (exponential backoff)
@@ -84,12 +83,24 @@ DEEPINFRA_CHAT_TIMEOUT_SECONDS = _env_float("DEEPINFRA_CHAT_TIMEOUT_SECONDS", 30
 DEEPINFRA_EMBED_TIMEOUT_SECONDS = _env_float("DEEPINFRA_EMBED_TIMEOUT_SECONDS", 120.0)
 DEEPINFRA_RERANK_TIMEOUT_SECONDS = _env_float("DEEPINFRA_RERANK_TIMEOUT_SECONDS", 60.0)
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com")
+GROQ_RETRY_COUNT = int(os.getenv("GROQ_RETRY_COUNT", "3"))
+GROQ_RETRY_DELAY = float(os.getenv("GROQ_RETRY_DELAY", "1.0"))
+GROQ_CHAT_TIMEOUT_SECONDS = _env_float("GROQ_CHAT_TIMEOUT_SECONDS", 300.0)
+
 # LLM Generation Parameters
 LLM_TEMPERATURE = 0.7  # Controls randomness (0=deterministic, 1=creative)
 LLM_TOP_P = 0.9  # Nucleus sampling threshold
 
-# LLM Configuration (Single Model)
+# LLM Configuration (Generation)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").strip().lower()
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
+LLM_MAX_COMPLETION_TOKENS = _env_int("LLM_MAX_COMPLETION_TOKENS", 8192)
+LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "medium").strip().lower()
+LLM_RETRY_COUNT = GROQ_RETRY_COUNT if LLM_PROVIDER == "groq" else DEEPINFRA_RETRY_COUNT
+LLM_RETRY_DELAY = GROQ_RETRY_DELAY if LLM_PROVIDER == "groq" else DEEPINFRA_RETRY_DELAY
+LLM_CHAT_TIMEOUT_SECONDS = GROQ_CHAT_TIMEOUT_SECONDS if LLM_PROVIDER == "groq" else DEEPINFRA_CHAT_TIMEOUT_SECONDS
 
 # =============================================================================
 # Embedding Model Configuration
@@ -208,6 +219,10 @@ def validate_config():
         errors.append("QDRANT_API_KEY not set in .env")
     if not DEEPINFRA_API_KEY:
         errors.append("DEEPINFRA_API_KEY not set")
+    if LLM_PROVIDER not in {"groq", "deepinfra"}:
+        errors.append("LLM_PROVIDER must be one of: groq, deepinfra")
+    if LLM_PROVIDER == "groq" and not GROQ_API_KEY:
+        errors.append("GROQ_API_KEY not set")
 
     if errors:
         raise ValueError(
@@ -226,8 +241,12 @@ if __name__ == "__main__":
         print(f"✅ QDRANT_URL: {QDRANT_URL[:50]}...")
         print(f"✅ QDRANT_API_KEY: {QDRANT_API_KEY[:20]}...")
         print(f"✅ DEEPINFRA_API_KEY: {DEEPINFRA_API_KEY[:20]}...")
+        if GROQ_API_KEY:
+            print(f"✅ GROQ_API_KEY: {GROQ_API_KEY[:20]}...")
         print(f"✅ LLM Model: {LLM_MODEL}")
+        print(f"✅ LLM Provider: {LLM_PROVIDER}")
         print(f"✅ DeepInfra Base URL: {DEEPINFRA_BASE_URL}")
+        print(f"✅ Groq Base URL: {GROQ_BASE_URL}")
         print(f"✅ Embedding Model: {EMBEDDING_MODEL}")
         print(f"✅ Collection Name: {COLLECTION_NAME}")
         print("\n✅ All configuration validated!")
