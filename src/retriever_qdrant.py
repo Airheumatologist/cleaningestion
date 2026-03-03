@@ -383,6 +383,78 @@ class QdrantRetriever(AbstractRetriever):
             top_scores,
         )
 
+    @staticmethod
+    def _prepare_query_for_embedding(query: str, use_instruction: bool = True) -> str:
+        """Apply instruction prefix used for dense query embeddings."""
+        if not use_instruction:
+            return query
+        instruction = "Given a medical question, retrieve relevant clinical passages that answer the query"
+        return f"Instruct: {instruction}\nQuery: {query}"
+
+    def _embed_queries(self, queries: List[str], use_instruction: bool = True) -> List[Any]:
+        """
+        Embed multiple queries in one call when provider supports batching.
+
+        Returns one embedding object per input query (same order). Items may be
+        None when embedding fails for a specific query.
+        """
+        if not queries:
+            return []
+
+        if self.embedding_provider == "deepinfra" and self.openai_client is not None:
+            prepared_queries = [
+                self._prepare_query_for_embedding(query, use_instruction=use_instruction)
+                for query in queries
+            ]
+            try:
+                response = retry_with_exponential_backoff(
+                    lambda: self.openai_client.embeddings.create(
+                        model=self.embedding_model,
+                        input=prepared_queries,
+                        encoding_format="float"
+                    ),
+                    max_attempts=self.retry_count + 1,
+                    base_delay=float(self.retry_delay),
+                    operation_name="DeepInfra embeddings.create (batch)",
+                    logger=logger,
+                )
+                embeddings: List[Any] = [None] * len(queries)
+                for item_idx, item in enumerate(response.data):
+                    index = getattr(item, "index", item_idx)
+                    if 0 <= index < len(embeddings):
+                        embeddings[index] = item.embedding
+                missing = sum(1 for emb in embeddings if emb is None)
+                if missing:
+                    logger.warning(
+                        "DeepInfra batch embeddings returned %s/%s vectors; filling missing sequentially",
+                        len(queries) - missing,
+                        len(queries),
+                    )
+                    for idx, emb in enumerate(embeddings):
+                        if emb is None:
+                            embeddings[idx] = self._embed_query(queries[idx], use_instruction=use_instruction)
+                return embeddings
+            except Exception as e:
+                logger.error(f"DeepInfra batch query embedding failed: {e}")
+                # Preserve behavior by falling back to sequential embedding.
+                return [self._embed_query(query, use_instruction=use_instruction) for query in queries]
+
+        if self.embedding_provider == "qdrant_cloud_inference":
+            return [Document(text=query, model=self.embedding_model) for query in queries]
+
+        if self.local_encoder is not None:
+            embeddings: List[Any] = []
+            for query in queries:
+                try:
+                    vec = self.local_encoder.encode(query, normalize_embeddings=True)
+                    embeddings.append(vec.tolist())
+                except Exception as e:
+                    logger.error(f"Local query embedding failed: {e}")
+                    embeddings.append(None)
+            return embeddings
+
+        return [None for _ in queries]
+
     def _embed_query(self, query: str, use_instruction: bool = True):
         """
         Embed a single query using the configured embedding provider.
@@ -401,12 +473,9 @@ class QdrantRetriever(AbstractRetriever):
         
         if self.embedding_provider == "deepinfra" and self.openai_client is not None:
             try:
-                # For queries, add instruction to improve retrieval (1-5% improvement)
-                if use_instruction:
-                    instruction = "Given a medical question, retrieve relevant clinical passages that answer the query"
-                    query_with_instruct = f"Instruct: {instruction}\nQuery: {query}"
-                else:
-                    query_with_instruct = query
+                query_with_instruct = self._prepare_query_for_embedding(
+                    query, use_instruction=use_instruction
+                )
 
                 response = retry_with_exponential_backoff(
                     lambda: self.openai_client.embeddings.create(
@@ -883,16 +952,39 @@ class QdrantRetriever(AbstractRetriever):
 
         use_sparse = any(vec.indices for vec in sparse_vectors)
         per_query_requests = 2 if use_sparse else 1
-        logger.info(
-            "⚡ Batch search: %s queries × %s request(s) = %s in one HTTP call",
-            len(queries),
-            per_query_requests,
-            len(queries) * per_query_requests,
-        )
         
         # Build filter
         search_filter = self._build_filter(**filter_kwargs)
         
+        # Embed dense queries in one provider request when possible.
+        dense_queries = self._embed_queries(queries)
+        query_contexts = []
+        for i, query_text in enumerate(queries):
+            dense_query = dense_queries[i] if i < len(dense_queries) else None
+            if dense_query is None:
+                logger.warning("Skipping query without dense encoder available: %s", query_text[:80])
+                continue
+            query_contexts.append({
+                "query_index": i,
+                "dense_query": dense_query,
+            })
+
+        if not query_contexts:
+            logger.warning("Batch search aborted: no dense query embeddings available")
+            return []
+
+        logger.info(
+            "⚡ Batch search: %s queries × %s request(s) = %s in one HTTP call",
+            len(query_contexts),
+            per_query_requests,
+            len(query_contexts) * per_query_requests,
+        )
+        if len(query_contexts) < len(queries):
+            logger.warning(
+                "Batch search dropped %s query(ies) due to embedding failures",
+                len(queries) - len(query_contexts),
+            )
+
         # Build batch requests: interleave dense and sparse for each query
         batch_requests = []
         
@@ -904,13 +996,9 @@ class QdrantRetriever(AbstractRetriever):
             )
         )
         
-        for i, query_text in enumerate(queries):
-            # Dense query using configured embedding provider
-            dense_query = self._embed_query(query_text)
-            if dense_query is None:
-                logger.warning("Skipping query without dense encoder available: %s", query_text[:80])
-                continue
-
+        for query_ctx in query_contexts:
+            query_idx = query_ctx["query_index"]
+            dense_query = query_ctx["dense_query"]
             dense_request = QueryRequest(
                 query=dense_query,
                 using="dense",
@@ -925,7 +1013,7 @@ class QdrantRetriever(AbstractRetriever):
             if use_sparse:
                 # Sparse query using pre-computed BM25 sparse vector.
                 sparse_request = QueryRequest(
-                    query=sparse_vectors[i],
+                    query=sparse_vectors[query_idx],
                     using="sparse",
                     filter=search_filter,
                     limit=self.n_retrieval * 2,
@@ -968,7 +1056,7 @@ class QdrantRetriever(AbstractRetriever):
         all_points = {}  # rank_key -> point (for payload access)
         combined_scores = {}  # rank_key -> RRF score
         
-        for i in range(len(queries)):
+        for i, _query_ctx in enumerate(query_contexts):
             dense_idx = i * per_query_requests
             sparse_idx = dense_idx + 1
             

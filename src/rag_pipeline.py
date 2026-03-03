@@ -33,6 +33,11 @@ from .config import (
     RERANK_INPUT_CHUNK_LIMIT,
     RERANK_TOP_CHUNKS,
     FINAL_TOP_ARTICLES,
+    FINAL_RECENCY_POLICY_MODE,
+    FINAL_RECENCY_WINDOW_YEARS,
+    FINAL_RECENCY_BACKFILL_MAX_EVIDENCE_LEVEL,
+    FINAL_RECENCY_EXCLUDE_UNKNOWN_NON_DAILYMED,
+    PMC_FULLTEXT_RECENT_ONLY,
     ENTITY_FILTER_ENABLED,
     PRE_RERANK_RECENT_WINDOW_YEARS,
     PRE_RERANK_RECENT_QUOTA_RATIO,
@@ -93,6 +98,21 @@ class MedicalRAGPipeline:
         self.pre_rerank_recent_window_years = PRE_RERANK_RECENT_WINDOW_YEARS
         self.pre_rerank_recent_quota_ratio = PRE_RERANK_RECENT_QUOTA_RATIO
         self.final_top_articles = FINAL_TOP_ARTICLES
+        self.final_recency_policy_mode = FINAL_RECENCY_POLICY_MODE
+        self.final_recency_window_years = max(1, FINAL_RECENCY_WINDOW_YEARS)
+        self.final_recency_backfill_max_evidence_level = FINAL_RECENCY_BACKFILL_MAX_EVIDENCE_LEVEL
+        self.final_recency_exclude_unknown_non_dailymed = FINAL_RECENCY_EXCLUDE_UNKNOWN_NON_DAILYMED
+        self.pmc_fulltext_recent_only = PMC_FULLTEXT_RECENT_ONLY
+        self._last_recency_stats = {
+            "recent_kept_non_dailymed": 0,
+            "dailymed_kept": 0,
+            "older_backfilled": 0,
+            "unknown_non_dailymed_excluded": 0,
+            "recent_cutoff_year": datetime.now().year - self.final_recency_window_years + 1,
+        }
+        self._last_context_stats = {
+            "pmc_recent_fulltext_used": 0,
+        }
         self.openai_client = OpenAI(
             api_key=DEEPINFRA_API_KEY,
             base_url=DEEPINFRA_BASE_URL,
@@ -121,7 +141,7 @@ class MedicalRAGPipeline:
         reranker_model = getattr(getattr(self.paper_finder, "reranker_engine", None), "model", "unknown")
         self._cache_key_context = {
             "pipeline": "elixir",
-            "pipeline_cache_version": 2,
+            "pipeline_cache_version": 3,
             "llm_model": self.model,
             "reranker_model": reranker_model,
             "embedding_model": getattr(self.retriever, "embedding_model", "unknown"),
@@ -146,6 +166,37 @@ class MedicalRAGPipeline:
         if not self.cache.enabled:
             return
         self.cache.set(query, response, **self._cache_key_context)
+
+    def _build_retrieval_stats(
+        self,
+        passages_retrieved: int,
+        papers_after_aggregation: int,
+        abstracts_used: int,
+    ) -> Dict[str, Any]:
+        recency_stats = self._last_recency_stats or {}
+        context_stats = self._last_context_stats or {}
+        return {
+            "passages_retrieved": passages_retrieved,
+            "papers_after_aggregation": papers_after_aggregation,
+            "abstracts_used": abstracts_used,
+            "recent_articles_kept": recency_stats.get("recent_kept_non_dailymed", 0),
+            "older_high_evidence_backfilled": recency_stats.get("older_backfilled", 0),
+            "unknown_year_non_dailymed_excluded": recency_stats.get("unknown_non_dailymed_excluded", 0),
+            "pmc_recent_fulltext_used": context_stats.get("pmc_recent_fulltext_used", 0),
+        }
+
+    def _reset_run_stats(self) -> None:
+        self._last_recency_stats = {
+            "recent_kept_non_dailymed": 0,
+            "dailymed_kept": 0,
+            "older_backfilled": 0,
+            "unknown_non_dailymed_excluded": 0,
+            "recent_cutoff_year": self._recent_cutoff_year(),
+        }
+        self._last_context_stats = {
+            "pmc_recent_fulltext_used": 0,
+            "recent_cutoff_year": self._recent_cutoff_year(),
+        }
     
     # =========================================================================
     # Step 1: Query Preprocessing
@@ -320,6 +371,127 @@ class MedicalRAGPipeline:
                 return None
 
     @staticmethod
+    def _to_int_evidence_level(value: Any) -> Optional[int]:
+        if value is None or value == "":
+            return None
+        try:
+            level = int(value)
+            if 1 <= level <= 4:
+                return level
+            return None
+        except (TypeError, ValueError):
+            return None
+
+    def _recent_cutoff_year(self, current_year: Optional[int] = None) -> int:
+        year_now = current_year if current_year is not None else datetime.now().year
+        return year_now - self.final_recency_window_years + 1
+
+    @staticmethod
+    def _is_dailymed_row(row: Any) -> bool:
+        pmcid = str(row.get("pmcid", "") or row.get("corpus_id", "")).lower()
+        article_type = str(row.get("article_type", "")).lower()
+        source = str(row.get("source", "")).lower()
+        venue = str(row.get("venue", "") or row.get("journal", "")).lower()
+        return (
+            pmcid.startswith("dailymed_")
+            or article_type == "drug_label"
+            or source == "dailymed"
+            or "dailymed" in venue
+            or "fda drug label" in venue
+        )
+
+    @staticmethod
+    def _attach_sort_score(papers_df):
+        if papers_df.empty:
+            return papers_df
+
+        if "relevance_judgement" in papers_df.columns and "relevance_score" in papers_df.columns:
+            papers_df["_sort_score"] = papers_df["relevance_judgement"].fillna(papers_df["relevance_score"]).fillna(0.0)
+        elif "relevance_judgement" in papers_df.columns:
+            papers_df["_sort_score"] = papers_df["relevance_judgement"].fillna(0.0)
+        elif "relevance_score" in papers_df.columns:
+            papers_df["_sort_score"] = papers_df["relevance_score"].fillna(0.0)
+        else:
+            papers_df["_sort_score"] = 0.0
+        return papers_df
+
+    def _apply_final_recency_policy(self, papers_df):
+        import pandas as pd
+
+        cutoff_year = self._recent_cutoff_year()
+        stats = {
+            "recent_kept_non_dailymed": 0,
+            "dailymed_kept": 0,
+            "older_backfilled": 0,
+            "unknown_non_dailymed_excluded": 0,
+            "recent_cutoff_year": cutoff_year,
+        }
+
+        if papers_df.empty:
+            return papers_df, stats
+
+        policy_mode = (self.final_recency_policy_mode or "hybrid").lower()
+        if policy_mode not in {"hybrid", "strict"}:
+            logger.info("   Final recency policy disabled (mode=%s)", policy_mode)
+            return papers_df, stats
+
+        ranked_df = self._attach_sort_score(papers_df.copy()).sort_values(by="_sort_score", ascending=False).reset_index(drop=True)
+
+        selected_rows: List[Dict[str, Any]] = []
+        older_candidates: List[Dict[str, Any]] = []
+
+        for _, row in ranked_df.iterrows():
+            row_dict = row.to_dict()
+
+            if self._is_dailymed_row(row):
+                selected_rows.append(row_dict)
+                stats["dailymed_kept"] += 1
+                continue
+
+            year_value = self._to_int_year(row.get("year"))
+            if year_value is None:
+                if self.final_recency_exclude_unknown_non_dailymed:
+                    stats["unknown_non_dailymed_excluded"] += 1
+                    continue
+                selected_rows.append(row_dict)
+                stats["recent_kept_non_dailymed"] += 1
+                continue
+
+            if year_value >= cutoff_year:
+                selected_rows.append(row_dict)
+                stats["recent_kept_non_dailymed"] += 1
+                continue
+
+            older_candidates.append(row_dict)
+
+        if policy_mode == "hybrid" and len(selected_rows) < self.final_top_articles:
+            for row_dict in older_candidates:
+                evidence_level = self._to_int_evidence_level(row_dict.get("evidence_level"))
+                if evidence_level is None or evidence_level > self.final_recency_backfill_max_evidence_level:
+                    continue
+                selected_rows.append(row_dict)
+                stats["older_backfilled"] += 1
+                if len(selected_rows) >= self.final_top_articles:
+                    break
+
+        if selected_rows:
+            selected_df = pd.DataFrame(selected_rows)
+        else:
+            selected_df = ranked_df.iloc[0:0].copy()
+
+        selected_df = selected_df.drop(columns=["_sort_score"], errors="ignore").reset_index(drop=True)
+        logger.info(
+            "   Final recency gate (mode=%s, cutoff=%s): recent_kept_non_dailymed=%s | dailymed_kept=%s | older_backfilled=%s | unknown_non_dailymed_excluded=%s",
+            policy_mode,
+            cutoff_year,
+            stats["recent_kept_non_dailymed"],
+            stats["dailymed_kept"],
+            stats["older_backfilled"],
+            stats["unknown_non_dailymed_excluded"],
+        )
+        return selected_df, stats
+
+    @staticmethod
     def _chunk_identity_for_preselection(passage: Dict[str, Any], idx: int) -> str:
         chunk_id = passage.get("chunk_id")
         if chunk_id:
@@ -468,6 +640,13 @@ class MedicalRAGPipeline:
         import pandas as pd
         
         logger.info("📊 Step 3: Reranking & Aggregation")
+        self._last_recency_stats = {
+            "recent_kept_non_dailymed": 0,
+            "dailymed_kept": 0,
+            "older_backfilled": 0,
+            "unknown_non_dailymed_excluded": 0,
+            "recent_cutoff_year": self._recent_cutoff_year(),
+        }
 
         if self.paper_finder is None:
             # Skip reranking and create basic aggregation
@@ -559,16 +738,12 @@ class MedicalRAGPipeline:
                 papers_df = pd.concat([dailymed_df, papers_df], ignore_index=True)
                 logger.info(f"   Total papers after DailyMed merge: {len(papers_df)}")
 
+        papers_df, recency_stats = self._apply_final_recency_policy(papers_df)
+        self._last_recency_stats = recency_stats
+
         # Keep only top-N final articles after all merges and filtering
         if not papers_df.empty:
-            if "relevance_judgement" in papers_df.columns and "relevance_score" in papers_df.columns:
-                papers_df["_sort_score"] = papers_df["relevance_judgement"].fillna(papers_df["relevance_score"]).fillna(0.0)
-            elif "relevance_judgement" in papers_df.columns:
-                papers_df["_sort_score"] = papers_df["relevance_judgement"].fillna(0.0)
-            elif "relevance_score" in papers_df.columns:
-                papers_df["_sort_score"] = papers_df["relevance_score"].fillna(0.0)
-            else:
-                papers_df["_sort_score"] = 0.0
+            papers_df = self._attach_sort_score(papers_df)
 
             papers_df = (
                 papers_df.sort_values(by="_sort_score", ascending=False)
@@ -879,6 +1054,11 @@ class MedicalRAGPipeline:
         context_parts = []
         dailymed_section_count = 0
         pmc_full_text_included = 0
+        recent_cutoff_year = self._recent_cutoff_year()
+        self._last_context_stats = {
+            "pmc_recent_fulltext_used": 0,
+            "recent_cutoff_year": recent_cutoff_year,
+        }
 
         def _safe_str(value: Any) -> str:
             if value is None:
@@ -950,9 +1130,20 @@ class MedicalRAGPipeline:
                 pmcid = _safe_str(row.get('pmcid') or row.get('corpus_id')).upper()
                 doc_id = _safe_str(row.get('doc_id') or row.get('corpus_id') or row.get('pmcid'))
                 is_pmc_article = pmcid.startswith('PMC')
+                year_value = self._to_int_year(row.get("year"))
+                is_recent_for_fulltext = year_value is not None and year_value >= recent_cutoff_year
 
                 text_content = ""
-                if is_pmc_article and pmc_full_text_included < 2 and doc_id:
+                should_load_pmc_fulltext = (
+                    is_pmc_article
+                    and pmc_full_text_included < 2
+                    and doc_id
+                    and (
+                        not self.pmc_fulltext_recent_only
+                        or is_recent_for_fulltext
+                    )
+                )
+                if should_load_pmc_fulltext:
                     chunks = self.retriever.get_all_chunks_for_doc(doc_id)
                     reconstructed_text = self._reconstruct_full_text_from_chunks(chunks)
                     if reconstructed_text:
@@ -969,11 +1160,17 @@ class MedicalRAGPipeline:
             context_parts.append(paper_info)
             
         logger.info(
-            "Context built: %d papers (%d DailyMed with section selection, %d PMC full-text sources).",
+            "Context built: %d papers (%d DailyMed with section selection, %d PMC full-text sources, cutoff=%d recent_only=%s).",
             len(context_parts),
             dailymed_section_count,
             pmc_full_text_included,
+            recent_cutoff_year,
+            self.pmc_fulltext_recent_only,
         )
+        self._last_context_stats = {
+            "pmc_recent_fulltext_used": pmc_full_text_included,
+            "recent_cutoff_year": recent_cutoff_year,
+        }
         return context_parts, used_papers
 
     def _reconstruct_full_text_from_chunks(self, chunks: List[Dict[str, Any]]) -> str:
@@ -1462,6 +1659,8 @@ Please provide a comprehensive clinical response based on your medical knowledge
             cached_result["status"] = "cache_hit"
             return cached_result
 
+        self._reset_run_stats()
+
         # Step 1: Preprocess
         processed_query = self.preprocess_query(query)
         
@@ -1547,11 +1746,11 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "sections": [],  # Direct synthesis - no sections
             "sources": sources_with_pdf,
             "evidence_hierarchy": self.evidence_hierarchy,
-            "retrieval_stats": {
-                "passages_retrieved": len(passages),
-                "papers_after_aggregation": len(papers_df),
-                "abstracts_used": len(used_papers)
-            },
+            "retrieval_stats": self._build_retrieval_stats(
+                passages_retrieved=len(passages),
+                papers_after_aggregation=len(papers_df),
+                abstracts_used=len(used_papers),
+            ),
             "status": "success"
         }
         
@@ -1581,6 +1780,8 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "cache_hit": True,
             }
             return
+
+        self._reset_run_stats()
 
         # Step 1: Preprocess
         yield {"step": "query_expansion", "status": "running", "message": "Analyzing query..."}
@@ -1628,11 +1829,11 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "sources": [],
                 "evidence_hierarchy": self.evidence_hierarchy,
                 "status": "fallback",
-                "retrieval_stats": {
-                    "passages_retrieved": 0,
-                    "papers_after_aggregation": 0,
-                    "abstracts_used": 0
-                }
+                "retrieval_stats": self._build_retrieval_stats(
+                    passages_retrieved=0,
+                    papers_after_aggregation=0,
+                    abstracts_used=0,
+                ),
             })
             return
 
@@ -1691,11 +1892,11 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 "sources": initial_sources if initial_sources else [],
                 "evidence_hierarchy": self.evidence_hierarchy,
                 "status": "fallback",
-                "retrieval_stats": {
-                    "passages_retrieved": len(passages),
-                    "papers_after_aggregation": 0,
-                    "abstracts_used": 0
-                }
+                "retrieval_stats": self._build_retrieval_stats(
+                    passages_retrieved=len(passages),
+                    papers_after_aggregation=0,
+                    abstracts_used=0,
+                ),
             })
             return
 
@@ -1770,7 +1971,12 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "sources": final_sources,
             "evidence_hierarchy": self.evidence_hierarchy,
             "abstracts_used": len(used_papers),
-            "original_sources_count": len(pdf_results)
+            "original_sources_count": len(pdf_results),
+            "retrieval_stats": self._build_retrieval_stats(
+                passages_retrieved=len(passages),
+                papers_after_aggregation=len(papers_df),
+                abstracts_used=len(used_papers),
+            ),
         }
         yield final_result
         self._cache_set(query, {
@@ -1781,11 +1987,11 @@ Please provide a comprehensive clinical response based on your medical knowledge
             "sources": final_result["sources"],
             "evidence_hierarchy": final_result["evidence_hierarchy"],
             "status": "success",
-            "retrieval_stats": {
-                "passages_retrieved": len(passages),
-                "papers_after_aggregation": len(papers_df),
-                "abstracts_used": len(used_papers),
-            }
+            "retrieval_stats": self._build_retrieval_stats(
+                passages_retrieved=len(passages),
+                papers_after_aggregation=len(papers_df),
+                abstracts_used=len(used_papers),
+            ),
         })
     
     # Backward compatibility
