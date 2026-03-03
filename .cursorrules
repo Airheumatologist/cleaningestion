@@ -11,3 +11,4 @@
   1. Sync modified files: `rsync -avz -e "ssh -i .ssh/id_ed25519" ./src/ root@65.109.112.253:/opt/RAG-pipeline/src/`
   2. Rebuild & Restart backend safely: `ssh -i .ssh/id_ed25519 root@65.109.112.253 "cd /opt/RAG-pipeline/deploy/hetzner && docker compose up -d --build --no-deps rag-api"`
 - **Critical**: Always append `--no-deps rag-api` to docker compose commands so the `qdrant` container remains completely untouched.
+- **Environment Variables**: The `docker-compose.yml` loads `env_file: ../../.env`, which resolves to `/opt/RAG-pipeline/.env` (the **root** `.env`), NOT `deploy/hetzner/.env`. Always edit `/opt/RAG-pipeline/.env` on the server when changing runtime env vars (e.g. model names, API keys). The `deploy/hetzner/.env` is only used for Qdrant-specific compose variables.
