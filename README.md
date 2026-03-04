@@ -81,7 +81,13 @@ This section is the source of truth for integrating product frontend services in
              │ (WireGuard tunnel)
              ▼
 ┌──────────────────────────┐
-│ Hetzner rag-api:8000     │
+│ Hetzner rag-gateway:8000 │
+│ Nginx upstream           │
+└────────────┬─────────────┘
+             │ Docker internal network
+             ▼
+┌──────────────────────────┐
+│ rag-api-1..4             │
 │ FastAPI + Gunicorn       │
 └────────────┬─────────────┘
              │ Docker internal network
@@ -94,7 +100,7 @@ This section is the source of truth for integrating product frontend services in
 Rules:
 1. Do not call Hetzner API directly from browser code.
 2. Do not expose bearer service token to client-side JavaScript.
-3. Keep Qdrant non-public; only `rag-api` talks to Qdrant over Docker network.
+3. Keep Qdrant non-public; only `rag-api-*` talks to Qdrant over Docker network.
 
 ### 2) API contract used by frontend services
 
@@ -218,7 +224,7 @@ Local Next.js server
 SSH tunnel localhost:8001 -> Hetzner localhost:8000
         │
         ▼
-Hetzner rag-api
+Hetzner rag-gateway
 ```
 
 Reference docs:
@@ -291,7 +297,9 @@ RAG-pipeline/
 │   └── next.config.ts                      # Next.js configuration
 │
 ├── deploy/                                 # Deployment configurations
-│   ├── hetzner/README.md                   # Co-located Hetzner stack (Qdrant + rag-api)
+│   ├── hetzner/docker-compose.yml          # Qdrant + rag-api-1..4 + rag-gateway
+│   ├── hetzner/nginx-rag-gateway.conf      # Nginx upstream config for API replicas
+│   ├── hetzner/README.md                   # Co-located Hetzner stack (Qdrant + gateway + API replicas)
 │   └── integration/README.md               # Service integration contract + examples
 │
 ├── start_ingestion.sh                      # Interactive ingestion starter
@@ -503,6 +511,11 @@ Edit `.env` with team credentials:
 # =============================================================================
 QDRANT_URL=http://qdrant:6333
 QDRANT_API_KEY=<ask-team-lead>
+QDRANT_PREFER_GRPC=true
+QDRANT_GRPC_PORT=6334
+QDRANT_HNSW_EF=64
+QDRANT_MAX_INFLIGHT_SEARCHES=64
+QDRANT_SEARCH_TIMEOUT_SECONDS=10
 QDRANT_COLLECTION=rag_pipeline
 COLLECTION_NAME=rag_pipeline
 
@@ -528,6 +541,8 @@ DEEPINFRA_RERANK_TIMEOUT_SECONDS=60
 API_AUTH_ENABLED=true
 API_KEYS_FILE=/opt/RAG-pipeline/api_keys.json
 API_KEYS_CACHE_TTL_SECONDS=30
+API_MAX_INFLIGHT_REQUESTS=128
+API_INFLIGHT_ACQUIRE_TIMEOUT_MS=200
 
 # Embedding Model
 EMBEDDING_PROVIDER=deepinfra
@@ -548,11 +563,15 @@ CHUNK_OVERLAP_TOKENS=256
 # =============================================================================
 USE_HYBRID_SEARCH=true
 SPARSE_RETRIEVAL_MODE=bm25
-RETRIEVAL_CHUNK_LIMIT=400
-MAX_CHUNKS_PER_ARTICLE_PRE_RERANK=3
-RERANK_INPUT_CHUNK_LIMIT=200
-RERANK_TOP_CHUNKS=100
+QUANTIZATION_RESCORE=false
+QUANTIZATION_OVERSAMPLING=1.0
+RETRIEVAL_CHUNK_LIMIT=150
+MAX_CHUNKS_PER_ARTICLE_PRE_RERANK=2
+RERANK_INPUT_CHUNK_LIMIT=90
+RERANK_TOP_CHUNKS=75
 FINAL_TOP_ARTICLES=50
+WEEKLY_UPDATE_THROTTLE_SECONDS=0.5
+WEEKLY_UPDATE_BATCH_SIZE=0
 
 # =============================================================================
 # DATA DIRECTORIES
@@ -957,7 +976,7 @@ QDRANT_TIMEOUT = 180  # seconds
 
 ### Qdrant Container Protection
 **CRITICAL**: `qdrant` ingestion takes weeks. Absolutely **NEVER** recreate, stop, or delete the `qdrant` container during routine API updates.
-- **Rule**: If restarting `rag-api`, isolate it using `docker compose up -d --no-deps rag-api` so that Docker Compose does not mistakenly try to recreate the `qdrant` container and trigger name conflicts.
+- **Rule**: If restarting API services, isolate them using `docker compose up -d --no-deps rag-api-1 rag-api-2 rag-api-3 rag-api-4 rag-gateway` so Docker Compose cannot touch `qdrant`.
 - A global `.cursorrules` file enforces this rule across all AI agents in this repository.
 
 ### MeSH Dictionary Downloads & Concurrency
@@ -967,8 +986,8 @@ The API utilizes the NLM MeSH Dictionary for query expansion, which rolls over t
 - Run `curl -O` directly into the mounted data directory on the host if NLM URLs change or roll over to a new year.
 
 ### Docker Networking Issues
-- `rag-api` and `qdrant` must share the same Docker network for DNS resolution to work.
-- If `rag-api` throws `Temporary failure in name resolution` for `http://qdrant:6333`, ensure that both containers are attached to `qdrant_default` (or `rag_internal`) inside `docker-compose.yml`.
+- `rag-api-*`, `rag-gateway`, and `qdrant` must share the same Docker network for DNS resolution to work.
+- If API services throw `Temporary failure in name resolution` for `http://qdrant:6333`, ensure containers are attached to `rag_internal` inside `docker-compose.yml`.
 
 ### Frontend API Routing
 - The local Next.js frontend defaults to routing `/api/*` to `http://localhost:8000`.

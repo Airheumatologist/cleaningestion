@@ -820,8 +820,31 @@ def ingest_pubmed_updates(
     client: QdrantClient,
     embedding_provider: EmbeddingProvider,
     max_files: Optional[int],
-    min_year: int = DEFAULT_MIN_YEAR
+    min_year: int = DEFAULT_MIN_YEAR,
+    batch_size: Optional[int] = None,
+    throttle_seconds: Optional[float] = None,
 ) -> int:
+    effective_batch_size = (
+        batch_size
+        if batch_size is not None and batch_size > 0
+        else (
+            IngestionConfig.WEEKLY_UPDATE_BATCH_SIZE
+            if IngestionConfig.WEEKLY_UPDATE_BATCH_SIZE > 0
+            else IngestionConfig.BATCH_SIZE
+        )
+    )
+    effective_throttle = (
+        throttle_seconds
+        if throttle_seconds is not None and throttle_seconds >= 0
+        else max(0.0, IngestionConfig.WEEKLY_UPDATE_THROTTLE_SECONDS)
+    )
+
+    logger.info(
+        "Weekly PubMed QoS settings: batch_size=%d throttle_seconds=%.3f",
+        effective_batch_size,
+        effective_throttle,
+    )
+
     processed = load_processed_files()
     baseline_pmids = load_baseline_pmids(CHECKPOINT_FILE)
     logger.info(
@@ -864,16 +887,23 @@ def ingest_pubmed_updates(
         logger.warning("BM25 sparse encoder unavailable; continuing with dense-only indexing")
 
     inserted = 0
+    total_articles_processed = 0
+    total_batches_upserted = 0
+    pubmed_started = time.time()
     for file_name in new_files:
+        file_started = time.time()
         logger.info("Processing update file: %s", file_name)
         local_file = download_pubmed_file(file_name, UPDATE_DOWNLOAD_DIR)
 
         batch: List[Dict[str, Any]] = []
         file_inserted = 0
+        file_articles_processed = 0
+        file_batches_upserted = 0
         for article in parse_pubmed_update_xml(local_file, min_year=min_year):
-            pmid = str(article.get("pmid") or "").strip()
             batch.append(article)
-            if len(batch) < IngestionConfig.BATCH_SIZE:
+            file_articles_processed += 1
+            total_articles_processed += 1
+            if len(batch) < effective_batch_size:
                 continue
             points, ingested_pmids = build_points(
                 batch,
@@ -891,7 +921,10 @@ def ingest_pubmed_updates(
                 baseline_pmids.update(ingested_pmids)
                 inserted += len(points)
                 file_inserted += len(points)
-                time.sleep(0.5)  # Throttle: allow RocksDB compaction
+                file_batches_upserted += 1
+                total_batches_upserted += 1
+                if effective_throttle > 0:
+                    time.sleep(effective_throttle)
             batch.clear()
 
         if batch:
@@ -911,11 +944,34 @@ def ingest_pubmed_updates(
                 baseline_pmids.update(ingested_pmids)
                 inserted += len(points)
                 file_inserted += len(points)
+                file_batches_upserted += 1
+                total_batches_upserted += 1
+                if effective_throttle > 0:
+                    time.sleep(effective_throttle)
 
         processed.add(file_name)
         save_processed_files(processed)
         local_file.unlink(missing_ok=True)
-        logger.info("Completed file: %s inserted=%d", file_name, file_inserted)
+        file_elapsed = max(0.001, time.time() - file_started)
+        logger.info(
+            "Completed file: %s inserted=%d articles=%d batches=%d elapsed=%.1fs throughput_points_per_s=%.2f",
+            file_name,
+            file_inserted,
+            file_articles_processed,
+            file_batches_upserted,
+            file_elapsed,
+            file_inserted / file_elapsed,
+        )
+
+    pubmed_elapsed = max(0.001, time.time() - pubmed_started)
+    logger.info(
+        "Weekly PubMed update summary: inserted=%d articles=%d batches=%d elapsed=%.1fs throughput_points_per_s=%.2f",
+        inserted,
+        total_articles_processed,
+        total_batches_upserted,
+        pubmed_elapsed,
+        inserted / pubmed_elapsed,
+    )
 
     return inserted
 
@@ -1007,6 +1063,24 @@ def main() -> None:
             "Increase to 2-4 after a missed run to catch up."
         ),
     )
+    parser.add_argument(
+        "--throttle-seconds",
+        type=float,
+        default=IngestionConfig.WEEKLY_UPDATE_THROTTLE_SECONDS,
+        help=(
+            "Sleep duration after each PubMed upsert batch (seconds). "
+            f"Default from env WEEKLY_UPDATE_THROTTLE_SECONDS={IngestionConfig.WEEKLY_UPDATE_THROTTLE_SECONDS}."
+        ),
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=IngestionConfig.WEEKLY_UPDATE_BATCH_SIZE,
+        help=(
+            "Override PubMed weekly ingestion batch size. "
+            "Set <=0 to use BATCH_SIZE."
+        ),
+    )
     args = parser.parse_args()
 
     ensure_data_dirs()
@@ -1036,6 +1110,8 @@ def main() -> None:
             client, embedding_provider,
             max_files=args.max_files,
             min_year=args.min_year,
+            batch_size=args.batch_size,
+            throttle_seconds=args.throttle_seconds,
         )
 
     if not args.skip_dailymed:

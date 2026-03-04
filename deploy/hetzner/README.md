@@ -1,8 +1,9 @@
 # Hetzner Deployment: Co-Located RAG API + Qdrant
 
-This folder contains production assets for running both services on one Hetzner host:
+This folder contains production assets for running the stack on one Hetzner host:
 - `qdrant` (internal-only on Docker network)
-- `rag-api` (FastAPI/Gunicorn on port `8000`)
+- `rag-api-1..4` (FastAPI/Gunicorn replicas on internal network)
+- `rag-gateway` (Nginx on host port `8000`)
 
 ## 1) Prepare server
 
@@ -36,11 +37,16 @@ Required production edits in `.env`:
 ```env
 QDRANT_URL=http://qdrant:6333
 QDRANT_GRPC_URL=qdrant:6334
+QDRANT_PREFER_GRPC=true
+QDRANT_GRPC_PORT=6334
+QDRANT_HNSW_EF=64
 QDRANT_API_KEY=<generate-with-openssl-rand-hex-32>
 
 DEEPINFRA_API_KEY=<deepinfra-key>
 API_AUTH_ENABLED=true
 API_KEYS_FILE=/opt/RAG-pipeline/api_keys.json
+API_MAX_INFLIGHT_REQUESTS=128
+API_INFLIGHT_ACQUIRE_TIMEOUT_MS=200
 
 # Browser CORS can stay local-only if callers are backend services.
 CORS_ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
@@ -150,9 +156,9 @@ cd /opt/RAG-pipeline
 python3 scripts/hash_service_token.py --token "<new-token>"
 
 # 3) Replace token_hash in /opt/RAG-pipeline/api_keys.json
-# 4) Restart API container (NOTE: isolate rag-api to avoid touching qdrant)
+# 4) Restart API services only (NOTE: isolate API + gateway to avoid touching qdrant)
 cd /opt/RAG-pipeline/deploy/hetzner
-docker compose --env-file ../../.env up -d --no-deps rag-api
+docker compose --env-file ../../.env up -d --no-deps rag-api-1 rag-api-2 rag-api-3 rag-api-4 rag-gateway
 ```
 
 ## 12) Acceptance checks

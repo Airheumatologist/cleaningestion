@@ -59,6 +59,8 @@ API_KEYS_CACHE_TTL_SECONDS = _env_int("API_KEYS_CACHE_TTL_SECONDS", 30)
 # Runtime graceful shutdown controls
 API_SHUTDOWN_GRACE_SECONDS = _env_int("API_SHUTDOWN_GRACE_SECONDS", 85)
 API_INFLIGHT_DRAIN_POLL_SECONDS = _env_float("API_INFLIGHT_DRAIN_POLL_SECONDS", 0.2)
+API_MAX_INFLIGHT_REQUESTS = _env_int("API_MAX_INFLIGHT_REQUESTS", 0)
+API_INFLIGHT_ACQUIRE_TIMEOUT_MS = _env_int("API_INFLIGHT_ACQUIRE_TIMEOUT_MS", 250)
 
 # =============================================================================
 # Qdrant Cloud Configuration
@@ -68,6 +70,11 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", os.getenv("QDRANT_COLLECTION", "rag_pipeline"))
 GRAPHRAG_COLLECTION_NAME = os.getenv("GRAPHRAG_COLLECTION_NAME", "pmc_medical_graphrag")
 QDRANT_CLOUD_INFERENCE = _env_bool("QDRANT_CLOUD_INFERENCE", default=False)
+QDRANT_PREFER_GRPC = _env_bool("QDRANT_PREFER_GRPC", default=True)
+QDRANT_GRPC_PORT = _env_int("QDRANT_GRPC_PORT", 6334)
+QDRANT_HNSW_EF = _env_int("QDRANT_HNSW_EF", 64)
+QDRANT_MAX_INFLIGHT_SEARCHES = _env_int("QDRANT_MAX_INFLIGHT_SEARCHES", 0)
+QDRANT_SEARCH_TIMEOUT_SECONDS = _env_int("QDRANT_SEARCH_TIMEOUT_SECONDS", 10)
 QDRANT_TIMEOUT = 180  # Client timeout in seconds
 QDRANT_RETRY_COUNT = 3  # Number of retries for transient failures
 QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
@@ -105,11 +112,20 @@ LLM_CHAT_TIMEOUT_SECONDS = GROQ_CHAT_TIMEOUT_SECONDS if LLM_PROVIDER == "groq" e
 # =============================================================================
 # Embedding Model Configuration
 # =============================================================================
-# Provider: "deepinfra" (default) or "qdrant_cloud_inference"
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra").strip().lower()
+# Provider: "hf_inference_endpoint" (default) | "deepinfra" | "qdrant_cloud_inference"
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "hf_inference_endpoint").strip().lower()
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 EMBEDDING_DIMENSION = 1024  # Qwen/Qwen3-Embedding-0.6B output dimension
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
+
+# HF Self-Hosted Inference Endpoint (TEI) — used when EMBEDDING_PROVIDER=hf_inference_endpoint
+# Endpoint exposes an OpenAI-compatible /v1/embeddings route.
+HF_INFERENCE_ENDPOINT_URL = os.getenv(
+    "HF_INFERENCE_ENDPOINT_URL",
+    "https://jp5vxer2scm0dmve.us-east-1.aws.endpoints.huggingface.cloud",
+)
+HF_INFERENCE_ENDPOINT_API_KEY = os.getenv("HF_INFERENCE_ENDPOINT_API_KEY")
+HF_INFERENCE_EMBED_TIMEOUT_SECONDS = _env_float("HF_INFERENCE_EMBED_TIMEOUT_SECONDS", 60.0)
 
 # =============================================================================
 # Chunking Configuration (CRITICAL: Must match .env values)
@@ -124,8 +140,8 @@ QUANTIZATION_TYPE = os.getenv("QUANTIZATION_TYPE", "scalar").strip().lower()
 SCALAR_QUANTILE = float(os.getenv("SCALAR_QUANTILE", "0.99"))
 QUANTIZATION_ALWAYS_RAM = _env_bool("QUANTIZATION_ALWAYS_RAM", default=True)
 # Search rescore improves accuracy with quantized vectors
-QUANTIZATION_RESCORE = _env_bool("QUANTIZATION_RESCORE", default=True)
-QUANTIZATION_OVERSAMPLING = float(os.getenv("QUANTIZATION_OVERSAMPLING", "1.5"))
+QUANTIZATION_RESCORE = _env_bool("QUANTIZATION_RESCORE", default=False)
+QUANTIZATION_OVERSAMPLING = float(os.getenv("QUANTIZATION_OVERSAMPLING", "1.0"))
 
 # Hybrid Search Configuration
 USE_HYBRID_SEARCH = _env_bool("USE_HYBRID_SEARCH", default=True)
@@ -146,10 +162,10 @@ ENTITY_FILTER_ENABLED = _env_bool("ENTITY_FILTER_ENABLED", default=False)
 
 # Chunk retrieval/reranking profile for chunk-level indexing
 # Aligned with .env values for 2048-token chunks (larger chunks = fewer needed)
-RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "400"))
+RETRIEVAL_CHUNK_LIMIT = int(os.getenv("RETRIEVAL_CHUNK_LIMIT", "150"))
 MAX_CHUNKS_PER_ARTICLE_PRE_RERANK = int(os.getenv("MAX_CHUNKS_PER_ARTICLE_PRE_RERANK", "2"))
-RERANK_INPUT_CHUNK_LIMIT = int(os.getenv("RERANK_INPUT_CHUNK_LIMIT", "100"))
-RERANK_TOP_CHUNKS = int(os.getenv("RERANK_TOP_CHUNKS", "100"))
+RERANK_INPUT_CHUNK_LIMIT = int(os.getenv("RERANK_INPUT_CHUNK_LIMIT", "90"))
+RERANK_TOP_CHUNKS = int(os.getenv("RERANK_TOP_CHUNKS", "75"))
 FINAL_TOP_ARTICLES = int(os.getenv("FINAL_TOP_ARTICLES", "50"))
 FINAL_RECENCY_POLICY_MODE = os.getenv("FINAL_RECENCY_POLICY_MODE", "hybrid").strip().lower()
 FINAL_RECENCY_WINDOW_YEARS = int(os.getenv("FINAL_RECENCY_WINDOW_YEARS", "5"))
@@ -198,6 +214,12 @@ MAX_ABSTRACTS = FINAL_TOP_ARTICLES  # Context article cap
 MAX_DAILYMED_PER_DRUG = 2  # Max DailyMed entries per drug (deduplicate by drug name)
 
 # =============================================================================
+# Weekly Update QoS Configuration
+# =============================================================================
+WEEKLY_UPDATE_THROTTLE_SECONDS = _env_float("WEEKLY_UPDATE_THROTTLE_SECONDS", 0.5)
+WEEKLY_UPDATE_BATCH_SIZE = _env_int("WEEKLY_UPDATE_BATCH_SIZE", 0)
+
+# =============================================================================
 # Query Caching Configuration
 # =============================================================================
 QUERY_CACHE_ENABLED = _env_bool("QUERY_CACHE_ENABLED", default=True)
@@ -217,8 +239,13 @@ def validate_config():
         errors.append("QDRANT_URL not set in .env")
     if not QDRANT_API_KEY:
         errors.append("QDRANT_API_KEY not set in .env")
-    if not DEEPINFRA_API_KEY:
-        errors.append("DEEPINFRA_API_KEY not set")
+    # Only require DeepInfra key when it is actually used for embeddings or LLM
+    if EMBEDDING_PROVIDER == "deepinfra" and not DEEPINFRA_API_KEY:
+        errors.append("DEEPINFRA_API_KEY not set (required when EMBEDDING_PROVIDER=deepinfra)")
+    if EMBEDDING_PROVIDER not in {"deepinfra", "qdrant_cloud_inference", "hf_inference_endpoint"}:
+        errors.append(f"EMBEDDING_PROVIDER '{EMBEDDING_PROVIDER}' is not supported")
+    if EMBEDDING_PROVIDER == "hf_inference_endpoint" and not HF_INFERENCE_ENDPOINT_API_KEY:
+        errors.append("HF_INFERENCE_ENDPOINT_API_KEY not set (required when EMBEDDING_PROVIDER=hf_inference_endpoint)")
     if LLM_PROVIDER not in {"groq", "deepinfra"}:
         errors.append("LLM_PROVIDER must be one of: groq, deepinfra")
     if LLM_PROVIDER == "groq" and not GROQ_API_KEY:

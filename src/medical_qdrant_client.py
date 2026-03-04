@@ -22,6 +22,8 @@ from qdrant_client.models import (
 from .config import (
     QDRANT_URL, 
     QDRANT_API_KEY, 
+    QDRANT_PREFER_GRPC,
+    QDRANT_GRPC_PORT,
     COLLECTION_NAME,
     EMBEDDING_DIMENSION,
     TOP_K_RESULTS,
@@ -59,6 +61,8 @@ class MedicalQdrantClient:
         self.client = QdrantClient(
             url=QDRANT_URL,
             api_key=QDRANT_API_KEY,
+            prefer_grpc=QDRANT_PREFER_GRPC,
+            grpc_port=QDRANT_GRPC_PORT,
         )
         self.collection_name = COLLECTION_NAME
         self._initialized = True

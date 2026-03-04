@@ -17,12 +17,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .config import (
     API_AUTH_ENABLED,
+    API_INFLIGHT_ACQUIRE_TIMEOUT_MS,
     API_INFLIGHT_DRAIN_POLL_SECONDS,
     API_KEYS_CACHE_TTL_SECONDS,
     API_KEYS_FILE,
+    API_MAX_INFLIGHT_REQUESTS,
     API_SHUTDOWN_GRACE_SECONDS,
     CORS_ALLOWED_ORIGINS,
 )
@@ -42,6 +45,9 @@ _inflight_lock = threading.Lock()
 _inflight_requests = 0
 _stream_threads_lock = threading.Lock()
 _stream_threads: set[threading.Thread] = set()
+_request_capacity_semaphore: Optional[asyncio.Semaphore] = (
+    asyncio.Semaphore(API_MAX_INFLIGHT_REQUESTS) if API_MAX_INFLIGHT_REQUESTS > 0 else None
+)
 
 
 def make_json_serializable(obj: Any) -> Any:
@@ -132,6 +138,58 @@ def _request_error_detail(request: Request, message: str) -> dict[str, str]:
         "request_id": getattr(request.state, "request_id", ""),
         "retry_hint": "Retry with exponential backoff.",
     }
+
+
+def _release_request_capacity_slot() -> None:
+    if _request_capacity_semaphore is not None:
+        _request_capacity_semaphore.release()
+
+
+async def _acquire_request_capacity_slot(request: Request) -> int:
+    if _request_capacity_semaphore is None:
+        return 0
+
+    queue_wait_start = time.perf_counter()
+    timeout_seconds = max(0.001, API_INFLIGHT_ACQUIRE_TIMEOUT_MS / 1000.0)
+    try:
+        await asyncio.wait_for(_request_capacity_semaphore.acquire(), timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        queue_wait_ms = int((time.perf_counter() - queue_wait_start) * 1000)
+        logger.warning(
+            json.dumps(
+                {
+                    "event": "request_backpressure_reject",
+                    "request_id": getattr(request.state, "request_id", ""),
+                    "endpoint": request.url.path,
+                    "queue_wait_ms": queue_wait_ms,
+                    "acquire_timeout_ms": API_INFLIGHT_ACQUIRE_TIMEOUT_MS,
+                    "max_inflight_requests": API_MAX_INFLIGHT_REQUESTS,
+                },
+                sort_keys=True,
+            )
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=_request_error_detail(
+                request,
+                "Server is handling maximum in-flight requests. Please retry shortly.",
+            ),
+        ) from exc
+
+    queue_wait_ms = int((time.perf_counter() - queue_wait_start) * 1000)
+    logger.info(
+        json.dumps(
+            {
+                "event": "request_backpressure_acquired",
+                "request_id": getattr(request.state, "request_id", ""),
+                "endpoint": request.url.path,
+                "queue_wait_ms": queue_wait_ms,
+                "max_inflight_requests": API_MAX_INFLIGHT_REQUESTS,
+            },
+            sort_keys=True,
+        )
+    )
+    return queue_wait_ms
 
 
 async def require_service_auth(
@@ -309,7 +367,10 @@ async def chat(
     if not payload.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
+    slot_acquired = False
     try:
+        await _acquire_request_capacity_slot(request)
+        slot_acquired = True
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
@@ -325,6 +386,9 @@ async def chat(
             status_code=500,
             detail=_request_error_detail(request, "Chat generation failed"),
         )
+    finally:
+        if slot_acquired:
+            _release_request_capacity_slot()
 
 
 @app.post("/api/v1/chat/stream", tags=["chat"])
@@ -344,6 +408,14 @@ async def chat_stream(
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     request_id = getattr(request.state, "request_id", "")
+    await _acquire_request_capacity_slot(request)
+    slot_released = False
+
+    def _release_slot_once() -> None:
+        nonlocal slot_released
+        if not slot_released:
+            _release_request_capacity_slot()
+            slot_released = True
 
     async def event_generator():
         queue: asyncio.Queue[Any] = asyncio.Queue()
@@ -417,16 +489,21 @@ async def chat_stream(
             await asyncio.to_thread(thread.join, 1.0)
             with _stream_threads_lock:
                 _stream_threads.discard(thread)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+            _release_slot_once()
+    try:
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            background=BackgroundTask(_release_slot_once),
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except Exception:
+        _release_slot_once()
+        raise
 
 
 @app.post("/api/v1/debug/decompose", tags=["debug"])
@@ -445,7 +522,10 @@ async def decompose_query(
     if not payload.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
+    slot_acquired = False
     try:
+        await _acquire_request_capacity_slot(request)
+        slot_acquired = True
         result = pipeline.preprocess_query(payload.query)
         return {
             "original_query": result.original_query,
@@ -460,6 +540,9 @@ async def decompose_query(
             status_code=500,
             detail=_request_error_detail(request, "Query decomposition failed"),
         )
+    finally:
+        if slot_acquired:
+            _release_request_capacity_slot()
 
 
 if __name__ == "__main__":

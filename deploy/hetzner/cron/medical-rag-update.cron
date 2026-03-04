@@ -1,4 +1,6 @@
 # Weekly PubMed + DailyMed incremental update followed immediately by a Qdrant backup.
+# Weekly ingestion QoS can be tuned in /opt/RAG-pipeline/.env:
+#   WEEKLY_UPDATE_THROTTLE_SECONDS, WEEKLY_UPDATE_BATCH_SIZE
 # Runs every Sunday at 01:00 local time.
 #   - 01:00  weekly update ingestion  (08_weekly_update.py)
 #   - backup.sh runs only if the update exits successfully (&&)

@@ -11,9 +11,10 @@ Implements retrieval from Qdrant Vector Database with:
 import logging
 import threading
 import re
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchText, Range, SparseVector, SearchParams, QuantizationSearchParams, QueryRequest, PayloadSelectorInclude
 from qdrant_client.http.models import Document
@@ -23,7 +24,7 @@ from qdrant_client.http.models import Document
 # =============================================================================
 SEARCH_PAYLOAD_FIELDS = PayloadSelectorInclude(include=[
     "pmcid", "doc_id", "pmid", "doi", "title", "page_content", "abstract",
-    "full_text", "has_full_text",
+    "has_full_text",
     "section_title", "section_type", "chunk_id", "chunk_index",
     "journal", "nlm_unique_id", "year", "article_type", "publication_type", "source",
     "evidence_grade", "evidence_level", "evidence_term", "evidence_source",
@@ -50,10 +51,14 @@ DOC_RECONSTRUCTION_FIELDS = PayloadSelectorInclude(include=[
 from .config import (
     QDRANT_URL, QDRANT_API_KEY, COLLECTION_NAME, SCORE_THRESHOLD, 
     EMBEDDING_MODEL, EMBEDDING_PROVIDER, QDRANT_CLOUD_INFERENCE, QDRANT_TIMEOUT, 
-    QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY, USE_HYBRID_SEARCH,
+    QDRANT_RETRY_COUNT, QDRANT_RETRY_DELAY, USE_HYBRID_SEARCH, QDRANT_HNSW_EF,
+    QDRANT_PREFER_GRPC, QDRANT_GRPC_PORT, QDRANT_MAX_INFLIGHT_SEARCHES,
+    QDRANT_SEARCH_TIMEOUT_SECONDS,
     SPARSE_RETRIEVAL_MODE, SPARSE_MAX_TERMS_QUERY, SPARSE_MIN_TOKEN_LEN,
     SPARSE_REMOVE_STOPWORDS, DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL,
     DEEPINFRA_EMBED_TIMEOUT_SECONDS,
+    HF_INFERENCE_ENDPOINT_URL, HF_INFERENCE_ENDPOINT_API_KEY,
+    HF_INFERENCE_EMBED_TIMEOUT_SECONDS,
     QUANTIZATION_RESCORE, QUANTIZATION_OVERSAMPLING,
     RETRIEVAL_RECENCY_BOOST_ENABLED, RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER,
     RETRIEVAL_RECENCY_Y1_MULT, RETRIEVAL_RECENCY_Y3_MULT,
@@ -63,6 +68,8 @@ from .bm25_sparse import BM25SparseEncoder
 from .retry_utils import retry_with_exponential_backoff
 
 logger = logging.getLogger(__name__)
+_qdrant_search_semaphore_lock = threading.Lock()
+_qdrant_search_semaphore: Optional[threading.BoundedSemaphore] = None
 
 
 # =============================================================================
@@ -129,6 +136,8 @@ class QdrantRetriever(AbstractRetriever):
             api_key=QDRANT_API_KEY,
             timeout=QDRANT_TIMEOUT,
             cloud_inference=use_cloud,
+            prefer_grpc=QDRANT_PREFER_GRPC,
+            grpc_port=QDRANT_GRPC_PORT,
         )
         self.retry_count = QDRANT_RETRY_COUNT
         self.retry_delay = QDRANT_RETRY_DELAY
@@ -143,7 +152,22 @@ class QdrantRetriever(AbstractRetriever):
         self.local_encoder = None
         self.openai_client = None
 
-        if self.embedding_provider == "deepinfra":
+        if self.embedding_provider == "hf_inference_endpoint":
+            from openai import OpenAI
+            if not HF_INFERENCE_ENDPOINT_API_KEY:
+                raise ValueError("HF_INFERENCE_ENDPOINT_API_KEY not set in config")
+            # HF TEI exposes an OpenAI-compatible /v1/embeddings route
+            self.openai_client = OpenAI(
+                api_key=HF_INFERENCE_ENDPOINT_API_KEY,
+                base_url=f"{HF_INFERENCE_ENDPOINT_URL}/v1",
+                timeout=HF_INFERENCE_EMBED_TIMEOUT_SECONDS,
+            )
+            logger.info(
+                "✅ HF Inference Endpoint embedding initialized (url: %s, model: %s)",
+                HF_INFERENCE_ENDPOINT_URL,
+                EMBEDDING_MODEL,
+            )
+        elif self.embedding_provider == "deepinfra":
             from openai import OpenAI
             if not DEEPINFRA_API_KEY:
                 raise ValueError("DEEPINFRA_API_KEY not set in config")
@@ -153,8 +177,11 @@ class QdrantRetriever(AbstractRetriever):
                 timeout=DEEPINFRA_EMBED_TIMEOUT_SECONDS,
             )
             logger.info("✅ DeepInfra embedding initialized (model: %s)", EMBEDDING_MODEL)
-        else:
-            raise ValueError(f"Unsupported embedding provider: {self.embedding_provider}. Only 'deepinfra' is supported.")
+        elif self.embedding_provider != "qdrant_cloud_inference":
+            raise ValueError(
+                f"Unsupported embedding provider: {self.embedding_provider}. "
+                "Supported: 'hf_inference_endpoint', 'deepinfra', 'qdrant_cloud_inference'."
+            )
 
         # Initialize sparse query encoder for hybrid search.
         self.bm25_sparse_encoder = None
@@ -194,6 +221,71 @@ class QdrantRetriever(AbstractRetriever):
             self.embedding_provider,
             self.sparse_mode if USE_HYBRID_SEARCH else "disabled",
         )
+
+    @staticmethod
+    def _get_qdrant_search_semaphore() -> Optional[threading.BoundedSemaphore]:
+        """Initialize process-local search semaphore lazily."""
+        if QDRANT_MAX_INFLIGHT_SEARCHES <= 0:
+            return None
+
+        global _qdrant_search_semaphore
+        if _qdrant_search_semaphore is None:
+            with _qdrant_search_semaphore_lock:
+                if _qdrant_search_semaphore is None:
+                    _qdrant_search_semaphore = threading.BoundedSemaphore(
+                        QDRANT_MAX_INFLIGHT_SEARCHES
+                    )
+        return _qdrant_search_semaphore
+
+    @staticmethod
+    def _dense_search_params() -> SearchParams:
+        """Build dense search params shared across all dense retrieval paths."""
+        return SearchParams(
+            hnsw_ef=QDRANT_HNSW_EF,
+            quantization=QuantizationSearchParams(
+                rescore=QUANTIZATION_RESCORE,
+                oversampling=QUANTIZATION_OVERSAMPLING,
+            ),
+        )
+
+    def _run_qdrant_search(self, operation: str, query_fn: Callable[[], Any]) -> Any:
+        """
+        Execute Qdrant search with bounded in-flight concurrency and timing logs.
+        """
+        semaphore = self._get_qdrant_search_semaphore()
+        queue_wait_start = time.perf_counter()
+        acquired = False
+
+        if semaphore is not None:
+            acquired = semaphore.acquire(timeout=max(0.001, QDRANT_SEARCH_TIMEOUT_SECONDS))
+            queue_wait_ms = int((time.perf_counter() - queue_wait_start) * 1000)
+            if not acquired:
+                logger.warning(
+                    "Qdrant search saturated op=%s queue_wait_ms=%s timeout_s=%.3f",
+                    operation,
+                    queue_wait_ms,
+                    QDRANT_SEARCH_TIMEOUT_SECONDS,
+                )
+                raise TimeoutError(
+                    f"Qdrant search queue timeout after {QDRANT_SEARCH_TIMEOUT_SECONDS:.3f}s"
+                )
+        else:
+            queue_wait_ms = 0
+
+        call_start = time.perf_counter()
+        try:
+            result = query_fn()
+            call_duration_ms = int((time.perf_counter() - call_start) * 1000)
+            logger.info(
+                "Qdrant search timing op=%s queue_wait_ms=%s call_ms=%s",
+                operation,
+                queue_wait_ms,
+                call_duration_ms,
+            )
+            return result
+        finally:
+            if acquired and semaphore is not None:
+                semaphore.release()
 
     def _rank_key_from_point(self, point) -> str:
         """
@@ -401,7 +493,8 @@ class QdrantRetriever(AbstractRetriever):
         if not queries:
             return []
 
-        if self.embedding_provider == "deepinfra" and self.openai_client is not None:
+        if self.embedding_provider in {"hf_inference_endpoint", "deepinfra"} and self.openai_client is not None:
+            provider_label = "HFEndpoint" if self.embedding_provider == "hf_inference_endpoint" else "DeepInfra"
             prepared_queries = [
                 self._prepare_query_for_embedding(query, use_instruction=use_instruction)
                 for query in queries
@@ -415,7 +508,7 @@ class QdrantRetriever(AbstractRetriever):
                     ),
                     max_attempts=self.retry_count + 1,
                     base_delay=float(self.retry_delay),
-                    operation_name="DeepInfra embeddings.create (batch)",
+                    operation_name=f"{provider_label} embeddings.create (batch)",
                     logger=logger,
                 )
                 embeddings: List[Any] = [None] * len(queries)
@@ -426,7 +519,8 @@ class QdrantRetriever(AbstractRetriever):
                 missing = sum(1 for emb in embeddings if emb is None)
                 if missing:
                     logger.warning(
-                        "DeepInfra batch embeddings returned %s/%s vectors; filling missing sequentially",
+                        "%s batch embeddings returned %s/%s vectors; filling missing sequentially",
+                        provider_label,
                         len(queries) - missing,
                         len(queries),
                     )
@@ -435,7 +529,7 @@ class QdrantRetriever(AbstractRetriever):
                             embeddings[idx] = self._embed_query(queries[idx], use_instruction=use_instruction)
                 return embeddings
             except Exception as e:
-                logger.error(f"DeepInfra batch query embedding failed: {e}")
+                logger.error(f"{provider_label} batch query embedding failed: {e}")
                 # Preserve behavior by falling back to sequential embedding.
                 return [self._embed_query(query, use_instruction=use_instruction) for query in queries]
 
@@ -471,7 +565,8 @@ class QdrantRetriever(AbstractRetriever):
         Returns None if no embedding method is available.
         """
         
-        if self.embedding_provider == "deepinfra" and self.openai_client is not None:
+        if self.embedding_provider in {"hf_inference_endpoint", "deepinfra"} and self.openai_client is not None:
+            provider_label = "HFEndpoint" if self.embedding_provider == "hf_inference_endpoint" else "DeepInfra"
             try:
                 query_with_instruct = self._prepare_query_for_embedding(
                     query, use_instruction=use_instruction
@@ -485,12 +580,12 @@ class QdrantRetriever(AbstractRetriever):
                     ),
                     max_attempts=self.retry_count + 1,
                     base_delay=float(self.retry_delay),
-                    operation_name="DeepInfra embeddings.create",
+                    operation_name=f"{provider_label} embeddings.create",
                     logger=logger,
                 )
                 return response.data[0].embedding
             except Exception as e:
-                logger.error(f"DeepInfra query embedding failed: {e}")
+                logger.error(f"{provider_label} query embedding failed: {e}")
                 return None
 
         if self.embedding_provider == "qdrant_cloud_inference":
@@ -646,20 +741,18 @@ class QdrantRetriever(AbstractRetriever):
             return []
 
         try:
-            results = self.client.query_points(
-                collection_name=self.collection_name,
-                query=query_embedding,
-                using="dense",
-                limit=self.n_retrieval,
-                score_threshold=self.score_threshold,
-                query_filter=search_filter,
-                with_payload=SEARCH_PAYLOAD_FIELDS,
-                search_params=SearchParams(
-                    quantization=QuantizationSearchParams(
-                        rescore=QUANTIZATION_RESCORE,
-                        oversampling=QUANTIZATION_OVERSAMPLING
-                    )
-                )
+            results = self._run_qdrant_search(
+                operation="query_points:dense:retrieve_passages",
+                query_fn=lambda: self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=query_embedding,
+                    using="dense",
+                    limit=self.n_retrieval,
+                    score_threshold=self.score_threshold,
+                    query_filter=search_filter,
+                    with_payload=SEARCH_PAYLOAD_FIELDS,
+                    search_params=self._dense_search_params(),
+                ),
             )
             logger.info(f"✅ Dense search successful, retrieved {len(results.points)} passages")
         except Exception as e:
@@ -688,7 +781,7 @@ class QdrantRetriever(AbstractRetriever):
                     # Use page_content (chunk) if available, else abstract
                     "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
-                    "full_text": point.payload.get("full_text", ""),
+                    "full_text": "",
                     "has_full_text": point.payload.get("has_full_text", False),
                     "section_title": point.payload.get("section_title", "abstract"),
                     "section_type": point.payload.get("section_type", "body"),
@@ -760,20 +853,18 @@ class QdrantRetriever(AbstractRetriever):
         query_embedding = self._embed_query(query)
         if query_embedding is not None:
             try:
-                dense_results = self.client.query_points(
-                    collection_name=self.collection_name,
-                    query=query_embedding,
-                    using="dense",
-                    limit=self.n_retrieval * 2,  # Get more for fusion
-                    score_threshold=self.score_threshold,
-                    query_filter=search_filter,
-                    with_payload=SEARCH_PAYLOAD_FIELDS,
-                    search_params=SearchParams(
-                        quantization=QuantizationSearchParams(
-                            rescore=True,
-                            oversampling=2.0
-                        )
-                    )
+                dense_results = self._run_qdrant_search(
+                    operation="query_points:dense:hybrid",
+                    query_fn=lambda: self.client.query_points(
+                        collection_name=self.collection_name,
+                        query=query_embedding,
+                        using="dense",
+                        limit=self.n_retrieval * 2,  # Get more for fusion
+                        score_threshold=self.score_threshold,
+                        query_filter=search_filter,
+                        with_payload=SEARCH_PAYLOAD_FIELDS,
+                        search_params=self._dense_search_params(),
+                    ),
                 )
             except Exception as e:
                 logger.warning(f"Dense search failed: {e}")
@@ -781,13 +872,16 @@ class QdrantRetriever(AbstractRetriever):
         # Perform sparse search
         sparse_results = None
         try:
-            sparse_results = self.client.query_points(
-                collection_name=self.collection_name,
-                query=sparse_vector,
-                using="sparse",
-                limit=self.n_retrieval * 2,  # Get more for fusion
-                query_filter=search_filter,
-                with_payload=SEARCH_PAYLOAD_FIELDS
+            sparse_results = self._run_qdrant_search(
+                operation="query_points:sparse:hybrid",
+                query_fn=lambda: self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=sparse_vector,
+                    using="sparse",
+                    limit=self.n_retrieval * 2,  # Get more for fusion
+                    query_filter=search_filter,
+                    with_payload=SEARCH_PAYLOAD_FIELDS,
+                ),
             )
         except Exception as e:
             logger.warning(f"Sparse search failed: {e}")
@@ -889,7 +983,7 @@ class QdrantRetriever(AbstractRetriever):
                     "title": point.payload.get("title", ""),
                     "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
-                    "full_text": point.payload.get("full_text", ""),
+                    "full_text": "",
                     "has_full_text": point.payload.get("has_full_text", False),
                     "section_title": point.payload.get("section_title", "abstract"),
                     "section_type": point.payload.get("section_type", "body"),
@@ -989,12 +1083,7 @@ class QdrantRetriever(AbstractRetriever):
         batch_requests = []
         
         # Search params for binary quantization rescore (production-ready)
-        search_params = SearchParams(
-            quantization=QuantizationSearchParams(
-                rescore=QUANTIZATION_RESCORE,
-                oversampling=QUANTIZATION_OVERSAMPLING
-            )
-        )
+        search_params = self._dense_search_params()
         
         for query_ctx in query_contexts:
             query_idx = query_ctx["query_index"]
@@ -1026,9 +1115,12 @@ class QdrantRetriever(AbstractRetriever):
         
         # Execute single batch HTTP call
         try:
-            batch_results = self.client.query_batch_points(
-                collection_name=self.collection_name,
-                requests=batch_requests
+            batch_results = self._run_qdrant_search(
+                operation="query_batch_points:batch_hybrid",
+                query_fn=lambda: self.client.query_batch_points(
+                    collection_name=self.collection_name,
+                    requests=batch_requests,
+                ),
             )
             logger.info(f"⚡ Batch query returned {len(batch_results)} result sets")
         except Exception as e:
@@ -1129,7 +1221,7 @@ class QdrantRetriever(AbstractRetriever):
                     "title": point.payload.get("title", ""),
                     "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                     "abstract": point.payload.get("abstract", ""),
-                    "full_text": point.payload.get("full_text", ""),
+                    "full_text": "",
                     "has_full_text": point.payload.get("has_full_text", False),
                     "section_title": point.payload.get("section_title", "abstract"),
                     "section_type": point.payload.get("section_type", "body"),
@@ -1174,20 +1266,18 @@ class QdrantRetriever(AbstractRetriever):
                 logger.error("No embedding method available for additional search")
                 return []
 
-            results = self.client.query_points(
-                collection_name=self.collection_name,
-                query=query_embedding,
-                using="dense",
-                limit=self.n_keyword_search,
-                score_threshold=max(self.score_threshold - 0.1, 0.2),  # Lower threshold
-                query_filter=search_filter,
-                with_payload=SEARCH_PAYLOAD_FIELDS,
-                search_params=SearchParams(
-                    quantization=QuantizationSearchParams(
-                        rescore=QUANTIZATION_RESCORE,
-                        oversampling=QUANTIZATION_OVERSAMPLING
-                    )
-                )
+            results = self._run_qdrant_search(
+                operation="query_points:dense:additional",
+                query_fn=lambda: self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=query_embedding,
+                    using="dense",
+                    limit=self.n_keyword_search,
+                    score_threshold=max(self.score_threshold - 0.1, 0.2),  # Lower threshold
+                    query_filter=search_filter,
+                    with_payload=SEARCH_PAYLOAD_FIELDS,
+                    search_params=self._dense_search_params(),
+                ),
             )
 
             papers = []
@@ -1210,7 +1300,7 @@ class QdrantRetriever(AbstractRetriever):
                         "title": point.payload.get("title", ""),
                         "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
                         "abstract": point.payload.get("abstract", ""),
-                        "full_text": point.payload.get("full_text", ""),
+                        "full_text": "",
                         "has_full_text": point.payload.get("has_full_text", False),
                         "section_title": point.payload.get("section_title", "abstract"),
                         "section_type": point.payload.get("section_type", "body"),
@@ -1492,13 +1582,16 @@ class QdrantRetriever(AbstractRetriever):
             )
             
             # Query using sparse vector
-            search_results = self.client.query_points(
-                collection_name=self.collection_name,
-                query=sparse_query,
-                using="sparse",
-                query_filter=source_filter,
-                limit=max(limit * 8, 40),
-                with_payload=DAILYMED_LOOKUP_FIELDS
+            search_results = self._run_qdrant_search(
+                operation="query_points:sparse:dailymed_bm25",
+                query_fn=lambda: self.client.query_points(
+                    collection_name=self.collection_name,
+                    query=sparse_query,
+                    using="sparse",
+                    query_filter=source_filter,
+                    limit=max(limit * 8, 40),
+                    with_payload=DAILYMED_LOOKUP_FIELDS,
+                ),
             )
             
             passages = []

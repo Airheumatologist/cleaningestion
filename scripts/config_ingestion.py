@@ -17,6 +17,15 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _as_float(value: str | None, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 class IngestionConfig:
     # Self-hosted Qdrant
     QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -58,6 +67,10 @@ class IngestionConfig:
     MAX_WORKERS = int(os.getenv("MAX_WORKERS", os.getenv("PARALLEL_WORKERS", "8")))
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
     USE_GRPC = _as_bool(os.getenv("USE_GRPC"), default=True)
+    WEEKLY_UPDATE_THROTTLE_SECONDS = _as_float(
+        os.getenv("WEEKLY_UPDATE_THROTTLE_SECONDS"), default=0.5
+    )
+    WEEKLY_UPDATE_BATCH_SIZE = int(os.getenv("WEEKLY_UPDATE_BATCH_SIZE", "0"))
 
     # V4 Migration: Chunking & Filtering
     EMBED_FILTER_ENABLED = _as_bool(os.getenv("EMBED_FILTER_ENABLED"), default=True)
