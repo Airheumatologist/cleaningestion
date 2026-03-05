@@ -12,6 +12,7 @@ import logging
 import threading
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Callable
@@ -26,7 +27,7 @@ SEARCH_PAYLOAD_FIELDS = PayloadSelectorInclude(include=[
     "pmcid", "doc_id", "pmid", "doi", "title", "page_content", "abstract",
     "has_full_text",
     "section_title", "section_type", "chunk_id", "chunk_index",
-    "journal", "nlm_unique_id", "year", "article_type", "publication_type", "source",
+    "journal", "nlm_unique_id", "year", "article_type", "publication_type", "source", "source_family",
     "evidence_grade", "evidence_level", "evidence_term", "evidence_source",
     "set_id", "drug_name", "manufacturer", "is_gov_affiliated", "gov_agencies"
 ])
@@ -63,6 +64,7 @@ from .config import (
     RETRIEVAL_RECENCY_BOOST_ENABLED, RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER,
     RETRIEVAL_RECENCY_Y1_MULT, RETRIEVAL_RECENCY_Y3_MULT,
     RETRIEVAL_RECENCY_Y5_MULT, RETRIEVAL_RECENCY_Y7_MULT,
+    QDRANT_QUERY_BACKEND,
 )
 from .bm25_sparse import BM25SparseEncoder
 from .retry_utils import retry_with_exponential_backoff
@@ -691,10 +693,143 @@ class QdrantRetriever(AbstractRetriever):
                 conditions.append(
                     FieldCondition(key="gov_agencies", match=MatchValue(value=agencies[0]))
                 )
+
+        # Source family filter (e.g. pmc, pubmed)
+        if "source_family" in kwargs and kwargs["source_family"]:
+            source_family = str(kwargs["source_family"]).strip().lower()
+            if source_family:
+                conditions.append(
+                    FieldCondition(key="source_family", match=MatchValue(value=source_family))
+                )
         
         if conditions:
             return Filter(must=conditions)
         return None
+
+    def _build_dense_batch_requests(
+        self,
+        query_contexts: List[Dict[str, Any]],
+        search_filter: Optional[Filter],
+    ) -> List[QueryRequest]:
+        search_params = self._dense_search_params()
+        requests: List[QueryRequest] = []
+        for query_ctx in query_contexts:
+            requests.append(
+                QueryRequest(
+                    query=query_ctx["dense_query"],
+                    using="dense",
+                    filter=search_filter,
+                    limit=self.n_retrieval * 2,
+                    score_threshold=self.score_threshold,
+                    with_payload=SEARCH_PAYLOAD_FIELDS,
+                    params=search_params,
+                )
+            )
+        return requests
+
+    def _run_dense_batch(
+        self,
+        operation: str,
+        query_contexts: List[Dict[str, Any]],
+        search_filter: Optional[Filter],
+    ) -> List[Any]:
+        batch_requests = self._build_dense_batch_requests(
+            query_contexts=query_contexts,
+            search_filter=search_filter,
+        )
+        if not batch_requests:
+            return []
+        return self._run_qdrant_search(
+            operation=operation,
+            query_fn=lambda: self.client.query_batch_points(
+                collection_name=self.collection_name,
+                requests=batch_requests,
+            ),
+        )
+
+    def _format_fused_passages(
+        self,
+        all_points: Dict[str, Any],
+        combined_scores: Dict[str, float],
+        filter_kwargs: Dict[str, Any],
+        stype: str,
+    ) -> List[Dict[str, Any]]:
+        if not combined_scores:
+            return []
+
+        recency_mults: Dict[str, float] = {}
+        boosted_scores: Dict[str, float] = {}
+        year_filter_present = bool(filter_kwargs.get("year"))
+        for key, raw_score in combined_scores.items():
+            point = all_points.get(key)
+            payload = point.payload if point else {}
+            if year_filter_present and not RETRIEVAL_RECENCY_APPLY_WITH_YEAR_FILTER:
+                recency_mult = 1.0
+            else:
+                recency_mult = self._compute_retrieval_recency_mult(
+                    year=payload.get("year"),
+                    article_type=payload.get("article_type"),
+                    publication_type=payload.get("publication_type"),
+                )
+            recency_mults[key] = recency_mult
+            boosted_scores[key] = raw_score * recency_mult
+
+        sorted_keys = sorted(
+            combined_scores.keys(),
+            key=lambda p: (boosted_scores[p], p),
+            reverse=True,
+        )[:self.n_retrieval]
+
+        passages: List[Dict[str, Any]] = []
+        for key in sorted_keys:
+            point = all_points[key]
+            source = point.payload.get("source", "")
+            article_type = point.payload.get("article_type", "")
+            is_dailymed = source == "dailymed" or article_type == "drug_label"
+
+            if is_dailymed:
+                passage = self._transform_dailymed_payload(point.payload, boosted_scores[key])
+                passage["raw_score"] = combined_scores[key]
+                passage["retrieval_recency_mult"] = recency_mults.get(key, 1.0)
+                passage["boosted_score"] = boosted_scores[key]
+                passage["score"] = boosted_scores[key]
+                passage["stype"] = stype
+            else:
+                doc_id = self._doc_id_from_payload(point.payload)
+                passage = {
+                    "corpus_id": doc_id,
+                    "pmcid": point.payload.get("pmcid", doc_id),
+                    "pmid": point.payload.get("pmid"),
+                    "doi": point.payload.get("doi"),
+                    "title": point.payload.get("title", ""),
+                    "text": point.payload.get("page_content") or point.payload.get("abstract", ""),
+                    "abstract": point.payload.get("abstract", ""),
+                    "full_text": "",
+                    "has_full_text": point.payload.get("has_full_text", False),
+                    "section_title": point.payload.get("section_title", "abstract"),
+                    "section_type": point.payload.get("section_type", "body"),
+                    "chunk_id": point.payload.get("chunk_id"),
+                    "chunk_index": point.payload.get("chunk_index"),
+                    "journal": point.payload.get("journal", ""),
+                    "venue": point.payload.get("journal", ""),
+                    "nlm_unique_id": point.payload.get("nlm_unique_id"),
+                    "year": point.payload.get("year"),
+                    "authors": [],
+                    "article_type": point.payload.get("article_type", ""),
+                    "publication_type": self._normalize_publication_type_list(
+                        point.payload.get("publication_type")
+                    ),
+                    "raw_score": combined_scores[key],
+                    "retrieval_recency_mult": recency_mults.get(key, 1.0),
+                    "boosted_score": boosted_scores[key],
+                    "score": boosted_scores[key],
+                    "stype": stype,
+                    **self._extract_evidence_metadata(point.payload),
+                }
+            passages.append(passage)
+
+        self._log_retrieval_recency_stats(passages, stage=stype)
+        return passages
 
     
     def retrieve_passages(
@@ -1013,6 +1148,157 @@ class QdrantRetriever(AbstractRetriever):
         self._log_retrieval_recency_stats(passages, stage="Hybrid")
         logger.info(f"✅ Hybrid search successful, retrieved {len(passages)} passages")
         return passages
+
+    def _batch_dense_broad_search(
+        self,
+        query_contexts: List[Dict[str, Any]],
+        filter_kwargs: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        search_filter = self._build_filter(**filter_kwargs)
+        try:
+            batch_results = self._run_dense_batch(
+                operation="query_batch_points:dense:broad",
+                query_contexts=query_contexts,
+                search_filter=search_filter,
+            )
+        except Exception as exc:
+            logger.warning("Broad dense fallback failed: %s", exc)
+            return []
+
+        all_points: Dict[str, Any] = {}
+        combined_scores: Dict[str, float] = {}
+        for result in batch_results:
+            points = getattr(result, "points", [])
+            for rank, point in enumerate(points, 1):
+                key = self._rank_key_from_point(point)
+                rrf_score = 1.0 / (60.0 + rank)
+                combined_scores[key] = combined_scores.get(key, 0.0) + rrf_score
+                if key not in all_points:
+                    all_points[key] = point
+        return self._format_fused_passages(
+            all_points=all_points,
+            combined_scores=combined_scores,
+            filter_kwargs=filter_kwargs,
+            stype="batch_dense_broad",
+        )
+
+    def batch_dense_source_fanout_search(
+        self,
+        queries: List[str],
+        min_results: int = 60,
+        fallback_broad: bool = False,
+        **filter_kwargs,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Dense-only source_family fanout (pmc + pubmed).
+
+        Returns:
+            List of passages when fanout succeeds.
+            None when caller should fall back to the current hybrid path.
+        """
+        if not queries:
+            return []
+
+        dense_queries = self._embed_queries(queries)
+        query_contexts: List[Dict[str, Any]] = []
+        for i, query_text in enumerate(queries):
+            dense_query = dense_queries[i] if i < len(dense_queries) else None
+            if dense_query is None:
+                logger.warning("Skipping fanout query without embedding: %s", query_text[:80])
+                continue
+            query_contexts.append({"query_index": i, "dense_query": dense_query})
+
+        if not query_contexts:
+            logger.warning("Dense fanout aborted: no query embeddings available")
+            return None
+
+        family_results: Dict[str, List[Any]] = {}
+        family_errors: Dict[str, str] = {}
+        families = ("pmc", "pubmed")
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {}
+            for family in families:
+                family_filters = dict(filter_kwargs)
+                family_filters["source_family"] = family
+                search_filter = self._build_filter(**family_filters)
+                futures[
+                    executor.submit(
+                        self._run_dense_batch,
+                        operation=f"query_batch_points:dense:fanout:{family}",
+                        query_contexts=query_contexts,
+                        search_filter=search_filter,
+                    )
+                ] = family
+
+            for future in as_completed(futures):
+                family = futures[future]
+                try:
+                    family_results[family] = future.result()
+                except Exception as exc:
+                    family_errors[family] = str(exc)
+                    logger.warning("Dense fanout branch failed source_family=%s err=%s", family, exc)
+
+        if family_errors:
+            if fallback_broad:
+                broad_results = self._batch_dense_broad_search(
+                    query_contexts=query_contexts,
+                    filter_kwargs=filter_kwargs,
+                )
+                if len(broad_results) >= max(1, min_results):
+                    logger.info(
+                        "Dense fanout used broad fallback results=%s threshold=%s",
+                        len(broad_results),
+                        min_results,
+                    )
+                    return broad_results
+            return None
+
+        all_points: Dict[str, Any] = {}
+        combined_scores: Dict[str, float] = {}
+        family_hit_counts = {family: 0 for family in families}
+
+        for family in families:
+            batch_results = family_results.get(family, [])
+            for result in batch_results:
+                points = getattr(result, "points", [])
+                family_hit_counts[family] += len(points)
+                for rank, point in enumerate(points, 1):
+                    key = self._rank_key_from_point(point)
+                    rrf_score = 1.0 / (60.0 + rank)
+                    combined_scores[key] = combined_scores.get(key, 0.0) + rrf_score
+                    if key not in all_points:
+                        all_points[key] = point
+
+        passages = self._format_fused_passages(
+            all_points=all_points,
+            combined_scores=combined_scores,
+            filter_kwargs=filter_kwargs,
+            stype="batch_dense_fanout",
+        )
+        logger.info(
+            "Dense fanout stats pmc_hits=%s pubmed_hits=%s merged=%s",
+            family_hit_counts.get("pmc", 0),
+            family_hit_counts.get("pubmed", 0),
+            len(passages),
+        )
+
+        if len(passages) < max(1, min_results):
+            logger.info(
+                "Dense fanout below threshold merged=%s threshold=%s",
+                len(passages),
+                min_results,
+            )
+            if fallback_broad:
+                broad_results = self._batch_dense_broad_search(
+                    query_contexts=query_contexts,
+                    filter_kwargs=filter_kwargs,
+                )
+                if len(broad_results) >= max(1, min_results):
+                    return broad_results
+            return None
+
+        return passages
     
     def batch_hybrid_search(
         self,
@@ -1040,6 +1326,12 @@ class QdrantRetriever(AbstractRetriever):
         """
         if not queries:
             return []
+
+        if QDRANT_QUERY_BACKEND != "batch":
+            logger.warning(
+                "QDRANT_QUERY_BACKEND=%s requested but only batch is implemented in this release; using batch.",
+                QDRANT_QUERY_BACKEND,
+            )
 
         if sparse_vectors is None or len(sparse_vectors) != len(queries):
             sparse_vectors = self.build_sparse_query_vectors(queries)

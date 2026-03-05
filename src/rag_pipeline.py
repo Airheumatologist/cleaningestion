@@ -46,6 +46,9 @@ from .config import (
     ENTITY_FILTER_ENABLED,
     PRE_RERANK_RECENT_WINDOW_YEARS,
     PRE_RERANK_RECENT_QUOTA_RATIO,
+    RETRIEVAL_SOURCE_FANOUT_ENABLED,
+    RETRIEVAL_SOURCE_FANOUT_MIN_RESULTS,
+    RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD,
 )
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
 from .retriever_qdrant import QdrantRetriever
@@ -265,16 +268,14 @@ class MedicalRAGPipeline:
 
         logger.info(f"   PMC+PubMed Queries: {len(queries_to_run)} | DailyMed Drugs: {len(drug_names)}")
         
-        # ========================================================================
-        # OPTIMIZATION 1: Batch encode ALL query variations with configured sparse mode
-        # ========================================================================
-        sparse_vectors = []
-        try:
-            sparse_vectors = self.retriever.build_sparse_query_vectors(queries_to_run)
-            logger.info(f"   ⚡ Built {len(sparse_vectors)} sparse query vectors")
-        except Exception as e:
-            logger.warning(f"   Sparse query vector build failed: {e}")
-            sparse_vectors = [SparseVector(indices=[], values=[]) for _ in queries_to_run]
+        def _build_sparse_vectors() -> List[SparseVector]:
+            try:
+                vectors = self.retriever.build_sparse_query_vectors(queries_to_run)
+                logger.info(f"   ⚡ Built {len(vectors)} sparse query vectors")
+                return vectors
+            except Exception as e:
+                logger.warning(f"   Sparse query vector build failed: {e}")
+                return [SparseVector(indices=[], values=[]) for _ in queries_to_run]
         
         # ========================================================================
         # OPTIMIZATION 2: Run DailyMed search in parallel with batch PMC query
@@ -292,13 +293,35 @@ class MedicalRAGPipeline:
             dm_future = executor.submit(run_dailymed_search, drug_names)
             
             # ========================================================================
-            # OPTIMIZATION 3: Single batch HTTP call for ALL PMC queries (6 → 1)
+            # OPTIMIZATION 3: Feature-flagged dense fanout with automatic fallback
             # ========================================================================
-            all_passages = self.retriever.batch_hybrid_search(
-                queries=queries_to_run,
-                sparse_vectors=sparse_vectors,
-                **processed_query.search_filters
-            )
+            if RETRIEVAL_SOURCE_FANOUT_ENABLED:
+                logger.info(
+                    "   ⚡ Dense source-family fanout enabled (min_results=%s, broad_fallback=%s)",
+                    RETRIEVAL_SOURCE_FANOUT_MIN_RESULTS,
+                    RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD,
+                )
+                all_passages = self.retriever.batch_dense_source_fanout_search(
+                    queries=queries_to_run,
+                    min_results=RETRIEVAL_SOURCE_FANOUT_MIN_RESULTS,
+                    fallback_broad=RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD,
+                    **processed_query.search_filters,
+                )
+                if all_passages is None:
+                    logger.info("   ⚠️ Dense fanout fallback triggered -> batch hybrid search")
+                    sparse_vectors = _build_sparse_vectors()
+                    all_passages = self.retriever.batch_hybrid_search(
+                        queries=queries_to_run,
+                        sparse_vectors=sparse_vectors,
+                        **processed_query.search_filters,
+                    )
+            else:
+                sparse_vectors = _build_sparse_vectors()
+                all_passages = self.retriever.batch_hybrid_search(
+                    queries=queries_to_run,
+                    sparse_vectors=sparse_vectors,
+                    **processed_query.search_filters
+                )
             
             # Collect DailyMed results
             try:

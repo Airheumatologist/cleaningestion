@@ -75,6 +75,8 @@ QDRANT_GRPC_PORT = _env_int("QDRANT_GRPC_PORT", 6334)
 QDRANT_HNSW_EF = _env_int("QDRANT_HNSW_EF", 64)
 QDRANT_MAX_INFLIGHT_SEARCHES = _env_int("QDRANT_MAX_INFLIGHT_SEARCHES", 0)
 QDRANT_SEARCH_TIMEOUT_SECONDS = _env_int("QDRANT_SEARCH_TIMEOUT_SECONDS", 10)
+QDRANT_QUERY_BACKEND = os.getenv("QDRANT_QUERY_BACKEND", "batch").strip().lower()
+QDRANT_INDEXED_ONLY = _env_bool("QDRANT_INDEXED_ONLY", default=False)
 QDRANT_TIMEOUT = 180  # Client timeout in seconds
 QDRANT_RETRY_COUNT = 3  # Number of retries for transient failures
 QDRANT_RETRY_DELAY = 2  # Base delay between retries (exponential backoff)
@@ -180,6 +182,13 @@ RETRIEVAL_RECENCY_Y5_MULT = float(os.getenv("RETRIEVAL_RECENCY_Y5_MULT", "1.08")
 RETRIEVAL_RECENCY_Y7_MULT = float(os.getenv("RETRIEVAL_RECENCY_Y7_MULT", "1.03"))
 PRE_RERANK_RECENT_WINDOW_YEARS = int(os.getenv("PRE_RERANK_RECENT_WINDOW_YEARS", "7"))
 PRE_RERANK_RECENT_QUOTA_RATIO = float(os.getenv("PRE_RERANK_RECENT_QUOTA_RATIO", "0.35"))
+RETRIEVAL_SOURCE_FANOUT_ENABLED = _env_bool("RETRIEVAL_SOURCE_FANOUT_ENABLED", default=False)
+RETRIEVAL_SOURCE_FANOUT_MODE = os.getenv("RETRIEVAL_SOURCE_FANOUT_MODE", "parallel").strip().lower()
+RETRIEVAL_SOURCE_FANOUT_MIN_RESULTS = _env_int("RETRIEVAL_SOURCE_FANOUT_MIN_RESULTS", 60)
+RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD = _env_bool(
+    "RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD",
+    default=False,
+)
 
 # =============================================================================
 # Reranker Configuration
@@ -239,6 +248,10 @@ def validate_config():
         errors.append("QDRANT_URL not set in .env")
     if not QDRANT_API_KEY:
         errors.append("QDRANT_API_KEY not set in .env")
+    if QDRANT_QUERY_BACKEND not in {"batch", "prefetch"}:
+        errors.append("QDRANT_QUERY_BACKEND must be one of: batch, prefetch")
+    if RETRIEVAL_SOURCE_FANOUT_MODE not in {"parallel"}:
+        errors.append("RETRIEVAL_SOURCE_FANOUT_MODE must be: parallel")
     # Only require DeepInfra key when it is actually used for embeddings or LLM
     if EMBEDDING_PROVIDER == "deepinfra" and not DEEPINFRA_API_KEY:
         errors.append("DEEPINFRA_API_KEY not set (required when EMBEDDING_PROVIDER=deepinfra)")
