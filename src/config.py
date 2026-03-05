@@ -103,7 +103,7 @@ LLM_TEMPERATURE = 0.7  # Controls randomness (0=deterministic, 1=creative)
 LLM_TOP_P = 0.9  # Nucleus sampling threshold
 
 # LLM Configuration (Generation)
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").strip().lower()
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepinfra").strip().lower()
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
 LLM_MAX_COMPLETION_TOKENS = _env_int("LLM_MAX_COMPLETION_TOKENS", 8192)
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "medium").strip().lower()
