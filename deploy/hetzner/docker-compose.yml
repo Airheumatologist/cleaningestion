@@ -1,6 +1,6 @@
 services:
   qdrant:
-    image: qdrant/qdrant:v1.15.4
+    image: qdrant/qdrant:v1.17.0
     container_name: qdrant
     restart: unless-stopped
     expose:
