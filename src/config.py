@@ -115,7 +115,7 @@ LLM_CHAT_TIMEOUT_SECONDS = GROQ_CHAT_TIMEOUT_SECONDS if LLM_PROVIDER == "groq" e
 # Embedding Model Configuration
 # =============================================================================
 # Provider: "hf_inference_endpoint" (default) | "deepinfra" | "qdrant_cloud_inference"
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "hf_inference_endpoint").strip().lower()
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra").strip().lower()
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
 EMBEDDING_DIMENSION = 1024  # Qwen/Qwen3-Embedding-0.6B output dimension
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
