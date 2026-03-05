@@ -286,7 +286,9 @@ RAG-pipeline/
 │   ├── 21_ingest_pubmed_abstracts.py       # Ingest PubMed to Qdrant
 │   ├── config_ingestion.py                 # Ingestion config
 │   ├── ingestion_utils.py                  # Core ingestion utilities
-│   └── ingestion_utils_enhanced.py         # Enhanced chunking/validation
+│   ├── ingestion_utils_enhanced.py         # Enhanced chunking/validation
+│   ├── 43_latency_split.py                  # Isolate embedding vs Qdrant HNSW latency (--dummy-vector flag)
+│   └── 44_compact_segments.py               # Inspect/trigger Qdrant segment compaction
 │
 ├── frontend/                               # Next.js React frontend
 │   ├── src/app/
@@ -984,6 +986,33 @@ QDRANT_TIMEOUT = 180  # seconds
 **CRITICAL**: `qdrant` ingestion takes weeks. Absolutely **NEVER** recreate, stop, or delete the `qdrant` container during routine API updates.
 - **Rule**: If restarting API services, isolate them using `docker compose up -d --no-deps rag-api-1 rag-api-2 rag-api-3 rag-api-4 rag-gateway` so Docker Compose cannot touch `qdrant`.
 - A global `.cursorrules` file enforces this rule across all AI agents in this repository.
+
+### `indexing_threshold=0` disables HNSW — brute-force scan on all vectors
+**CRITICAL post-ingestion step**: `scripts/05_setup_qdrant.py` sets `indexing_threshold=0` during bulk ingestion to prevent premature indexing. **If `finalize_collection()` is not called after ingestion, HNSW is never built.** The collection silently falls back to brute-force scan — 22M vectors × every query = 20–30s latency or timeouts with no error message.
+
+**Verify HNSW is built** after any ingestion:
+```bash
+# Each segment should have a vector_index-dense/ dir:
+ls /opt/qdrant/qdrant_storage/collections/rag_pipeline/0/segments/<seg-id>/
+# Should contain: vector_index-dense/  (if missing, HNSW was never built)
+```
+
+**Fix** if missing (safe, no data risk — builds index in background, takes ~10 min for 22M vectors):
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import OptimizersConfigDiff
+client = QdrantClient(url="http://qdrant:6333", api_key="...")
+client.update_collection(
+    collection_name="rag_pipeline",
+    optimizers_config=OptimizersConfigDiff(indexing_threshold=10000),
+)
+```
+
+**Diagnose latency split** (embedding API vs Qdrant):
+```bash
+docker exec rag-api-1 python3 scripts/43_latency_split.py \
+  --qdrant-url http://qdrant:6333 --dummy-vector --n 3
+```
 
 ### MeSH Dictionary Downloads & Concurrency
 The API utilizes the NLM MeSH Dictionary for query expansion, which rolls over to a new year annually (e.g., `desc2026.xml`).

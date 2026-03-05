@@ -4,6 +4,13 @@
 - Ingestion for Qdrant took weeks. Any data loss is considered catastrophic.
 - If a docker-compose command might affect `qdrant`, isolate only API services with `--no-deps`.
 
+# Qdrant Post-Ingestion Critical Rule
+- **`indexing_threshold=0` disables HNSW entirely** — the collection falls back to brute-force scan (22M vectors = 22s/query).
+- After any ingestion or collection setup, always verify and set: `update_collection(optimizers_config=OptimizersConfigDiff(indexing_threshold=10000))`.
+- Confirm HNSW is built: each segment dir should contain a `vector_index-dense/` subdirectory under `/opt/qdrant/qdrant_storage/collections/<name>/<shard>/segments/<id>/`.
+- Use `scripts/43_latency_split.py --dummy-vector` to isolate Qdrant latency from embedding latency.
+- Use `scripts/44_compact_segments.py` to inspect/trigger segment compaction.
+
 # Model Provider Guardrails
 - Use `GROQ` as the LLM provider for `openai/gpt-oss-20b` generation/query decomposition.
 - Keep Qwen `0.6B` embedding on `HF self-hosted` (hf_inference_endpoint); keep reranking on `DeepInfra`.
