@@ -1,7 +1,7 @@
 # Weekly PubMed + DailyMed incremental update followed immediately by a Qdrant backup.
 # Weekly ingestion QoS can be tuned in /opt/RAG-pipeline/.env:
 #   WEEKLY_UPDATE_THROTTLE_SECONDS, WEEKLY_UPDATE_BATCH_SIZE
-# Runs every Sunday at 01:00 local time.
+# Runs every Saturday at 01:00 local time.
 #   - 01:00  weekly update ingestion  (08_weekly_update.py)
 #   - backup.sh runs only if the update exits successfully (&&)
 #
@@ -12,4 +12,4 @@
 #   sudo cp deploy/hetzner/cron/medical-rag-update.cron /etc/cron.d/medical-rag-update
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 1 * * 0 root cd /opt/RAG-pipeline && /bin/bash -lc '{ source venv/bin/activate || source .venv/bin/activate; } && set -a && source .env && set +a && python scripts/08_weekly_update.py && ./deploy/hetzner/backup.sh' >> /var/log/rag-update.log 2>&1
+0 1 * * 6 root cd /opt/RAG-pipeline && /bin/bash -lc '{ source venv/bin/activate || source .venv/bin/activate; } && set -a && source .env && set +a && python scripts/08_weekly_update.py && ./deploy/hetzner/backup.sh' >> /var/log/rag-update.log 2>&1
