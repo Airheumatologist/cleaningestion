@@ -13,15 +13,15 @@ from src.service_auth import hash_service_token
 
 class DummyDecomposed:
     def model_dump(self):
-        return {"field_of_study": "Medicine"}
+        return {"is_drug_query": False}
 
 
 class DummyProcessed:
     def __init__(self):
         self.original_query = "original"
-        self.rewritten_query = "rewritten"
+        self.primary_query = "primary"
         self.keyword_query = "keyword"
-        self.search_filters = {}
+        self.retrieval_queries = ["primary", "keyword"]
         self.decomposed = DummyDecomposed()
 
 
@@ -140,7 +140,8 @@ class ApiContractTests(unittest.TestCase):
             json={"query": "hi"},
         )
         self.assertEqual(ok.status_code, 200)
-        self.assertIn("rewritten_query", ok.json())
+        self.assertIn("primary_query", ok.json())
+        self.assertIn("is_drug_query", ok.json().get("decomposed", {}))
 
     def test_stream_route_and_legacy_alias(self):
         headers = self._auth_header(self.valid_token)

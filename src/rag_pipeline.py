@@ -222,11 +222,11 @@ class MedicalRAGPipeline:
     # =========================================================================
     
     def preprocess_query(self, query: str) -> LLMProcessedQuery:
-        """Decompose query and extract filters."""
+        """Decompose query into compact retrieval queries and routing hints."""
         logger.info("📝 Step 1: Query Preprocessing")
         result = self.preprocessor.decompose_query(query)
-        logger.info(f"   Rewritten: {result.rewritten_query}")
-        logger.info(f"   Filters: {result.search_filters}")
+        logger.info(f"   Primary: {result.primary_query}")
+        logger.info(f"   Keyword: {result.keyword_query}")
         return result
     
     # =========================================================================
@@ -236,7 +236,7 @@ class MedicalRAGPipeline:
     def retrieve_passages(
         self,
         processed_query: LLMProcessedQuery
-    ) -> List[Dict[str, Any]]:
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         Retrieve passages from Qdrant using multi-query expansion.
         
@@ -252,21 +252,31 @@ class MedicalRAGPipeline:
         
         dailymed_results = []
         
-        # Get queries and drug names
-        queries_to_run = processed_query.expanded_queries or [processed_query.rewritten_query]
-        # If expanded queries are already present, trust them as the complete set.
-        # Only append keyword query for fallback paths that do not generate expansions.
-        if not processed_query.expanded_queries and processed_query.keyword_query and processed_query.keyword_query not in queries_to_run:
+        # Get compact retrieval queries and DailyMed drug routing hints.
+        queries_to_run = processed_query.retrieval_queries or [processed_query.primary_query]
+        if processed_query.keyword_query and processed_query.keyword_query not in queries_to_run:
             queries_to_run.append(processed_query.keyword_query)
-            
-        drug_names = []
-        if processed_query.decomposed and processed_query.decomposed.drug_names:
-            drug_names = processed_query.decomposed.drug_names
-        else:
-            # Fallback to manual extraction if decomposition failed
-            drug_names = self._extract_drug_names(processed_query.original_query, processed_query.rewritten_query)
 
-        logger.info(f"   PMC+PubMed Queries: {len(queries_to_run)} | DailyMed Drugs: {len(drug_names)}")
+        is_drug_query = False
+        drug_names: List[str] = []
+        if processed_query.decomposed is not None:
+            # Trust decomposition output, including empty [] when no drugs are present.
+            is_drug_query = bool(processed_query.decomposed.is_drug_query)
+            drug_names = processed_query.decomposed.drug_names or []
+        else:
+            # Hard-failure fallback only: infer drugs from query text.
+            drug_names = self._extract_drug_names(processed_query.original_query, processed_query.primary_query)
+            is_drug_query = bool(drug_names)
+
+        if not is_drug_query:
+            drug_names = []
+
+        logger.info(
+            "   PMC+PubMed Queries: %s | DailyMed Enabled: %s | DailyMed Drugs: %s",
+            len(queries_to_run),
+            is_drug_query,
+            len(drug_names),
+        )
         
         def _build_sparse_vectors() -> List[SparseVector]:
             try:
@@ -288,9 +298,9 @@ class MedicalRAGPipeline:
                 logger.warning(f"DailyMed search failed: {e}")
                 return []
         
-        # Start DailyMed search in background thread
+        # Start DailyMed search in background thread only when explicitly enabled.
         with ThreadPoolExecutor(max_workers=2) as executor:
-            dm_future = executor.submit(run_dailymed_search, drug_names)
+            dm_future = executor.submit(run_dailymed_search, drug_names) if drug_names else None
             
             # ========================================================================
             # OPTIMIZATION 3: Feature-flagged dense fanout with automatic fallback
@@ -305,7 +315,6 @@ class MedicalRAGPipeline:
                     queries=queries_to_run,
                     min_results=RETRIEVAL_SOURCE_FANOUT_MIN_RESULTS,
                     fallback_broad=RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD,
-                    **processed_query.search_filters,
                 )
                 if all_passages is None:
                     logger.info("   ⚠️ Dense fanout fallback triggered -> batch hybrid search")
@@ -313,21 +322,20 @@ class MedicalRAGPipeline:
                     all_passages = self.retriever.batch_hybrid_search(
                         queries=queries_to_run,
                         sparse_vectors=sparse_vectors,
-                        **processed_query.search_filters,
                     )
             else:
                 sparse_vectors = _build_sparse_vectors()
                 all_passages = self.retriever.batch_hybrid_search(
                     queries=queries_to_run,
                     sparse_vectors=sparse_vectors,
-                    **processed_query.search_filters
                 )
             
             # Collect DailyMed results
             try:
-                dailymed_results = dm_future.result()
-                if dailymed_results:
-                    logger.info(f"   ✅ DailyMed search found {len(dailymed_results)} results")
+                if dm_future is not None:
+                    dailymed_results = dm_future.result()
+                    if dailymed_results:
+                        logger.info(f"   ✅ DailyMed search found {len(dailymed_results)} results")
             except Exception as e:
                 logger.warning(f"DailyMed task failed: {e}")
         
@@ -344,7 +352,7 @@ class MedicalRAGPipeline:
         "lupus", "nephritis", "arthritis", "disease", "syndrome", "disorder"
     }
     
-    def _extract_drug_names(self, original_query: str, rewritten_query: str) -> List[str]:
+    def _extract_drug_names(self, original_query: str, primary_query: str) -> List[str]:
         """
         Extract drug names from query using simple pattern matching.
         
@@ -354,7 +362,7 @@ class MedicalRAGPipeline:
         import re
         
         # Combine queries for better coverage
-        text = f"{original_query} {rewritten_query}".lower()
+        text = f"{original_query} {primary_query}".lower()
         
         drug_names = set()
         
@@ -1721,7 +1729,7 @@ Please provide a comprehensive clinical response based on your medical knowledge
         # Apply hybrid scoring (dense + keyword matching)
         if passages:
             passages = self.retriever.apply_hybrid_scoring(
-                query=processed_query.rewritten_query,
+                query=processed_query.primary_query,
                 passages=passages,
                 dense_weight=0.7,
                 sparse_weight=0.3
@@ -1745,14 +1753,14 @@ Please provide a comprehensive clinical response based on your medical knowledge
             return result
         
         # Step 3: Rerank & Aggregate
-        # Pass LLM-extracted medical conditions AND typo-corrected conditions for strict filtering
+        # Pass decomposed entities (original + corrected) for strict filtering.
         medical_conditions = []
         corrected_conditions = []
         if processed_query.decomposed:
-            if processed_query.decomposed.medical_conditions:
-                medical_conditions = processed_query.decomposed.medical_conditions
-            if processed_query.decomposed.corrected_medical_conditions:
-                corrected_conditions = processed_query.decomposed.corrected_medical_conditions
+            if processed_query.decomposed.key_entities:
+                medical_conditions = processed_query.decomposed.key_entities
+            if processed_query.decomposed.corrected_entities:
+                corrected_conditions = processed_query.decomposed.corrected_entities
         papers_df, reranked_passages = self.rerank_and_aggregate(query, passages, dailymed_results, medical_conditions, corrected_conditions)
         
         if papers_df.empty:
@@ -1840,7 +1848,10 @@ Please provide a comprehensive clinical response based on your medical knowledge
         yield {
             "step": "query_expansion",
             "status": "complete",
-            "data": {"rewritten": processed_query.rewritten_query}
+            "data": {
+                "primary_query": processed_query.primary_query,
+                "keyword_query": processed_query.keyword_query,
+            }
         }
 
         # Step 2: Retrieval
@@ -1890,14 +1901,14 @@ Please provide a comprehensive clinical response based on your medical knowledge
 
         # Step 3: Reranking
         yield {"step": "reranking", "status": "running", "message": "Ranking papers..."}
-        # Pass LLM-extracted medical conditions AND typo-corrected conditions for strict filtering
+        # Pass decomposed entities (original + corrected) for strict filtering.
         medical_conditions = []
         corrected_conditions = []
         if processed_query.decomposed:
-            if processed_query.decomposed.medical_conditions:
-                medical_conditions = processed_query.decomposed.medical_conditions
-            if processed_query.decomposed.corrected_medical_conditions:
-                corrected_conditions = processed_query.decomposed.corrected_medical_conditions
+            if processed_query.decomposed.key_entities:
+                medical_conditions = processed_query.decomposed.key_entities
+            if processed_query.decomposed.corrected_entities:
+                corrected_conditions = processed_query.decomposed.corrected_entities
         papers_df, _ = self.rerank_and_aggregate(query, passages, dailymed_results, medical_conditions, corrected_conditions)
         
         # [NEW] Reorder papers so reference ranking matches final citation order from the start

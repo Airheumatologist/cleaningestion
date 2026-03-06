@@ -1,27 +1,37 @@
 """
-Enhanced Query Preprocessor for Medical RAG Pipeline.
+Query preprocessor for Medical RAG retrieval.
 
-Adapts ScholarQA's query decomposition approach to:
-- Extract metadata filters (year, venue, field of study)
-- Generate rewritten query for semantic search
-- Generate keyword-optimized query for hybrid search
-- Support structured Pydantic output parsing
+Responsibilities:
+- Correct likely medical typos
+- Distill verbose prompts (including long clinical vignettes) into compact retrieval queries
+- Extract key entities for downstream entity filtering
+- Detect explicit drug-information intent for DailyMed routing
 """
 
 import json
 import logging
 import re
 from datetime import datetime
-from typing import List, Dict, Any, Optional, NamedTuple, Union
+from typing import List, Dict, Any, Optional, NamedTuple
+
 from groq import Groq
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from .config import (
-    DEEPINFRA_API_KEY, DEEPINFRA_BASE_URL, GROQ_API_KEY,
-    LLM_PROVIDER, LLM_RETRY_COUNT, LLM_RETRY_DELAY, LLM_CHAT_TIMEOUT_SECONDS,
-    LLM_MAX_COMPLETION_TOKENS, LLM_REASONING_EFFORT,
-    LLM_MODEL, LLM_TEMPERATURE, LLM_TOP_P, QUERY_EXPANSION_COUNT
+    DEEPINFRA_API_KEY,
+    DEEPINFRA_BASE_URL,
+    GROQ_API_KEY,
+    LLM_PROVIDER,
+    LLM_RETRY_COUNT,
+    LLM_RETRY_DELAY,
+    LLM_CHAT_TIMEOUT_SECONDS,
+    LLM_MAX_COMPLETION_TOKENS,
+    LLM_REASONING_EFFORT,
+    LLM_MODEL,
+    LLM_TEMPERATURE,
+    LLM_TOP_P,
+    QUERY_EXPANSION_COUNT,
 )
 from .medical_entity_expander import MedicalEntityExpander
 from .retry_utils import retry_with_exponential_backoff
@@ -29,231 +39,156 @@ from .retry_utils import retry_with_exponential_backoff
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Data Models
-# =============================================================================
-
 class DecomposedQuery(BaseModel):
-    """Structured query decomposition output from LLM."""
-    earliest_search_year: str = Field(default="", description="The earliest year to search for papers")
-    latest_search_year: str = Field(default="", description="The latest year to search for papers")
-    venues: str = Field(default="", description="Comma separated list of venues to search for papers")
-    authors: Union[List[str], str] = Field(default=[], description="List of authors to search for papers")
-    field_of_study: str = Field(default="", description="Comma separated list of field of study")
-    rewritten_query: str = Field(description="The rewritten simplified query for semantic search")
-    rewritten_query_for_keyword_search: str = Field(description="The keyword-optimized query")
-    drug_names: List[str] = Field(default=[], description="List of drug names (brand and generic) mentioned in query")
-    medical_conditions: List[str] = Field(default=[], description="Key medical conditions/diseases mentioned in query")
-    # Typo correction fields
-    corrected_query: str = Field(default="", description="Typo-corrected version of the query (empty if no typos found)")
-    corrected_medical_conditions: List[str] = Field(default=[], description="Typo-corrected medical conditions for entity matching")
+    """Minimal query decomposition output from LLM."""
+
+    corrected_query: str = Field(
+        default="", description="Typo-corrected query text (empty if no correction needed)."
+    )
+    primary_query: str = Field(
+        description="Primary semantic retrieval query. Keep compact and clinically specific."
+    )
+    keyword_query: str = Field(
+        description="Compact keyword retrieval query for sparse/BM25 retrieval."
+    )
+    key_entities: List[str] = Field(
+        default=[],
+        description="Key diseases/conditions/findings from the user query (original spelling).",
+    )
+    corrected_entities: List[str] = Field(
+        default=[],
+        description="Typo-corrected key entities for matching and recall.",
+    )
+    is_drug_query: bool = Field(
+        default=False,
+        description="True only when user intent is medication information (dose/adverse effects/interactions/contraindications/MOA).",
+    )
+    drug_names: List[str] = Field(
+        default=[], description="Pharmaceutical drug names only (generic and applicable brand names)."
+    )
 
 
 class LLMProcessedQuery(NamedTuple):
-    """Result of LLM query processing."""
-    rewritten_query: str
+    """Result of LLM query processing for retrieval."""
+
+    primary_query: str
     keyword_query: str
-    search_filters: Dict[str, Any]
     original_query: str
     decomposed: Optional[DecomposedQuery] = None
-    expanded_queries: List[str] = []
+    retrieval_queries: List[str] = []
 
 
 class QueryExpansionResult(NamedTuple):
     """Result of query expansion (backward compatibility)."""
+
     original_query: str
     expanded_queries: List[str]
     all_queries: List[str]
 
 
-# =============================================================================
-# Prompts
-# =============================================================================
-
 QUERY_DECOMPOSER_PROMPT = """
 <task>
-Your task is to analyze a medical/clinical query and break it down for searching PubMed Central articles and DailyMed drug labels.
-Create a structured JSON output for academic and clinical search.
-
-CRITICAL: Preserve all medical condition names, disease names, and medical acronyms in the rewritten queries.
-Do NOT remove or abbreviate disease names - they are essential for accurate retrieval.
-
-Components to extract:
-1. Publication years: If "recent" → last 3 years ending in current year. If "last 5 years" → current year-4 through current year. Leave blank if unspecified.
-2. Venues: Journal names mentioned (e.g., "NEJM", "Lancet", "JAMA"). Leave blank if none.
-3. Authors: Author names mentioned. Leave as empty array if none.
-4. Field of study: Map to one of: Medicine, Biology, Chemistry, Pharmacology, Psychology, Nursing, Public Health. 
-   Default to "Medicine" for general medical queries.
-5. Rewritten query: Simplify for semantic vector search. ALWAYS include full disease/condition names.
-   - If query contains acronyms (e.g., "APS"), include both the acronym AND the full term
-   - Preserve medical condition names exactly as they appear
-   - Remove only metadata (years, venues) already extracted
-6. Keyword query: Extract key medical terms for keyword matching. Include both acronyms and full terms.
-7. Drug names: COMPREHENSIVE drug name extraction. Include:
-   - Generic name AND brand name equivalents (e.g., "tofacitinib" → ["tofacitinib", "Xeljanz"])
-   - FORMULATION-SPECIFIC BRANDS: Many drugs have different brand names for different routes of administration.
-     * If a specific route IS mentioned (infusion, IV, subcutaneous, SC, injection, oral):
-       Include ONLY the brand for that route (e.g., "golimumab infusion" → ["golimumab", "SIMPONI ARIA"])
-     * If NO specific route is mentioned:
-       Include ALL formulation brands for comprehensive coverage (e.g., "golimumab dosing" → ["golimumab", "SIMPONI", "SIMPONI ARIA"])
-   - Common examples of multi-formulation drugs:
-     * Golimumab: SIMPONI (SC injection) vs SIMPONI ARIA (IV infusion)
-     * Rituximab: RITUXAN (IV) vs RITUXAN HYCELA (SC)
-     * Trastuzumab: HERCEPTIN (IV) vs HERCEPTIN HYLECTA (SC)
-     * Tocilizumab: ACTEMRA (both IV and SC, same brand)
-8. Medical conditions: List key diseases or clinical conditions mentioned (preserve original spelling from query).
-9. TYPO DETECTION AND CORRECTION (CRITICAL):
-   - Carefully check for typos/misspellings in medical terms, drug names, and disease names
-   - Common typo patterns: transposed letters, missing letters, extra letters, phonetic misspellings
-   - Examples of typos to correct:
-     * "NUEROBROCELLOSIS" → "neurobrucellosis" (transposed letters)
-     * "rhuematoid" → "rheumatoid" (common misspelling)
-     * "methotrexat" → "methotrexate" (missing letter)
-   - PRESERVE legitimate medical terms exactly - do NOT "correct" valid terms
-   - When confident a term is misspelled, provide the corrected version
-   - When unsure, leave corrected fields empty (err on side of caution)
-10. Corrected query: If typos were detected, provide the fully corrected query. Leave empty if no typos.
-11. Corrected medical conditions: List the corrected spellings of conditions (for entity matching).
-
-Current year is __CURRENT_YEAR__.
+You are a medical retrieval query preprocessor.
+Analyze the user query and output compact retrieval-focused JSON.
+If the input is a long clinical vignette (USMLE style), distill it into a concise 15-25 word primary_query that keeps only high-yield findings and question intent; never copy the full vignette.
+Set is_drug_query=true ONLY when the user explicitly asks medication information (dose, adverse effects, interactions, contraindications, mechanism, administration).
+If a drug is only background history in a case vignette, set is_drug_query=false and drug_names=[].
+Current year: __CURRENT_YEAR__
 </task>
+
+<fields>
+corrected_query: Full typo-corrected text only when you are confident there is a misspelling; otherwise "".
+primary_query: Main dense retrieval query. Compact and specific. Remove answer option blocks like (A)...(E).
+keyword_query: Compact sparse retrieval query. May include condensed option terms for differential diagnosis.
+key_entities: Key conditions/findings from user query (original spelling).
+corrected_entities: Corrected spellings of key_entities when applicable.
+is_drug_query: boolean with strict intent rule from <task>.
+drug_names: Pharmaceutical names only (generic + applicable brand names). Never output conditions, anatomy, procedures, symptoms, labs, or demographics here.
+</fields>
 
 <examples>
 <example input>
-What are the latest treatments for heart failure with preserved ejection fraction?
+What are the contraindications and adverse effects of lisinopril?
 </example input>
 <example output>
 {
-    "earliest_search_year": "2022",
-    "latest_search_year": "2025",
-    "venues": "",
-    "authors": [],
-    "field_of_study": "Medicine",
-    "rewritten_query": "Treatments for heart failure with preserved ejection fraction HFpEF",
-    "rewritten_query_for_keyword_search": "HFpEF treatment therapy heart failure preserved ejection fraction",
-    "drug_names": [],
-    "medical_conditions": ["heart failure", "HFpEF"],
-    "corrected_query": "",
-    "corrected_medical_conditions": []
+  "corrected_query": "",
+  "primary_query": "lisinopril contraindications adverse effects",
+  "keyword_query": "lisinopril contraindication adverse effects safety",
+  "key_entities": ["hypertension"],
+  "corrected_entities": [],
+  "is_drug_query": true,
+  "drug_names": ["lisinopril"]
 }
 </example output>
 
 <example input>
-golimumab infusion dosing for rheumatoid arthritis
+A 68-year-old female presents with 5 days of fever, chills, and painful swelling in the right groin with leukocytosis and neutrophilia. She has cat exposure. CT shows enlarged inflamed inguinal lymph node without abscess. What is the most likely diagnosis? (A) Lymphogranuloma venereum (B) Cat scratch disease (C) Pyogenic lymphadenitis (D) Inguinal hernia (E) Necrotizing fasciitis
 </example input>
 <example output>
 {
-    "earliest_search_year": "",
-    "latest_search_year": "",
-    "venues": "",
-    "authors": [],
-    "field_of_study": "Medicine",
-    "rewritten_query": "golimumab IV infusion dosing rheumatoid arthritis",
-    "rewritten_query_for_keyword_search": "golimumab SIMPONI ARIA infusion IV dosing rheumatoid arthritis RA",
-    "drug_names": ["golimumab", "SIMPONI ARIA"],
-    "medical_conditions": ["rheumatoid arthritis"],
-    "corrected_query": "",
-    "corrected_medical_conditions": []
-}
-</example output>
-
-<example input>
-golimumab dosing for RA
-</example input>
-<example output>
-{
-    "earliest_search_year": "",
-    "latest_search_year": "",
-    "venues": "",
-    "authors": [],
-    "field_of_study": "Medicine",
-    "rewritten_query": "golimumab dosing rheumatoid arthritis",
-    "rewritten_query_for_keyword_search": "golimumab SIMPONI dosing rheumatoid arthritis RA",
-    "drug_names": ["golimumab", "SIMPONI", "SIMPONI ARIA"],
-    "medical_conditions": ["rheumatoid arthritis"],
-    "corrected_query": "",
-    "corrected_medical_conditions": []
-}
-</example output>
-
-<example input>
-Systematic reviews on SGLT2 inhibitors for diabetes and heart failure from 2020 onwards
-</example input>
-<example output>
-{
-    "earliest_search_year": "2020",
-    "latest_search_year": "2025",
-    "venues": "",
-    "authors": [],
-    "field_of_study": "Medicine",
-    "rewritten_query": "Systematic reviews SGLT2 inhibitors sodium-glucose cotransporter-2 diabetes heart failure",
-    "rewritten_query_for_keyword_search": "SGLT2 inhibitor systematic review meta-analysis diabetes heart failure",
-    "drug_names": ["SGLT2 inhibitors"],
-    "medical_conditions": ["diabetes", "heart failure"],
-    "corrected_query": "",
-    "corrected_medical_conditions": []
-}
-</example output>
-
-<example input>
-rituximab subcutaneous vs IV administration
-</example input>
-<example output>
-{
-    "earliest_search_year": "",
-    "latest_search_year": "",
-    "venues": "",
-    "authors": [],
-    "field_of_study": "Medicine",
-    "rewritten_query": "rituximab subcutaneous versus intravenous IV administration comparison",
-    "rewritten_query_for_keyword_search": "rituximab RITUXAN RITUXAN HYCELA SC IV subcutaneous intravenous",
-    "drug_names": ["rituximab", "RITUXAN", "RITUXAN HYCELA"],
-    "medical_conditions": [],
-    "corrected_query": "",
-    "corrected_medical_conditions": []
-}
-</example output>
-
-<example input>
-Management of NUEROBROCELLOSIS
-</example input>
-<example output>
-{
-    "earliest_search_year": "",
-    "latest_search_year": "",
-    "venues": "",
-    "authors": [],
-    "field_of_study": "Medicine",
-    "rewritten_query": "Management of NUEROBROCELLOSIS",
-    "rewritten_query_for_keyword_search": "NUEROBROCELLOSIS management treatment therapy",
-    "drug_names": [],
-    "medical_conditions": ["NUEROBROCELLOSIS"],
-    "corrected_query": "Management of neurobrucellosis",
-    "corrected_medical_conditions": ["neurobrucellosis"]
+  "corrected_query": "",
+  "primary_query": "inguinal lymphadenopathy tender groin mass fever cat exposure leukocytosis neutrophilia differential diagnosis",
+  "keyword_query": "inguinal lymphadenopathy fever cat scratch disease pyogenic lymphadenitis neutrophilia diagnosis",
+  "key_entities": ["inguinal lymphadenopathy", "fever"],
+  "corrected_entities": [],
+  "is_drug_query": false,
+  "drug_names": []
 }
 </example output>
 </examples>
 
-Output valid JSON only. No markdown formatting.
+Output valid JSON only. No markdown.
 """
 
 
-# =============================================================================
-# Query Preprocessor Class
-# =============================================================================
-
 class QueryPreprocessor:
-    """
-    Enhanced query preprocessor using ScholarQA-style decomposition.
-    
-    Features:
-    - Medical entity expansion (acronyms → full terms)
-    - LLM-based structured query decomposition
-    - Metadata extraction (year, venue, field of study)
-    - Dual query generation (semantic + keyword)
-    - Fallback to basic expansion on errors
-    """
-    
+    """LLM-powered preprocessing for retrieval-focused medical queries."""
+
+    _DRUG_INTENT_TERMS = (
+        "dose",
+        "dosing",
+        "dosage",
+        "contraindication",
+        "contraindications",
+        "adverse",
+        "side effect",
+        "side effects",
+        "interaction",
+        "interactions",
+        "mechanism",
+        "moa",
+        "pharmacokinet",
+        "administration",
+    )
+
+    _FALLBACK_STOPWORDS = {
+        "the",
+        "and",
+        "with",
+        "from",
+        "that",
+        "this",
+        "have",
+        "been",
+        "into",
+        "what",
+        "which",
+        "when",
+        "where",
+        "does",
+        "about",
+        "without",
+        "normal",
+        "reports",
+        "patient",
+        "female",
+        "male",
+        "year",
+        "years",
+        "old",
+    }
+
     def __init__(self, model: str = LLM_MODEL, use_entity_expansion: bool = True):
         """Initialize query decomposition LLM client."""
         if LLM_PROVIDER == "groq":
@@ -282,122 +217,176 @@ class QueryPreprocessor:
         self.use_entity_expansion = use_entity_expansion
         self._entity_expander = None
         logger.info("LLM query preprocessor provider initialized: %s (%s)", self.llm_provider, self.model)
-        
+
         if use_entity_expansion:
             try:
                 self._entity_expander = MedicalEntityExpander()
                 logger.info("✅ Medical entity expander initialized")
-            except Exception as e:
-                logger.warning(f"Failed to initialize medical entity expander: {e}")
+            except Exception as exc:
+                logger.warning("Failed to initialize medical entity expander: %s", exc)
                 self.use_entity_expansion = False
-    
+
+    def _should_expand_medical_entities(self, query: str) -> bool:
+        """Expand entities only when it helps recall without bloating long vignettes."""
+        tokens = query.split()
+        acronym_hits = len(re.findall(r"\b[A-Z]{2,10}\b", query))
+        return len(tokens) <= 45 or acronym_hits >= 2
+
     def _expand_medical_entities(self, query: str) -> str:
-        """Expand medical acronyms in query if enabled."""
+        """Expand medical acronyms in query when enabled and likely beneficial."""
         if not (self.use_entity_expansion and self._entity_expander):
             return query
+        if not self._should_expand_medical_entities(query):
+            return query
+
         try:
             expanded = self._entity_expander.expand_query(query, preserve_original=True)
             if expanded != query:
-                logger.info(f"Expanded query: '{query}' → '{expanded}'")
+                logger.info("Expanded query: '%s' → '%s'", query, expanded)
             return expanded
-        except Exception as e:
-            logger.warning(f"Entity expansion failed: {e}")
+        except Exception as exc:
+            logger.warning("Entity expansion failed: %s", exc)
             return query
-    
+
+    def _normalize_response_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Map legacy keys to the minimal schema for robustness."""
+        normalized = dict(payload)
+
+        if "primary_query" not in normalized and "rewritten_query" in normalized:
+            normalized["primary_query"] = normalized.get("rewritten_query", "")
+        if "keyword_query" not in normalized and "rewritten_query_for_keyword_search" in normalized:
+            normalized["keyword_query"] = normalized.get("rewritten_query_for_keyword_search", "")
+        if "key_entities" not in normalized and "medical_conditions" in normalized:
+            normalized["key_entities"] = normalized.get("medical_conditions") or []
+        if "corrected_entities" not in normalized and "corrected_medical_conditions" in normalized:
+            normalized["corrected_entities"] = normalized.get("corrected_medical_conditions") or []
+
+        normalized.setdefault("corrected_query", "")
+        normalized.setdefault("key_entities", [])
+        normalized.setdefault("corrected_entities", [])
+        normalized.setdefault("drug_names", [])
+        normalized.setdefault("is_drug_query", False)
+
+        if not isinstance(normalized.get("is_drug_query"), bool):
+            normalized["is_drug_query"] = str(normalized.get("is_drug_query", "")).strip().lower() in {
+                "true",
+                "1",
+                "yes",
+                "on",
+            }
+
+        return normalized
+
     def _parse_llm_response(self, content: str) -> DecomposedQuery:
-        """Parse LLM response, handling markdown formatting."""
+        """Parse LLM response, handling markdown wrappers and legacy keys."""
         if content.startswith("```"):
-            content = re.sub(r'^```(?:json)?\n?', '', content)
-            content = re.sub(r'\n?```$', '', content)
-        return DecomposedQuery(**json.loads(content))
-    
-    def _extract_search_filters(self, decomposed: DecomposedQuery) -> Dict[str, Any]:
-        """Extract search filters from decomposed query."""
-        filters = {}
-        
-        if decomposed.earliest_search_year or decomposed.latest_search_year:
-            filters["year"] = f"{decomposed.earliest_search_year}-{decomposed.latest_search_year}"
-        if decomposed.venues:
-            filters["venue"] = decomposed.venues
-        
-        return filters
+            content = re.sub(r"^```(?:json)?\n?", "", content)
+            content = re.sub(r"\n?```$", "", content)
+        payload = self._normalize_response_payload(json.loads(content))
+        return DecomposedQuery(**payload)
 
     def _get_query_decomposer_prompt(self) -> str:
-        """Render the query decomposer prompt with current year at runtime."""
+        """Render query decomposer prompt with current year."""
         return QUERY_DECOMPOSER_PROMPT.replace("__CURRENT_YEAR__", str(datetime.now().year))
-    
-    def _extract_condition(self, query: str, decomposed: Optional[DecomposedQuery] = None) -> str:
-        """Extract the medical condition/disease from a query or decomposed data."""
-        if decomposed and decomposed.medical_conditions:
-            # Use the most specific condition from LLM
-            return decomposed.medical_conditions[0]
-            
-        # Fallback to regex logic
-        condition_match = re.search(
-            r'((?:[A-Z][a-z]*\d*[-]?)+(?:\s+[a-z]+)*\s*(?:disease|syndrome|disorder|condition)?)',
-            query, re.IGNORECASE
+
+    def _strip_mcq_options(self, text: str) -> str:
+        """Strip multiple-choice answer option blocks such as (A) ... (E)."""
+        option_marker = re.compile(r"(?:\([A-E]\)|\b[A-E]\))\s*", flags=re.IGNORECASE)
+        if not option_marker.search(text):
+            return re.sub(r"\s+", " ", text).strip()
+        stem = option_marker.split(text, maxsplit=1)[0]
+        return re.sub(r"\s+", " ", stem).strip()
+
+    def _extract_option_terms(self, text: str, limit: int = 10) -> List[str]:
+        """Extract compact diagnostic hints from MCQ options for sparse query variant."""
+        option_marker = re.compile(r"(?:\([A-E]\)|\b[A-E]\))\s*", flags=re.IGNORECASE)
+        chunks = option_marker.split(text)
+        if len(chunks) <= 1:
+            return []
+
+        terms: List[str] = []
+        for chunk in chunks[1:]:
+            cleaned = re.sub(r"[^a-zA-Z0-9\-\s]", " ", chunk).lower()
+            tokens = [tok for tok in cleaned.split() if len(tok) >= 3 and tok not in self._FALLBACK_STOPWORDS]
+            if not tokens:
+                continue
+            terms.append(" ".join(tokens[:4]))
+            if len(terms) >= limit:
+                break
+        return terms[:limit]
+
+    def _compact_text(self, text: str, max_tokens: int) -> str:
+        """Normalize whitespace and truncate to max token budget."""
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if not normalized:
+            return ""
+        tokens = normalized.split()
+        return " ".join(tokens[:max_tokens])
+
+    def _is_long_vignette(self, query: str) -> bool:
+        """Heuristic detection for long case-vignette prompts."""
+        lowered = query.lower()
+        indicators = (
+            "presents",
+            "physical examination",
+            "laboratory",
+            "blood pressure",
+            "ct scan",
+            "history",
         )
-        condition = condition_match.group(1).strip() if condition_match else query
-        
-        acronym_match = re.search(r'\b([A-Z]{2,}(?:\d+)?)\b', query)
-        if acronym_match:
-            acronym = acronym_match.group(1)
-            if acronym.lower() not in condition.lower():
-                condition = f"{condition} ({acronym})"
-        
-        return condition
-    
-    def _generate_query_variations(self, rewritten: str, keyword: str, expanded: str, decomposed: Optional[DecomposedQuery] = None) -> List[str]:
-        """
-        Generate exactly two query variations for multi-query retrieval:
-        1) primary rewritten/corrected query
-        2) spelling-aware condensed keyword variant (condition + intent keywords)
-        """
-        base_query = rewritten or keyword or expanded
-        corrected_query = (
-            decomposed.corrected_query.strip()
-            if decomposed and decomposed.corrected_query
-            else ""
+        return len(query.split()) >= 120 or sum(1 for term in indicators if term in lowered) >= 3
+
+    def _extract_key_entities_fallback(self, text: str, limit: int = 6) -> List[str]:
+        """Best-effort extraction for key entities when LLM fails."""
+        cleaned = re.sub(r"[^a-zA-Z0-9\-\s]", " ", text.lower())
+        candidates = [
+            tok
+            for tok in cleaned.split()
+            if len(tok) >= 5 and tok not in self._FALLBACK_STOPWORDS
+        ]
+        deduped = list(dict.fromkeys(candidates))
+        return deduped[:limit]
+
+    def _guess_drug_intent(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(term in lowered for term in self._DRUG_INTENT_TERMS)
+
+    def _build_retrieval_queries(self, primary: str, keyword: str) -> List[str]:
+        """Return authoritative retrieval query list with dedupe and non-empty fallback."""
+        queries: List[str] = []
+        for value in (primary, keyword):
+            cleaned = re.sub(r"\s+", " ", (value or "")).strip()
+            if cleaned and cleaned not in queries:
+                queries.append(cleaned)
+        if not queries:
+            return [primary or keyword or ""]
+        return queries
+
+    def _fallback_decompose(self, query: str, expanded_query: str) -> DecomposedQuery:
+        """Deterministic fallback decomposition when LLM parsing/call fails."""
+        stripped = self._strip_mcq_options(expanded_query)
+        base = stripped or expanded_query or query
+
+        primary_limit = 25 if self._is_long_vignette(query) else 45
+        primary_query = self._compact_text(base, max_tokens=primary_limit)
+
+        option_terms = self._extract_option_terms(query)
+        key_entities = self._extract_key_entities_fallback(stripped or query)
+
+        keyword_parts = key_entities + option_terms
+        if not keyword_parts:
+            keyword_parts = primary_query.split()[:24]
+        keyword_query = self._compact_text(" ".join(keyword_parts), max_tokens=24)
+
+        return DecomposedQuery(
+            corrected_query="",
+            primary_query=primary_query,
+            keyword_query=keyword_query or primary_query,
+            key_entities=key_entities,
+            corrected_entities=[],
+            is_drug_query=self._guess_drug_intent(query),
+            drug_names=[],
         )
-        primary_query = corrected_query or base_query
-
-        # Prefer corrected medical conditions for keyword matching when available.
-        condition_terms: List[str] = []
-        if decomposed:
-            if decomposed.corrected_medical_conditions:
-                condition_terms = [c.strip() for c in decomposed.corrected_medical_conditions if c.strip()]
-            elif decomposed.medical_conditions:
-                condition_terms = [c.strip() for c in decomposed.medical_conditions if c.strip()]
-        if not condition_terms:
-            extracted = self._extract_condition(primary_query, decomposed).strip()
-            if extracted:
-                condition_terms = [extracted]
-
-        query_text = f"{primary_query} {keyword}".lower().strip()
-        intent_keywords: List[str] = []
-        if any(word in query_text for word in ["treat", "therapy", "management", "drug", "medication", "dose", "dosing", "dosage"]):
-            intent_keywords.append("treatment")
-        if any(word in query_text for word in ["guideline", "guidelines", "recommendation", "consensus"]):
-            intent_keywords.append("guideline")
-        if any(word in query_text for word in ["diagnose", "diagnosis", "criteria", "test", "screening"]):
-            intent_keywords.append("diagnosis")
-        if not intent_keywords:
-            intent_keywords = ["treatment", "guideline", "diagnosis"]
-
-        condition_phrase = " ".join(dict.fromkeys(condition_terms))
-        keyword_variant = " ".join([condition_phrase, " ".join(intent_keywords)]).strip()
-        if not keyword_variant:
-            keyword_variant = (keyword or expanded or primary_query).strip()
-        if keyword_variant.lower() == primary_query.lower():
-            keyword_variant = " ".join([condition_phrase, "treatment guideline diagnosis"]).strip() or keyword_variant
-
-        variations = [primary_query, keyword_variant]
-
-        logger.info("Generated 2 query variations")
-        for i, v in enumerate(variations, 1):
-            logger.info(f"  {i}. {v}")
-
-        return variations
 
     def _chat_completion_with_retry(self, messages: List[Dict[str, str]], operation_name: str):
         """Execute chat completion with exponential-backoff retry."""
@@ -421,146 +410,148 @@ class QueryPreprocessor:
         )
 
     def decompose_query(self, query: str) -> LLMProcessedQuery:
-        """
-        Decompose query into structured components using LLM.
-        
-        Returns:
-            LLMProcessedQuery with rewritten query, keyword query, filters, and expanded queries
-        """
+        """Decompose query into compact retrieval inputs using LLM."""
         expanded_query = self._expand_medical_entities(query)
-        
+
         try:
             response = self._chat_completion_with_retry(
                 messages=[
                     {"role": "system", "content": self._get_query_decomposer_prompt()},
-                    {"role": "user", "content": expanded_query}
+                    {"role": "user", "content": expanded_query},
                 ],
-                operation_name=f"{self.llm_provider} query decomposition"
+                operation_name=f"{self.llm_provider} query decomposition",
             )
-
             decomposed = self._parse_llm_response(response.choices[0].message.content.strip())
-            logger.info(f"Decomposed query: {decomposed}")
-            
-            # Extract filters and queries
-            search_filters = self._extract_search_filters(decomposed)
-            
-            # Use corrected query if available (CRITICAL for retrieval), otherwise use rewritten
-            rewritten = decomposed.corrected_query if decomposed.corrected_query else (decomposed.rewritten_query or expanded_query)
-            
-            keyword = decomposed.rewritten_query_for_keyword_search or expanded_query
-            # Append corrected medical terms so BM25 can match correctly-spelled documents
-            # (the LLM-generated keyword query may still contain the original typo)
-            if decomposed.corrected_medical_conditions:
-                keyword = keyword + " " + " ".join(decomposed.corrected_medical_conditions)
-            
-            # Ensure expanded terms are included if entity expansion was used
-            if expanded_query != query:
-                if query.upper() in rewritten.upper() and expanded_query not in rewritten:
-                    rewritten = f"{rewritten} {expanded_query}"
-                if query.upper() in keyword.upper() and expanded_query not in keyword:
-                    keyword = f"{keyword} {expanded_query}"
-            
-            expanded_queries = self._generate_query_variations(rewritten, keyword, expanded_query, decomposed)
-            
-            return LLMProcessedQuery(
-                rewritten_query=rewritten,
-                keyword_query=keyword,
-                search_filters=search_filters,
-                original_query=query,
-                decomposed=decomposed,
-                expanded_queries=expanded_queries
-            )
-            
-        except Exception as e:
-            logger.warning(f"Query decomposition failed: {e}, falling back to basic processing")
-            return LLMProcessedQuery(
-                rewritten_query=query,
-                keyword_query=query,
-                search_filters={},
-                original_query=query,
-                decomposed=None,
-                expanded_queries=[query]
-            )
-    
-    def expand_query(self, query: str) -> QueryExpansionResult:
-        """
-        Expand query using LLM (backward compatibility method).
-        """
-        system_prompt = f"""You are a medical search query expansion expert. 
-Generate exactly {self.expansion_count} alternative search queries for medical literature.
+        except Exception as exc:
+            logger.warning("Query decomposition failed: %s; using deterministic fallback", exc)
+            decomposed = self._fallback_decompose(query, expanded_query)
 
-RULES:
-1. Each query should approach the topic from a different angle
-2. Use medical synonyms and related terminology
-3. Include both technical and layman terms
-4. Output ONLY the queries, one per line, no numbering or bullets"""
+        corrected = decomposed.corrected_query.strip()
+        primary_query = corrected or decomposed.primary_query or expanded_query
+
+        # For keyword retrieval, add corrected entities to improve exact term hits.
+        keyword_query = decomposed.keyword_query or primary_query
+        if decomposed.corrected_entities:
+            keyword_query = " ".join([keyword_query, " ".join(decomposed.corrected_entities)]).strip()
+
+        # Keep concise query budget, especially for long vignettes.
+        if self._is_long_vignette(query):
+            primary_query = self._compact_text(self._strip_mcq_options(primary_query), max_tokens=25)
+            keyword_query = self._compact_text(keyword_query, max_tokens=24)
+        else:
+            primary_query = self._compact_text(primary_query, max_tokens=45)
+            keyword_query = self._compact_text(keyword_query, max_tokens=28)
+
+        # Add option hints for keyword query in MCQ prompts.
+        option_terms = self._extract_option_terms(query)
+        if option_terms:
+            keyword_query = self._compact_text(
+                f"{keyword_query} {' '.join(option_terms)}",
+                max_tokens=24,
+            )
+
+        # If LLM returns no explicit drug flag, infer conservatively from intent + extracted drugs.
+        if not decomposed.is_drug_query and decomposed.drug_names and self._guess_drug_intent(query):
+            decomposed = decomposed.model_copy(update={"is_drug_query": True})
+
+        retrieval_queries = self._build_retrieval_queries(primary_query, keyword_query)
+
+        logger.info("Decomposed query: %s", decomposed)
+        logger.info("Primary query: %s", primary_query)
+        logger.info("Keyword query: %s", keyword_query)
+
+        return LLMProcessedQuery(
+            primary_query=primary_query,
+            keyword_query=keyword_query,
+            original_query=query,
+            decomposed=decomposed,
+            retrieval_queries=retrieval_queries,
+        )
+
+    def expand_query(self, query: str) -> QueryExpansionResult:
+        """Expand query using LLM (backward compatibility method)."""
+        system_prompt = (
+            "You are a medical search query expansion expert. "
+            f"Generate exactly {self.expansion_count} alternative search queries for medical literature.\n\n"
+            "RULES:\n"
+            "1. Each query should approach the topic from a different angle\n"
+            "2. Use medical synonyms and related terminology\n"
+            "3. Include both technical and layman terms\n"
+            "4. Output ONLY the queries, one per line, no numbering or bullets"
+        )
 
         try:
             response = self._chat_completion_with_retry(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f'Generate {self.expansion_count} alternative medical search queries for:\n\n"{query}"\n\nOutput only the queries, one per line:'}
+                    {
+                        "role": "user",
+                        "content": (
+                            f'Generate {self.expansion_count} alternative medical search queries for:\n\n"{query}"\n\n'
+                            "Output only the queries, one per line:"
+                        ),
+                    },
                 ],
-                operation_name=f"{self.llm_provider} query expansion"
+                operation_name=f"{self.llm_provider} query expansion",
             )
 
             expanded = []
-            for line in response.choices[0].message.content.strip().split('\n'):
-                cleaned = line.strip().lstrip('0123456789.-•*) ').strip()
+            for line in response.choices[0].message.content.strip().split("\n"):
+                cleaned = line.strip().lstrip("0123456789.-•*) ").strip()
                 if cleaned and len(cleaned) > 10:
                     expanded.append(cleaned)
-            
-            expanded = expanded[:self.expansion_count]
+
+            expanded = expanded[: self.expansion_count]
             return QueryExpansionResult(query, expanded, [query] + expanded)
-            
-        except Exception as e:
-            logger.warning(f"Query expansion failed: {e}")
+
+        except Exception as exc:
+            logger.warning("Query expansion failed: %s", exc)
             return QueryExpansionResult(query, [], [query])
-    
+
     def preprocess(self, query: str, use_decomposition: bool = True) -> LLMProcessedQuery:
-        """
-        Full preprocessing pipeline.
-        
-        Args:
-            query: Original user query
-            use_decomposition: If True, use structured decomposition; else basic expansion
-        """
+        """Full preprocessing pipeline."""
         if use_decomposition:
             return self.decompose_query(query)
-        
+
         expansion = self.expand_query(query)
+        retrieval_queries = expansion.all_queries[:2] if expansion.all_queries else [query]
+        primary_query = retrieval_queries[0] if retrieval_queries else query
+        keyword_query = retrieval_queries[1] if len(retrieval_queries) > 1 else primary_query
         return LLMProcessedQuery(
-            rewritten_query=query,
-            keyword_query=" ".join(expansion.expanded_queries[:2]),
-            search_filters={},
+            primary_query=primary_query,
+            keyword_query=keyword_query,
             original_query=query,
             decomposed=None,
-            expanded_queries=expansion.all_queries
+            retrieval_queries=retrieval_queries,
         )
 
 
 if __name__ == "__main__":
-    print("🧪 Testing Enhanced Query Preprocessor")
+    print("Testing Query Preprocessor")
     print("=" * 60)
-    
+
     preprocessor = QueryPreprocessor()
-    
+
     test_queries = [
         "What are the latest treatments for heart failure?",
         "Systematic reviews on metformin for type 2 diabetes from 2020",
-        "COVID-19 vaccine side effects in elderly patients",
+        "Management of NUEROBROCELLOSIS",
+        (
+            "A 68-year-old female presents with 5 days of fever, chills, and painful swelling in the right groin. "
+            "CT shows enlarged inflamed inguinal node. What is the most likely diagnosis? "
+            "(A) Lymphogranuloma venereum (B) Cat scratch disease (C) Pyogenic lymphadenitis"
+        ),
     ]
-    
+
     for query in test_queries:
-        print(f"\n📝 Original: {query}")
+        print(f"\nOriginal: {query}")
         print("-" * 40)
-        
+
         result = preprocessor.decompose_query(query)
-        
-        print(f"✅ Rewritten: {result.rewritten_query}")
-        print(f"🔑 Keyword: {result.keyword_query}")
-        print(f"🔍 Filters: {result.search_filters}")
-        
+
+        print(f"Primary: {result.primary_query}")
+        print(f"Keyword: {result.keyword_query}")
+        print(f"Retrieval queries: {result.retrieval_queries}")
         if result.decomposed:
-            print(f"📅 Year: {result.decomposed.earliest_search_year}-{result.decomposed.latest_search_year}")
-            print(f"📚 Field: {result.decomposed.field_of_study}")
+            print(f"Drug intent: {result.decomposed.is_drug_query}")
+            print(f"Drugs: {result.decomposed.drug_names}")

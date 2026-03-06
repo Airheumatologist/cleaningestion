@@ -529,9 +529,9 @@ async def decompose_query(
         result = pipeline.preprocess_query(payload.query)
         return {
             "original_query": result.original_query,
-            "rewritten_query": result.rewritten_query,
+            "primary_query": result.primary_query,
             "keyword_query": result.keyword_query,
-            "search_filters": result.search_filters,
+            "retrieval_queries": result.retrieval_queries,
             "decomposed": result.decomposed.model_dump() if result.decomposed else None,
         }
     except Exception as exc:
