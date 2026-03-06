@@ -12,8 +12,8 @@
 - Use `scripts/44_compact_segments.py` to inspect/trigger segment compaction.
 
 # Model Provider Guardrails
-- Use `DeepInfra` as the LLM provider for `openai/gpt-oss-20b` generation/query decomposition.
-- Keep Qwen `0.6B` embedding and reranking on `DeepInfra`.
+- Use `Groq` as the canonical runtime LLM provider for `openai/gpt-oss-20b` generation/query decomposition (unless explicitly overridden by env).
+- Keep Qwen `0.6B` embedding and reranking on `DeepInfra` (`RUNTIME_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B`, `INGESTION_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B-batch`).
 
 # Server Connection & Deployment
 - **SSH Connection**: run `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new root@65.109.112.253` from the workspace directory (or use `.ssh/id_ed25519` relative to workspace).

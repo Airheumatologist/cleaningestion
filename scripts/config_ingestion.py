@@ -35,7 +35,10 @@ class IngestionConfig:
 
     # Embedding provider: DeepInfra only
     EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra")
-    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B-batch")
+    EMBEDDING_MODEL = os.getenv(
+        "INGESTION_EMBEDDING_MODEL",
+        os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B-batch"),
+    )
 
     # Data paths
     DATA_DIR = Path(os.getenv("DATA_DIR", "/data/ingestion"))

@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -26,9 +27,10 @@ import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
+from urllib.parse import urlparse, urlunparse
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client.models import OptimizersConfigDiff, PointStruct
 
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -95,6 +97,85 @@ DEFAULT_DAILYMED_WEEKS_BACK = 1
 def _checkpoint_id(pmid: str) -> str:
     """Generate namespaced checkpoint ID for PubMed abstracts."""
     return f"{PUBMED_CHECKPOINT_NAMESPACE}:{pmid.strip()}"
+
+
+def _replace_url_host(url: str, host: str) -> str:
+    parsed = urlparse(url)
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo += f":{parsed.password}"
+        userinfo += "@"
+    port = f":{parsed.port}" if parsed.port else ""
+    return urlunparse(parsed._replace(netloc=f"{userinfo}{host}{port}"))
+
+
+def _resolve_qdrant_url_for_weekly(raw_url: str, container_name: str) -> str:
+    """Resolve Qdrant URL for host cron jobs when docker DNS 'qdrant' is unavailable."""
+    parsed = urlparse(raw_url)
+    host = parsed.hostname
+    if not host or host != "qdrant":
+        return raw_url
+
+    try:
+        socket.gethostbyname(host)
+        logger.info("Qdrant DNS resolved for weekly update host=%s url=%s", host, raw_url)
+        return raw_url
+    except OSError as dns_exc:
+        logger.warning("Qdrant DNS resolution failed for host=%s (%s); trying docker inspect fallback", host, dns_exc)
+
+    inspect_result = subprocess.run(
+        [
+            "docker",
+            "inspect",
+            "-f",
+            "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            container_name,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    container_ip = inspect_result.stdout.strip()
+    if inspect_result.returncode != 0 or not container_ip:
+        stderr = (inspect_result.stderr or "").strip()
+        raise RuntimeError(
+            "Unable to resolve Qdrant host 'qdrant'. DNS lookup failed and docker inspect did not return a container IP "
+            f"for '{container_name}'. Set QDRANT_URL explicitly or ensure container '{container_name}' is running. "
+            f"docker inspect exit_code={inspect_result.returncode} stderr={stderr!r}"
+        )
+
+    resolved_url = _replace_url_host(raw_url, container_ip)
+    logger.warning(
+        "Resolved Qdrant URL via docker inspect fallback container=%s ip=%s url=%s",
+        container_name,
+        container_ip,
+        resolved_url,
+    )
+    return resolved_url
+
+
+def enforce_hnsw_indexing(
+    client: QdrantClient,
+    collection_name: str,
+    indexing_threshold: int = 10000,
+) -> None:
+    """Ensure HNSW indexing is re-enabled after weekly ingestion."""
+    logger.info(
+        "Enforcing HNSW indexing threshold for collection=%s indexing_threshold=%d",
+        collection_name,
+        indexing_threshold,
+    )
+    try:
+        client.update_collection(
+            collection_name=collection_name,
+            optimizers_config=OptimizersConfigDiff(indexing_threshold=indexing_threshold),
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to enforce Qdrant HNSW indexing_threshold=10000. Weekly update aborted to avoid brute-force query mode."
+        ) from exc
 
 def load_processed_files() -> Set[str]:
     if not PROCESSED_TRACKER.exists():
@@ -1005,6 +1086,10 @@ def run_dailymed_refresh(weeks_back: int = DEFAULT_DAILYMED_WEEKS_BACK) -> None:
         sys.executable, str(scripts_dir / "07_ingest_dailymed.py"),
         "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR)
     ], check=True, cwd=PROJECT_ROOT)
+    # Regenerate lookup cache immediately after ingestion to avoid stale routing.
+    subprocess.run([
+        sys.executable, str(scripts_dir / "generate_drug_lookup.py"),
+    ], check=True, cwd=PROJECT_ROOT)
 
 
 def run_pmc_refresh() -> None:
@@ -1094,9 +1179,16 @@ def main() -> None:
         logger.error("QDRANT_API_KEY not set!")
         sys.exit(1)
 
+    resolved_qdrant_url = _resolve_qdrant_url_for_weekly(
+        IngestionConfig.QDRANT_URL,
+        os.getenv("QDRANT_CONTAINER_NAME", "qdrant"),
+    )
+    os.environ["QDRANT_URL"] = resolved_qdrant_url
+    IngestionConfig.QDRANT_URL = resolved_qdrant_url
+
     embedding_provider = EmbeddingProvider()
     client = QdrantClient(
-        url=IngestionConfig.QDRANT_URL,
+        url=resolved_qdrant_url,
         api_key=IngestionConfig.QDRANT_API_KEY or None,
         timeout=600,
         prefer_grpc=IngestionConfig.USE_GRPC,
@@ -1119,6 +1211,8 @@ def main() -> None:
 
     if not args.skip_pmc:
         run_pmc_refresh()
+
+    enforce_hnsw_indexing(client, IngestionConfig.COLLECTION_NAME, indexing_threshold=10000)
 
     info = client.get_collection(IngestionConfig.COLLECTION_NAME)
     logger.info(

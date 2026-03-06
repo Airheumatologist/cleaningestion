@@ -103,9 +103,10 @@ class EmbeddingProvider:
         api_key = os.getenv("DEEPINFRA_API_KEY")
         if not api_key:
             raise ValueError("DEEPINFRA_API_KEY not set - required for deepinfra embedding provider")
+        deepinfra_base_url = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
         self.openai_client = OpenAI(
             api_key=api_key,
-            base_url="https://api.deepinfra.com/v1/openai"
+            base_url=deepinfra_base_url
         )
         logger.info("✅ DeepInfra embedding provider initialized (model: %s)", self.model)
 

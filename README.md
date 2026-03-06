@@ -278,6 +278,7 @@ RAG-pipeline/
 ├── scripts/                                # Data ingestion pipeline
 │   ├── 01_download_pmc_unified.py          # Download PMC OA + Author Manuscripts from PMC Cloud Service (AWS S3)
 │   ├── 03_download_dailymed.py             # Download FDA drug labels
+│   ├── 04_prepare_dailymed_updates.py      # Clear checkpoint entries for updated DailyMed set_ids
 │   ├── 05_setup_qdrant.py                  # Initialize Qdrant collection
 │   ├── 06_ingest_pmc.py                    # Ingest unified PMC XML sources to Qdrant
 │   ├── 07_ingest_dailymed.py               # Ingest DailyMed XML to Qdrant
@@ -548,7 +549,9 @@ API_INFLIGHT_ACQUIRE_TIMEOUT_MS=200
 
 # Embedding Model
 EMBEDDING_PROVIDER=deepinfra
-EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B-batch
+RUNTIME_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
+INGESTION_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B-batch
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B  # Legacy fallback (backward compatibility)
 
 # Reranker Model  
 RERANKER_PROVIDER=deepinfra
@@ -619,6 +622,10 @@ export API_REWRITE_TARGET=http://localhost:8000
 npm run dev
 ```
 
+Embedding precedence:
+- Runtime/API retrieval: `RUNTIME_EMBEDDING_MODEL -> EMBEDDING_MODEL -> Qwen/Qwen3-Embedding-0.6B`
+- Ingestion scripts: `INGESTION_EMBEDDING_MODEL -> EMBEDDING_MODEL -> Qwen/Qwen3-Embedding-0.6B-batch`
+
 Access at `http://localhost:3000`
 
 ### 4. Production Data Ingestion
@@ -676,6 +683,11 @@ python scripts/21_ingest_pubmed_abstracts.py
 # Old scripts (10_download_gov_abstracts.py, 13_ingest_gov_abstracts.py) are deprecated.
 # Use filter: is_gov_affiliated=true in queries to get government-authored articles.
 ```
+
+**Weekly update behavior (`scripts/08_weekly_update.py`):**
+- Runs DailyMed weekly refresh as `03_download_dailymed.py -> 04_prepare_dailymed_updates.py -> 07_ingest_dailymed.py`.
+- Regenerates `src/data/drug_setid_lookup.json` automatically via `scripts/generate_drug_lookup.py` after DailyMed ingestion.
+- Re-enables Qdrant HNSW safety guardrail at end of run with `indexing_threshold=10000` and fails the weekly run if this enforcement fails.
 
 **Monitor Progress:**
 ```bash

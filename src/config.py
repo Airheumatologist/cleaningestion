@@ -103,7 +103,7 @@ LLM_TEMPERATURE = 0.7  # Controls randomness (0=deterministic, 1=creative)
 LLM_TOP_P = 0.9  # Nucleus sampling threshold
 
 # LLM Configuration (Generation)
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepinfra").strip().lower()
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").strip().lower()
 LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-20b")
 LLM_MAX_COMPLETION_TOKENS = _env_int("LLM_MAX_COMPLETION_TOKENS", 8192)
 LLM_REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "medium").strip().lower()
@@ -116,7 +116,10 @@ LLM_CHAT_TIMEOUT_SECONDS = GROQ_CHAT_TIMEOUT_SECONDS if LLM_PROVIDER == "groq" e
 # =============================================================================
 # Provider: "hf_inference_endpoint" (default) | "deepinfra" | "qdrant_cloud_inference"
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra").strip().lower()
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B")
+EMBEDDING_MODEL = os.getenv(
+    "RUNTIME_EMBEDDING_MODEL",
+    os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B"),
+)
 EMBEDDING_DIMENSION = 1024  # Qwen/Qwen3-Embedding-0.6B output dimension
 EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "64"))
 
