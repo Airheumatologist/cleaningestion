@@ -17,8 +17,16 @@ class DocsAlignmentTests(unittest.TestCase):
         self.assertIn("04_prepare_dailymed_updates.py", content)
         self.assertIn("Weekly update behavior (`scripts/08_weekly_update.py`):", content)
         self.assertIn("generate_drug_lookup.py", content)
+        self.assertIn("python scripts/08_weekly_update.py --skip-pmc", content)
         self.assertIn("Embedding precedence:", content)
         self.assertIn("indexing_threshold=10000", content)
+
+    def test_cron_documents_weekly_skip_pmc_and_semiannual_pmc_runner(self):
+        content = (REPO_ROOT / "deploy/hetzner/cron/medical-rag-update.cron").read_text(encoding="utf-8")
+        self.assertIn("CRON_TZ=America/Chicago", content)
+        self.assertIn("python scripts/08_weekly_update.py --skip-pmc", content)
+        self.assertIn("0 1 30 6,12 *", content)
+        self.assertIn("run_pmc_biannual_update.sh", content)
 
     def test_cursorrules_documents_groq_canonical_policy(self):
         content = (REPO_ROOT / ".cursorrules").read_text(encoding="utf-8")

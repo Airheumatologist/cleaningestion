@@ -33,7 +33,7 @@ import argparse
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Set
+from typing import Optional, Set, List
 from dailymed_rx_filters import (
     INCREMENTAL_ALLOWED_NESTED_ROOTS,
     select_nested_zip_members,
@@ -142,6 +142,66 @@ def get_weekly_update_filename(weeks_ago: int = 0) -> Optional[str]:
     friday_str = target_friday.strftime("%m%d%y")
     
     return f"dm_spl_weekly_update_{monday_str}_{friday_str}.zip"
+
+
+def _url_exists(url: str, timeout: int = 30) -> bool:
+    """
+    Return True when an HTTP resource exists.
+
+    Tries HEAD first, then falls back to a streamed GET for servers that do not
+    support HEAD reliably.
+    """
+    try:
+        head = requests.head(url, allow_redirects=True, timeout=timeout)
+        if head.status_code == 200:
+            return True
+        if head.status_code not in (403, 405):
+            return False
+    except Exception:
+        # Fall back to GET below.
+        pass
+
+    try:
+        with requests.get(url, stream=True, timeout=timeout) as resp:
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def resolve_weekly_update_filenames(
+    weeks_back: int,
+    probe_window_weeks: int = 8,
+) -> List[str]:
+    """
+    Resolve the newest published DailyMed weekly update ZIP files.
+
+    DailyMed weekly publication can lag; this probes a range of candidate week
+    filenames and keeps only URLs that currently exist.
+    """
+    wanted = max(1, weeks_back)
+    max_probe = max(wanted + probe_window_weeks, wanted)
+    existing: List[str] = []
+
+    for weeks_ago in range(max_probe):
+        filename = get_weekly_update_filename(weeks_ago=weeks_ago)
+        if not filename:
+            continue
+        zip_url = f"{DAILYMED_PUBLIC_RELEASE_BASE}/{filename}"
+        if _url_exists(zip_url):
+            existing.append(filename)
+            if len(existing) >= wanted:
+                break
+        else:
+            logger.info("Weekly ZIP not yet published, skipping candidate: %s", filename)
+
+    if len(existing) < wanted:
+        logger.warning(
+            "Requested %d weekly update(s), but only %d currently published in probe window=%d weeks",
+            wanted,
+            len(existing),
+            max_probe,
+        )
+    return existing
 
 
 def get_monthly_update_filename(months_ago: int = 0) -> Optional[str]:
@@ -379,6 +439,7 @@ def download_dailymed(
     refresh: bool = False,
     update_type: Optional[str] = None,
     weeks_back: int = 1,
+    weekly_probe_window: int = 8,
     days_back: int = 7,
     set_id_manifest: Optional[Path] = None
 ):
@@ -390,7 +451,8 @@ def download_dailymed(
         include_otc: Also download OTC (over-the-counter) drugs (full refresh only)
         refresh: If True, re-download and re-extract all files (full release)
         update_type: Type of update - 'daily', 'weekly', 'monthly', or None for full release
-        weeks_back: Number of weekly files to download, starting from most recent completed week
+        weeks_back: Number of weekly files to download, starting from most recent published week
+        weekly_probe_window: Additional older weeks to probe when newest week is not yet published
         days_back: Number of days to go back for daily updates (default: 7 = last 7 days)
         set_id_manifest: Path to persist updated set_ids for incremental re-ingestion
     """
@@ -407,11 +469,10 @@ def download_dailymed(
     
     # Determine which ZIPs to download based on update type
     if update_type == "weekly":
-        zip_files = []
-        for i in range(weeks_back):
-            filename = get_weekly_update_filename(weeks_ago=i)
-            if filename:
-                zip_files.append(filename)
+        zip_files = resolve_weekly_update_filenames(
+            weeks_back=weeks_back,
+            probe_window_weeks=weekly_probe_window,
+        )
         logger.info(f"📅 Weekly update mode: downloading {len(zip_files)} weekly update(s)")
         
     elif update_type == "daily":
@@ -550,6 +611,12 @@ Examples:
         help="Number of weekly files to download for weekly updates (default: 1)"
     )
     parser.add_argument(
+        "--weekly-probe-window",
+        type=int,
+        default=8,
+        help="Extra older weeks to probe when the newest weekly ZIP is not yet published (default: 8)"
+    )
+    parser.add_argument(
         "--days-back",
         type=int,
         default=7,
@@ -569,6 +636,7 @@ Examples:
         args.refresh,
         args.update_type,
         args.weeks_back,
+        args.weekly_probe_window,
         args.days_back,
         args.set_id_manifest
     )

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Qdrant snapshot backup script.
 #
-# Called automatically after the weekly update via medical-rag-update.cron.
+# Called automatically after scheduled weekly and semiannual PMC updates via
+# medical-rag-update.cron.
 # Can also be run standalone for ad-hoc backups.
 #
 # Required env vars:

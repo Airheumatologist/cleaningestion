@@ -1,8 +1,9 @@
 # Weekly PubMed + DailyMed incremental update followed immediately by a Qdrant backup.
 # Weekly ingestion QoS can be tuned in /opt/RAG-pipeline/.env:
 #   WEEKLY_UPDATE_THROTTLE_SECONDS, WEEKLY_UPDATE_BATCH_SIZE
-# Runs every Saturday at 01:00 local time.
-#   - 01:00  weekly update ingestion  (08_weekly_update.py)
+# Runs in America/Chicago timezone.
+#   - Weekly: Saturday 01:00 -> 08_weekly_update.py --skip-pmc
+#   - Semiannual PMC: June 30 and December 30 at 01:00 -> run_pmc_biannual_update.sh
 #   - backup.sh runs only if the update exits successfully (&&)
 #
 # The separate qdrant-backup.cron is no longer needed and can be removed:
@@ -12,4 +13,6 @@
 #   sudo cp deploy/hetzner/cron/medical-rag-update.cron /etc/cron.d/medical-rag-update
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-0 1 * * 6 root cd /opt/RAG-pipeline && /bin/bash -lc '{ source venv/bin/activate || source .venv/bin/activate; } && set -a && source .env && set +a && python scripts/08_weekly_update.py && ./deploy/hetzner/backup.sh' >> /var/log/rag-update.log 2>&1
+CRON_TZ=America/Chicago
+0 1 * * 6 root cd /opt/RAG-pipeline && /bin/bash -lc '{ source venv/bin/activate || source .venv/bin/activate; } && set -a && source .env && set +a && python scripts/08_weekly_update.py --skip-pmc && ./deploy/hetzner/backup.sh' >> /var/log/rag-update.log 2>&1
+0 1 30 6,12 * root cd /opt/RAG-pipeline && /bin/bash -lc './deploy/hetzner/run_pmc_biannual_update.sh && ./deploy/hetzner/backup.sh' >> /var/log/rag-pmc-biannual.log 2>&1

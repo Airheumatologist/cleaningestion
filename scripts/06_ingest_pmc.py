@@ -638,11 +638,6 @@ def process_batch(
         try:
             source_type = _detect_source_type(xml_path, xml_root)
             
-            # Skip author manuscripts entirely (as requested for commercial use safety)
-            if source_type == SOURCE_PMC_AUTHOR:
-                logger.info("Skipping %s: author_manuscript", xml_path.name)
-                continue
-
             stem_id = _extract_stem_id(xml_path)
             candidate_ids = set()
             if stem_id:

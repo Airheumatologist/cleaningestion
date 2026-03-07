@@ -5,7 +5,7 @@ Replaces the monthly cadence (08_monthly_update.py) with a weekly schedule
 that matches the daily-update frequency of our upstream datasets (PubMed and
 DailyMed both publish new files every weekday).
 
-Run via cron on Sunday at 01:00; backup.sh is chained in the cron entry and
+Run via cron on Saturday at 01:00; backup.sh is chained in the cron entry and
 runs immediately after this script exits successfully.
 """
 
@@ -1084,7 +1084,8 @@ def run_dailymed_refresh(weeks_back: int = DEFAULT_DAILYMED_WEEKS_BACK) -> None:
     # Ingest - updated labels will now be processed
     subprocess.run([
         sys.executable, str(scripts_dir / "07_ingest_dailymed.py"),
-        "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR)
+        "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR),
+        "--delete-source",
     ], check=True, cwd=PROJECT_ROOT)
     # Regenerate lookup cache immediately after ingestion to avoid stale routing.
     subprocess.run([
@@ -1116,7 +1117,7 @@ def run_pmc_refresh() -> None:
     subprocess.run([
         sys.executable, str(scripts_dir / "01_download_pmc_unified.py"),
         "--output-dir", str(IngestionConfig.PMC_XML_DIR),
-        "--datasets", "pmc_oa",
+        "--datasets", "pmc_oa,author_manuscript",
         "--release-mode", "incremental",
     ], check=True, cwd=PROJECT_ROOT)
     # Step 2: ingest — checkpoint skips already-ingested IDs; delete after

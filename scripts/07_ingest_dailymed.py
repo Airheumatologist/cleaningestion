@@ -748,7 +748,17 @@ def load_checkpoint_namespaced(path: Path) -> set[str]:
         if (resolved := _resolve_checkpoint_line(line)) is not None
     }
 
-def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder], processed_ids: set[str], processed_lock: threading.Lock, chunker: Any, refresh: bool = False) -> Tuple[int, int]:
+def process_batch(
+    client: QdrantClient,
+    batch_files: List[Path],
+    embedding_provider: EmbeddingProvider,
+    sparse_encoder: Optional[BM25SparseEncoder],
+    processed_ids: set[str],
+    processed_lock: threading.Lock,
+    chunker: Any,
+    refresh: bool = False,
+    delete_source: bool = False,
+) -> Tuple[int, int]:
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
     skipped = 0
@@ -757,6 +767,7 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
     
     drugs = []
     new_ids = []
+    processed_files: List[Path] = []
     
     # 1. Parse and filter
     for xml_file in batch_files:
@@ -791,6 +802,7 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
             
             drugs.append(drug)
             new_ids.append(set_id_checkpoint)
+            processed_files.append(xml_file)
             
         except Exception as e:
             logger.warning("Failed to parse %s: %s", xml_file, e)
@@ -823,6 +835,14 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
             append_checkpoint_file(CHECKPOINT_FILE, new_ids)
             with processed_lock:
                 processed_ids.update(new_ids)
+
+            # Delete source XML only after successful upsert + checkpoint update
+            if delete_source:
+                for xml_path in processed_files:
+                    try:
+                        xml_path.unlink()
+                    except OSError as e:
+                        logger.warning("Failed to delete %s: %s", xml_path, e)
                 
             inserted = len(points)
     except Exception as e:
@@ -831,8 +851,16 @@ def process_batch(client: QdrantClient, batch_files: List[Path], embedding_provi
     return inserted, len(batch_files) - len(drugs) # skipped count approximation for stats
 
 
-def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, refresh: bool = False) -> None:
+def run_ingestion(
+    xml_dir: Path,
+    embedding_provider: EmbeddingProvider,
+    refresh: bool = False,
+    delete_source: bool = False,
+) -> None:
     ensure_data_dirs()
+
+    if delete_source:
+        logger.warning("Source file deletion enabled: XML files will be deleted after successful ingestion")
     
     # In refresh mode, clear checkpoint to allow re-ingestion
     if refresh and CHECKPOINT_FILE.exists():
@@ -916,7 +944,18 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, refresh:
             current_super_batch = file_batches[i : i + SUPER_BATCH_SIZE]
             
             future_to_batch = {
-                executor.submit(process_batch, client, batch, embedding_provider, sparse_encoder, processed_ids, processed_lock, chunker, refresh): batch 
+                executor.submit(
+                    process_batch,
+                    client,
+                    batch,
+                    embedding_provider,
+                    sparse_encoder,
+                    processed_ids,
+                    processed_lock,
+                    chunker,
+                    refresh,
+                    delete_source,
+                ): batch
                 for batch in current_super_batch
             }
             
@@ -948,6 +987,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest DailyMed into self-hosted Qdrant with improved section handling")
     parser.add_argument("--xml-dir", type=Path, default=IngestionConfig.DAILYMED_XML_DIR)
     parser.add_argument("--refresh", action="store_true", help="Force re-ingestion of all labels (clears checkpoint)")
+    parser.add_argument("--delete-source", action="store_true", help="Delete XML file after successful ingestion")
     args = parser.parse_args()
 
     if not args.xml_dir.exists():
@@ -956,7 +996,7 @@ if __name__ == "__main__":
 
     try:
         provider = EmbeddingProvider()
-        run_ingestion(args.xml_dir, provider, refresh=args.refresh)
+        run_ingestion(args.xml_dir, provider, refresh=args.refresh, delete_source=args.delete_source)
     except Exception as e:
         logger.error("Ingestion failed: %s", e)
         sys.exit(1)

@@ -282,7 +282,7 @@ RAG-pipeline/
 │   ├── 05_setup_qdrant.py                  # Initialize Qdrant collection
 │   ├── 06_ingest_pmc.py                    # Ingest unified PMC XML sources to Qdrant
 │   ├── 07_ingest_dailymed.py               # Ingest DailyMed XML to Qdrant
-│   ├── 08_weekly_update.py                 # Weekly incremental updates (PubMed, DailyMed, PMC)
+│   ├── 08_weekly_update.py                 # Weekly updater (scheduled as PubMed + DailyMed; optional PMC for manual runs)
 │   ├── 20_download_pubmed_baseline.py      # Download PubMed abstracts (includes gov affiliation)
 │   ├── 21_ingest_pubmed_abstracts.py       # Ingest PubMed to Qdrant
 │   ├── config_ingestion.py                 # Ingestion config
@@ -666,7 +666,7 @@ python scripts/06_ingest_pmc.py --xml-dir /data/ingestion/pmc_xml
 
 # 2. DailyMed Drug Labels
 python scripts/03_download_dailymed.py
-python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
+python scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml --delete-source
 
 # IMPORTANT: Generate drug lookup cache AFTER DailyMed ingestion completes
 # This enables fast O(1) drug name → set_id lookups instead of slow BM25 fallback
@@ -686,8 +686,18 @@ python scripts/21_ingest_pubmed_abstracts.py
 
 **Weekly update behavior (`scripts/08_weekly_update.py`):**
 - Runs DailyMed weekly refresh as `03_download_dailymed.py -> 04_prepare_dailymed_updates.py -> 07_ingest_dailymed.py`.
+- Scheduled cron usage is PubMed + DailyMed only: `python scripts/08_weekly_update.py --skip-pmc`.
+- DailyMed ingestion in weekly flow uses `--delete-source` so successfully ingested XML files are removed after checkpoint update.
 - Regenerates `src/data/drug_setid_lookup.json` automatically via `scripts/generate_drug_lookup.py` after DailyMed ingestion.
 - Re-enables Qdrant HNSW safety guardrail at end of run with `indexing_threshold=10000` and fails the weekly run if this enforcement fails.
+
+**Semiannual PMC schedule (`deploy/hetzner/run_pmc_biannual_update.sh`):**
+- Run at `01:00 America/Chicago` on June 30 and December 30 via cron.
+- Executes:
+  - `01_download_pmc_unified.py --datasets pmc_oa,author_manuscript --release-mode incremental`
+  - `06_ingest_pmc.py --delete-source`
+  - `05_setup_qdrant.py --finalize --indexing-threshold 10000`
+- Backup is chained after success in `deploy/hetzner/cron/medical-rag-update.cron`.
 
 **Monitor Progress:**
 ```bash

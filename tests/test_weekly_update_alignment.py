@@ -38,6 +38,18 @@ class WeeklyUpdateAlignmentTests(unittest.TestCase):
             ],
         )
         self.assertIn("2", run_mock.call_args_list[0].args[0])
+        self.assertIn("--delete-source", run_mock.call_args_list[2].args[0])
+
+    def test_pmc_refresh_downloads_both_datasets_and_deletes_source(self):
+        module = load_weekly_module()
+        with mock.patch.object(module.subprocess, "run") as run_mock:
+            module.run_pmc_refresh()
+
+        pmc_download_cmd = run_mock.call_args_list[0].args[0]
+        pmc_ingest_cmd = run_mock.call_args_list[1].args[0]
+        self.assertIn("--datasets", pmc_download_cmd)
+        self.assertIn("pmc_oa,author_manuscript", pmc_download_cmd)
+        self.assertIn("--delete-source", pmc_ingest_cmd)
 
     def test_dailymed_refresh_fails_when_lookup_generation_fails(self):
         module = load_weekly_module()

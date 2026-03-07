@@ -43,6 +43,9 @@ QDRANT_HNSW_EF=64
 QDRANT_API_KEY=<generate-with-openssl-rand-hex-32>
 
 DEEPINFRA_API_KEY=<deepinfra-key>
+RUNTIME_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
+INGESTION_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B-batch
+EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
 API_AUTH_ENABLED=true
 API_KEYS_FILE=/opt/RAG-pipeline/api_keys.json
 API_MAX_INFLIGHT_REQUESTS=128
@@ -120,6 +123,10 @@ sudo cp deploy/hetzner/cron/qdrant-health.cron /etc/cron.d/qdrant-health
 sudo cp deploy/hetzner/cron/api-health.cron /etc/cron.d/api-health
 sudo chmod 644 /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-health /etc/cron.d/api-health
 ```
+
+`medical-rag-update.cron` includes both:
+- Weekly Saturday 01:00 America/Chicago: `08_weekly_update.py --skip-pmc` + `backup.sh`
+- Semiannual June 30 / December 30 01:00 America/Chicago: `run_pmc_biannual_update.sh` + `backup.sh`
 
 Optional cleanup if legacy backup cron exists:
 
