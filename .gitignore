@@ -4,11 +4,14 @@ api_keys.json
 venv/
 __pycache__/
 *.pyc
+**/__pycache__/
+**/*.py[cod]
 .DS_Store
 *.xml
 
 # macOS metadata
 ._*
+**/._*
 .DS_Store
 
 # Separate projects
@@ -35,4 +38,12 @@ fix_*.py
 
 # Node modules (frontend has its own .gitignore)
 node_modules/
+frontend/.next/
 .claude/
+
+# Runtime cache databases
+data/cache/*.db*
+data/cache_review_tmp*/
+
+# Local SSH keys
+.ssh/

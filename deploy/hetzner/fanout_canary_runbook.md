@@ -60,7 +60,7 @@ python3 scripts/42_qdrant_safe_tune.py \
 ## 4) API-only restart
 
 ```bash
-ssh -i .ssh/id_ed25519 root@65.109.112.253 \
+ssh -i ~/.ssh/id_ed25519 root@65.109.112.253 \
   "cd /opt/RAG-pipeline/deploy/hetzner && docker compose --env-file ../../.env up -d --build --no-deps rag-api-1 rag-api-2 rag-api-3 rag-api-4 rag-gateway"
 ```
 

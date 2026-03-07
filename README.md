@@ -306,8 +306,6 @@ RAG-pipeline/
 │   └── integration/README.md               # Service integration contract + examples
 │
 ├── start_ingestion.sh                      # Interactive ingestion starter
-├── start_remaining_ingestion.sh            # Resume partial ingestion
-├── deploy_production.sh                    # Production deployment
 ├── requirements.txt                        # Python dependencies
 ├── .env                                    # Environment configuration
 └── README.md                               # This file
