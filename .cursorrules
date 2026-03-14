@@ -15,6 +15,15 @@
 - Use `Groq` as the canonical runtime LLM provider for `openai/gpt-oss-20b` generation/query decomposition (unless explicitly overridden by env).
 - Keep Qwen `0.6B` embedding and reranking on `DeepInfra` (`RUNTIME_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B`, `INGESTION_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B-batch`).
 
+# Qdrant Dashboard Access
+- Qdrant ports (`6333`, `6334`) are **NOT published to the Docker host** — `docker ps` shows `6333/tcp` with no host binding.
+- To access the dashboard, tunnel directly to the container's **Docker internal IP** (`172.19.0.3`), not `localhost`:
+  ```
+  ssh -i ~/.ssh/id_ed25519 -N -L 6333:172.19.0.3:6333 root@65.109.112.253 &
+  ```
+  Then open: `http://localhost:6333/dashboard`
+- To close the tunnel: `kill $(lsof -ti:6333)`
+
 # Server Connection & Deployment
 - **SSH Connection**: run `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new root@65.109.112.253` from the workspace directory.
 - **Server App Path**: `/opt/RAG-pipeline`
