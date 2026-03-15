@@ -6,9 +6,6 @@
 #   - Semiannual PMC: June 30 and December 30 at 01:00 -> run_pmc_biannual_update.sh
 #   - backup.sh runs only if the update exits successfully (&&)
 #
-# The separate qdrant-backup.cron is no longer needed and can be removed:
-#   sudo rm /etc/cron.d/qdrant-backup
-#
 # Install / update with:
 #   sudo cp deploy/hetzner/cron/medical-rag-update.cron /etc/cron.d/medical-rag-update
 SHELL=/bin/bash

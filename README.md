@@ -64,6 +64,17 @@ A production-grade **Medical RAG (Retrieval-Augmented Generation) Pipeline** des
 
 This section is the source of truth for integrating product frontend services into the production stack.
 
+### Canonical Handoff Docs (ASCII Map)
+
+Use these two docs as the only handoff sources:
+
+```text
+README.md                      -> Architecture, deployment, ingestion, operations
+deploy/integration/README.md   -> API contract, SSE protocol, frontend integration
+```
+
+The previous draft handoff docs (`API_INFO.md`, `API_INTEGRATION_PLAN.md`) are merged into these canonical sources.
+
 ### 1) Production network model
 
 ```
@@ -819,13 +830,17 @@ curl -X POST http://localhost:8000/api/v1/chat/stream \
 **Response:** Server-Sent Events (SSE)
 
 ```
-data: {"step": "query_expansion", "status": "running"}
-data: {"step": "retrieval", "status": "running", "retrieved_count": 400}
-data: {"step": "reranking", "status": "complete", "sources": [...]}
-data: {"step": "generation", "status": "running", "token": "The latest treatments..."}
-data: {"step": "complete", "status": "success", "answer": "...", "sources": [...]}
+data: {"step":"query_expansion","status":"running","message":"Analyzing query..."}
+data: {"step":"query_expansion","status":"complete","data":{"primary_query":"...","keyword_query":"..."}}
+data: {"step":"retrieval","status":"complete","data":{"count":450}}
+data: {"step":"reranking","status":"complete","data":{"papers":47},"sources":[...],"evidence_hierarchy":{...}}
+data: {"step":"pdf_check","status":"complete","data":{"pdf_count":12},"sources":[...]}
+data: {"step":"generation","status":"running","token":"The latest treatments..."}
+data: {"step":"complete","status":"success","answer":"...","sources":[...],"retrieval_stats":{...}}
 data: [DONE]
 ```
+
+For the full event contract and parsing guidance, see `deploy/integration/README.md`.
 
 ### `POST /api/v1/chat` (Non-streaming)
 

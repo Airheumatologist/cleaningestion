@@ -128,12 +128,6 @@ sudo chmod 644 /etc/cron.d/medical-rag-update /etc/cron.d/qdrant-health /etc/cro
 - Weekly Saturday 01:00 America/Chicago: `08_weekly_update.py --skip-pmc` + `backup.sh`
 - Semiannual June 30 / December 30 01:00 America/Chicago: `run_pmc_biannual_update.sh` + `backup.sh`
 
-Optional cleanup if legacy backup cron exists:
-
-```bash
-sudo rm -f /etc/cron.d/qdrant-backup
-```
-
 ## 10) Firewall baseline
 
 ```bash
