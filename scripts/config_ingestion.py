@@ -32,6 +32,11 @@ class IngestionConfig:
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
     QDRANT_GRPC_URL = os.getenv("QDRANT_GRPC_URL", "localhost:6334")
     COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", os.getenv("COLLECTION_NAME", "rag_pipeline"))
+    VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "lancedb").strip().lower()
+    LANCEDB_URI = os.getenv("LANCEDB_URI", "./medical_data.lancedb")
+    LANCEDB_TABLE = os.getenv("LANCEDB_TABLE", "medical_docs")
+    LANCEDB_REINDEX_INTERVAL_BATCHES = int(os.getenv("LANCEDB_REINDEX_INTERVAL_BATCHES", "50"))
+    INGEST_DRY_RUN = _as_bool(os.getenv("INGEST_DRY_RUN"), default=False)
 
     # Embedding provider: DeepInfra only
     EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "deepinfra")

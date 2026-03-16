@@ -1,0 +1,1432 @@
+{
+  "schema_basis": "lancedb_rows_via_ingestion_sink",
+  "sources": {
+    "dailymed": {
+      "field_count": 57,
+      "fields": {
+        "abstract": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "active_ingredients": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<str>"
+          ]
+        },
+        "article_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "chunk_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "chunk_index": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "content_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "country": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "doc_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "doi": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "drug_name": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_grade": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_level": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "evidence_source": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "evidence_term": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "full_section_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "full_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "has_full_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "has_tables": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "ingestion_timestamp": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "float"
+          ]
+        },
+        "is_author_manuscript": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_open_access": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "is_table": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "journal": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "keywords": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<empty>"
+          ]
+        },
+        "label_type_code": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "label_type_display": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "manufacturer": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "mesh_terms": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<empty>"
+          ]
+        },
+        "nihms_id": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "nlm_unique_id": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "other_ids": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "dict{}"
+          ]
+        },
+        "page_content": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "parent_section_id": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "pii": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "pmcid": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "pmid": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "point_id": {
+          "description": "Original Qdrant point ID",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "publication_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<str>"
+          ]
+        },
+        "section_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_title": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_weight": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "float"
+          ]
+        },
+        "set_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "source": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "source_family": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "sparse_indices": {
+          "description": "BM25 sparse vector indices",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<int>"
+          ]
+        },
+        "sparse_values": {
+          "description": "BM25 sparse vector values",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<float>"
+          ]
+        },
+        "table_caption": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "table_count": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "table_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "table_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "text_preview": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "title": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "token_count": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "total_chunks": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "vector": {
+          "description": "Dense embedding vector (Qwen3 expected dimension)",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<float>"
+          ]
+        },
+        "year": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        }
+      },
+      "sample_payload_count": 3
+    },
+    "pmc_author_manuscript": {
+      "field_count": 42,
+      "fields": {
+        "abstract": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "article_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "chunk_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "chunk_index": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "content_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "country": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "doc_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "doi": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_grade": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_level": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "evidence_source": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_term": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "full_section_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "has_full_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_author_manuscript": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_open_access": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_table": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "journal": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "keywords": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<str>"
+          ]
+        },
+        "license": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "mesh_terms": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<str>"
+          ]
+        },
+        "nihms_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "nlm_unique_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "page_content": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "pmcid": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "pmid": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "point_id": {
+          "description": "Original Qdrant point ID",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "publication_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<str>"
+          ]
+        },
+        "section_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_title": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_weight": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "float"
+          ]
+        },
+        "source": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "source_family": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "sparse_indices": {
+          "description": "BM25 sparse vector indices",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<int>"
+          ]
+        },
+        "sparse_values": {
+          "description": "BM25 sparse vector values",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<float>"
+          ]
+        },
+        "table_caption": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "text_preview": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "title": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "total_chunks": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "vector": {
+          "description": "Dense embedding vector (Qwen3 expected dimension)",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<float>"
+          ]
+        },
+        "year": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        }
+      },
+      "sample_payload_count": 2
+    },
+    "pmc_oa": {
+      "field_count": 42,
+      "fields": {
+        "abstract": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "article_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "chunk_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "chunk_index": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "content_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "country": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "doc_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "doi": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_grade": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_level": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "evidence_source": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_term": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "full_section_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "has_full_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_author_manuscript": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_open_access": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_table": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "journal": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "keywords": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<str>"
+          ]
+        },
+        "license": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "mesh_terms": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<str>"
+          ]
+        },
+        "nihms_id": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "nlm_unique_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "page_content": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "pmcid": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "pmid": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "point_id": {
+          "description": "Original Qdrant point ID",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "publication_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<str>"
+          ]
+        },
+        "section_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_title": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_weight": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "float"
+          ]
+        },
+        "source": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "source_family": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "sparse_indices": {
+          "description": "BM25 sparse vector indices",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<int>"
+          ]
+        },
+        "sparse_values": {
+          "description": "BM25 sparse vector values",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<float>"
+          ]
+        },
+        "table_caption": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "text_preview": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "title": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "total_chunks": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "vector": {
+          "description": "Dense embedding vector (Qwen3 expected dimension)",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<float>"
+          ]
+        },
+        "year": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        }
+      },
+      "sample_payload_count": 2
+    },
+    "pubmed_abstract": {
+      "field_count": 54,
+      "fields": {
+        "abstract": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "abstract_structured": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<dict{label:str,text:str}>",
+            "list<empty>"
+          ]
+        },
+        "article_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "chunk_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "chunk_index": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "content_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "country": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "doc_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "doi": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null",
+            "str"
+          ]
+        },
+        "evidence_grade": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_level": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "evidence_source": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "evidence_term": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "full_section_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "full_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "gov_agencies": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<empty>",
+            "list<str>"
+          ]
+        },
+        "has_full_text": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "has_structured_abstract": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_author_manuscript": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_gov_affiliated": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "bool"
+          ]
+        },
+        "is_open_access": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "journal": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "journal_full": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "dict{abbreviation:str,issn_electronic:str,issn_print:str,issue:str,nlm_unique_id:str,publisher:str,title:str,volume:str}",
+            "dict{}"
+          ]
+        },
+        "keywords": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<empty>",
+            "list<str>"
+          ]
+        },
+        "keywords_full": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<dict{keyword:str,major_yn:str}>",
+            "list<empty>"
+          ]
+        },
+        "mesh_terms": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<empty>",
+            "list<str>"
+          ]
+        },
+        "mesh_terms_full": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<dict{descriptor:str,qualifiers:list<str>}>",
+            "list<empty>"
+          ]
+        },
+        "nihms_id": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "nlm_unique_id": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null",
+            "str"
+          ]
+        },
+        "other_ids": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "dict{mid:str,pmcpid:str}",
+            "dict{}"
+          ]
+        },
+        "page_content": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "parent_section_id": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null"
+          ]
+        },
+        "pii": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null",
+            "str"
+          ]
+        },
+        "pmcid": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "null",
+            "str"
+          ]
+        },
+        "pmid": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "point_id": {
+          "description": "Original Qdrant point ID",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "publication_date": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "dict{day:int,month:int,year:int}",
+            "dict{}"
+          ]
+        },
+        "publication_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<empty>",
+            "list<str>"
+          ]
+        },
+        "publication_types_full": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<dict{type:str,ui:str}>",
+            "list<empty>"
+          ]
+        },
+        "section_id": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_title": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_type": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "section_weight": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "float"
+          ]
+        },
+        "source": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "source_family": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "sparse_indices": {
+          "description": "BM25 sparse vector indices",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<int>"
+          ]
+        },
+        "sparse_values": {
+          "description": "BM25 sparse vector values",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<float>"
+          ]
+        },
+        "table_count": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "text_preview": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "title": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "str"
+          ]
+        },
+        "token_count": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "total_chunks": {
+          "nullable": false,
+          "required": true,
+          "types": [
+            "int"
+          ]
+        },
+        "vector": {
+          "description": "Dense embedding vector (Qwen3 expected dimension)",
+          "nullable": false,
+          "required": true,
+          "types": [
+            "list<float>"
+          ]
+        },
+        "year": {
+          "nullable": true,
+          "required": true,
+          "types": [
+            "int",
+            "null"
+          ]
+        }
+      },
+      "sample_payload_count": 2
+    }
+  },
+  "vector_expectations": {
+    "expected_vector_dim": 1024,
+    "manifest_vector_column": "vector",
+    "runtime_vector_dim": 1024,
+    "validation_status": "ok"
+  }
+}

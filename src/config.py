@@ -192,6 +192,11 @@ RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD = _env_bool(
     "RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD",
     default=False,
 )
+RETRIEVAL_BACKEND = os.getenv("RETRIEVAL_BACKEND", "qdrant").strip().lower()
+RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR = _env_bool("RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR", default=True)
+LANCEDB_URI = os.getenv("LANCEDB_URI", "./medical_data.lancedb")
+LANCEDB_TABLE = os.getenv("LANCEDB_TABLE", "medical_docs")
+RETRIEVAL_PREFILTER = _env_bool("RETRIEVAL_PREFILTER", default=True)
 
 # =============================================================================
 # Reranker Configuration

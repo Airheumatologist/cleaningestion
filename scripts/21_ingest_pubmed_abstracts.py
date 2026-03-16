@@ -60,6 +60,7 @@ from ingestion_utils import (
     append_checkpoint as append_checkpoint_file,
     generate_section_id,
 )
+from lancedb_ingestion_sink import BaseIngestionSink, build_ingestion_sink
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -597,8 +598,15 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     return points, processed_pmids
 
 
-def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, 
-                  sparse_encoder: Optional[Any], validate_chunks: bool = True, dedup_chunks: bool = True) -> int:
+def process_batch(
+    client: QdrantClient,
+    batch: List[Dict[str, Any]],
+    embedding_provider: EmbeddingProvider,
+    sparse_encoder: Optional[Any],
+    validate_chunks: bool = True,
+    dedup_chunks: bool = True,
+    sink: Optional[BaseIngestionSink] = None,
+) -> int:
     """Process a single batch in a worker thread."""
     if not batch:
         return 0
@@ -607,7 +615,10 @@ def process_batch(client: QdrantClient, batch: List[Dict[str, Any]], embedding_p
         points, ids = build_points(batch, embedding_provider, sparse_encoder, 
                                    validate_chunks=validate_chunks, dedup_chunks=dedup_chunks)
         if points:
-            upsert_with_retry(client, points)
+            if sink is not None:
+                sink.write_points(points)
+            else:
+                upsert_with_retry(client, points)
             # Convert plain PMIDs to namespaced checkpoint IDs
             checkpoint_ids = [_checkpoint_id(pmid) for pmid in ids]
             append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
@@ -640,20 +651,26 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
     except Exception as e:
         logger.warning(f"Shared chunker preload warning: {e}")
     
-    client = QdrantClient(
-        url=IngestionConfig.QDRANT_URL,
-        api_key=IngestionConfig.QDRANT_API_KEY or None,
-        timeout=600,
-        prefer_grpc=IngestionConfig.USE_GRPC,
-    )
+    backend = IngestionConfig.VECTOR_BACKEND.strip().lower()
+    client = None
+    if backend == "qdrant":
+        client = QdrantClient(
+            url=IngestionConfig.QDRANT_URL,
+            api_key=IngestionConfig.QDRANT_API_KEY or None,
+            timeout=600,
+            prefer_grpc=IngestionConfig.USE_GRPC,
+        )
 
-    try:
-        info = client.get_collection(IngestionConfig.COLLECTION_NAME)
-        logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
-        validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
-    except Exception as e:
-         logger.error("Failed to connect to collection: %s", e)
-         return
+        try:
+            info = client.get_collection(IngestionConfig.COLLECTION_NAME)
+            logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
+            validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
+        except Exception as e:
+            logger.error("Failed to connect to collection: %s", e)
+            return
+
+    sink = build_ingestion_sink(client=client)
+    logger.info("PubMed ingestion sink backend=%s dry_run=%s", backend, IngestionConfig.INGEST_DRY_RUN)
 
     # Initialize Sparse Encoder if enabled
     sparse_encoder = None
@@ -729,8 +746,16 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                             total_chunks += 1
                     
                     # Submit job
-                    future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder,
-                                            validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
+                    future = executor.submit(
+                        process_batch,
+                        client,
+                        list(current_batch),
+                        embedding_provider,
+                        sparse_encoder,
+                        validate_chunks=ENHANCED_UTILS_AVAILABLE,
+                        dedup_chunks=ENHANCED_UTILS_AVAILABLE,
+                        sink=sink,
+                    )
                     futures.append(future)
                     current_batch.clear()
                     
@@ -756,8 +781,16 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
 
         # Submit remaining
         if current_batch:
-            future = executor.submit(process_batch, client, list(current_batch), embedding_provider, sparse_encoder,
-                                    validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
+            future = executor.submit(
+                process_batch,
+                client,
+                list(current_batch),
+                embedding_provider,
+                sparse_encoder,
+                validate_chunks=ENHANCED_UTILS_AVAILABLE,
+                dedup_chunks=ENHANCED_UTILS_AVAILABLE,
+                sink=sink,
+            )
             futures.append(future)
             
         # Wait for all remaining

@@ -35,6 +35,7 @@ try:
         append_checkpoint as append_checkpoint_file,
     )
     from ingestion_utils import Chunker as BaseChunker
+    from lancedb_ingestion_sink import BaseIngestionSink, build_ingestion_sink
     
     # Import enhanced utilities for semantic chunking and validation
     try:
@@ -758,6 +759,7 @@ def process_batch(
     chunker: Any,
     refresh: bool = False,
     delete_source: bool = False,
+    sink: Optional[BaseIngestionSink] = None,
 ) -> Tuple[int, int]:
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
@@ -828,7 +830,10 @@ def process_batch(
                                         validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
         
         if points:
-            upsert_with_retry(client, points)
+            if sink is not None:
+                sink.write_points(points)
+            else:
+                upsert_with_retry(client, points)
             
             # Update checkpoints
             # new_ids are already namespaced via _checkpoint_id() above
@@ -887,20 +892,26 @@ def run_ingestion(
         logger.warning("No XML files found in %s", xml_dir)
         return
 
-    client = QdrantClient(
-        url=IngestionConfig.QDRANT_URL,
-        api_key=IngestionConfig.QDRANT_API_KEY or None,
-        timeout=600,
-        prefer_grpc=IngestionConfig.USE_GRPC,
-    )
+    backend = IngestionConfig.VECTOR_BACKEND.strip().lower()
+    client = None
+    if backend == "qdrant":
+        client = QdrantClient(
+            url=IngestionConfig.QDRANT_URL,
+            api_key=IngestionConfig.QDRANT_API_KEY or None,
+            timeout=600,
+            prefer_grpc=IngestionConfig.USE_GRPC,
+        )
 
-    try:
-        info = client.get_collection(IngestionConfig.COLLECTION_NAME)
-        logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
-        validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
-    except Exception as e:
-         logger.error("Failed to connect to collection: %s", e)
-         return
+        try:
+            info = client.get_collection(IngestionConfig.COLLECTION_NAME)
+            logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
+            validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
+        except Exception as e:
+            logger.error("Failed to connect to collection: %s", e)
+            return
+
+    sink = build_ingestion_sink(client=client)
+    logger.info("DailyMed ingestion sink backend=%s dry_run=%s", backend, IngestionConfig.INGEST_DRY_RUN)
 
     processed_ids = load_checkpoint_namespaced(CHECKPOINT_FILE)
     processed_lock = threading.Lock()
@@ -955,6 +966,7 @@ def run_ingestion(
                     chunker,
                     refresh,
                     delete_source,
+                    sink,
                 ): batch
                 for batch in current_super_batch
             }

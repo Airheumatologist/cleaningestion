@@ -29,6 +29,7 @@ from ingestion_utils import (
     append_checkpoint as append_checkpoint_file,
 )
 from ingestion_utils import Chunker as BaseChunker  # Fallback
+from lancedb_ingestion_sink import BaseIngestionSink, build_ingestion_sink
 
 # Initialize logging FIRST before any imports that might use logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -588,6 +589,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
             "publication_type": chunk.get("publication_type", []),
             "has_full_text": chunk.get("has_full_text", True),
             "is_open_access": chunk.get("is_open_access"),
+            "license": chunk.get("license", "unknown"),
             
             # Chunking metadata for cross-source consistency
             "chunk_index": chunk.get("chunk_index", 0),
@@ -625,6 +627,7 @@ def process_batch(
     xml_root: Path,
     sparse_encoder=None,
     delete_source: bool = False,
+    sink: Optional[BaseIngestionSink] = None,
 ) -> tuple[int, int]:
     """Process a batch of XML files in a single thread."""
     from ingestion_utils import parse_pmc_xml
@@ -685,9 +688,12 @@ def process_batch(
     if not points:
         return 0, len(batch_files)
 
-    # 3. Upsert to Qdrant
+    # 3. Write to selected vector sink
     try:
-        upsert_with_retry(client, points)
+        if sink is not None:
+            sink.write_points(points)
+        else:
+            upsert_with_retry(client, points)
         
         # 4. Update checkpoint
         checkpoint_ids = list(dict.fromkeys(new_ids))
@@ -729,21 +735,27 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
     except Exception as e:
         logger.warning("Shared chunker preload warning: %s", e)
     
-    # Qdrant client is thread-safe (connection pooling)
-    client = QdrantClient(
-        url=IngestionConfig.QDRANT_URL,
-        api_key=IngestionConfig.QDRANT_API_KEY or None,
-        timeout=600,
-        prefer_grpc=IngestionConfig.USE_GRPC,
-    )
+    backend = IngestionConfig.VECTOR_BACKEND.strip().lower()
+    client = None
+    if backend == "qdrant":
+        # Qdrant client is thread-safe (connection pooling)
+        client = QdrantClient(
+            url=IngestionConfig.QDRANT_URL,
+            api_key=IngestionConfig.QDRANT_API_KEY or None,
+            timeout=600,
+            prefer_grpc=IngestionConfig.USE_GRPC,
+        )
 
-    try:
-        info = client.get_collection(IngestionConfig.COLLECTION_NAME)
-        logger.info("Connected to %s (points=%s)", IngestionConfig.COLLECTION_NAME, info.points_count)
-        validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
-    except Exception as e:
-        logger.error("Failed Qdrant schema preflight for %s: %s", IngestionConfig.COLLECTION_NAME, e)
-        return
+        try:
+            info = client.get_collection(IngestionConfig.COLLECTION_NAME)
+            logger.info("Connected to %s (points=%s)", IngestionConfig.COLLECTION_NAME, info.points_count)
+            validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
+        except Exception as e:
+            logger.error("Failed Qdrant schema preflight for %s: %s", IngestionConfig.COLLECTION_NAME, e)
+            return
+
+    sink = build_ingestion_sink(client=client)
+    logger.info("PMC ingestion sink backend=%s dry_run=%s", backend, IngestionConfig.INGEST_DRY_RUN)
 
     processed_ids = load_checkpoint()
     processed_lock = threading.Lock()
@@ -801,6 +813,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
                     xml_dir,
                     sparse_encoder,
                     delete_source,
+                    sink,
                 ): batch
                 for batch in current_super_batch
             }

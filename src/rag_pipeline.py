@@ -51,7 +51,7 @@ from .config import (
     RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD,
 )
 from .query_preprocessor import QueryPreprocessor, LLMProcessedQuery
-from .retriever_qdrant import QdrantRetriever
+from .retriever_factory import create_retriever
 from .reranker import PaperFinderWithReranker
 from .prompts import ELIXIR_SYSTEM_PROMPT
 from .query_cache import QueryCache
@@ -140,7 +140,7 @@ class MedicalRAGPipeline:
         
         # Components
         self.preprocessor = QueryPreprocessor(model=model)
-        self.retriever = QdrantRetriever(n_retrieval=n_retrieval)
+        self.retriever = create_retriever(n_retrieval=n_retrieval)
 
         # Reuse the entity expander already initialized inside QueryPreprocessor
         self.entity_expander = self.preprocessor._entity_expander
