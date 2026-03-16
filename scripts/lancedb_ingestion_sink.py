@@ -5,19 +5,82 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import random
 import shlex
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
 import lancedb
+import pyarrow as pa
 
 from config_ingestion import IngestionConfig
 from ingestion_utils import upsert_with_retry
 
 logger = logging.getLogger(__name__)
+
+def _lancedb_arrow_schema() -> pa.Schema:
+    vector_dim = IngestionConfig.get_vector_size()
+    return pa.schema(
+        [
+        pa.field("point_id", pa.string()),
+        pa.field("vector", pa.list_(pa.float64(), vector_dim)),
+        pa.field("sparse_indices", pa.list_(pa.int64())),
+        pa.field("sparse_values", pa.list_(pa.float64())),
+        pa.field("doc_id", pa.string()),
+        pa.field("chunk_id", pa.string()),
+        pa.field("pmcid", pa.string()),
+        pa.field("pmid", pa.string()),
+        pa.field("doi", pa.string()),
+        pa.field("page_content", pa.string()),
+        pa.field("title", pa.string()),
+        pa.field("abstract", pa.string()),
+        pa.field("journal", pa.string()),
+        pa.field("nlm_unique_id", pa.string()),
+        pa.field("year", pa.int64()),
+        pa.field("country", pa.string()),
+        pa.field("keywords", pa.list_(pa.string())),
+        pa.field("mesh_terms", pa.list_(pa.string())),
+        pa.field("evidence_grade", pa.string()),
+        pa.field("evidence_level", pa.int64()),
+        pa.field("evidence_term", pa.string()),
+        pa.field("evidence_source", pa.string()),
+        pa.field("section_type", pa.string()),
+        pa.field("section_title", pa.string()),
+        pa.field("is_table", pa.bool_()),
+        pa.field("table_caption", pa.string()),
+        pa.field("full_section_text", pa.string()),
+        pa.field("section_id", pa.string()),
+        pa.field("section_weight", pa.float64()),
+        pa.field("source", pa.string()),
+        pa.field("source_family", pa.string()),
+        pa.field("content_type", pa.string()),
+        pa.field("is_author_manuscript", pa.bool_()),
+        pa.field("nihms_id", pa.string()),
+        pa.field("article_type", pa.string()),
+        pa.field("publication_type", pa.list_(pa.string())),
+        pa.field("has_full_text", pa.bool_()),
+        pa.field("is_open_access", pa.bool_()),
+        pa.field("license", pa.string()),
+        pa.field("chunk_index", pa.int64()),
+        pa.field("total_chunks", pa.int64()),
+        pa.field("text_preview", pa.string()),
+        ]
+    )
+
+
+def _connect_lancedb(uri: str):
+    connect_kwargs: dict[str, Any] = {}
+    if uri.startswith("db://"):
+        if IngestionConfig.LANCEDB_API_KEY:
+            connect_kwargs["api_key"] = IngestionConfig.LANCEDB_API_KEY
+        if IngestionConfig.LANCEDB_REGION:
+            connect_kwargs["region"] = IngestionConfig.LANCEDB_REGION
+    return lancedb.connect(uri, **connect_kwargs)
 
 
 def _extract_dense_vector(vector_data: Any) -> list[float]:
@@ -41,6 +104,82 @@ def _extract_sparse(vector_data: Any) -> tuple[list[int], list[float]]:
     return list(indices), list(values)
 
 
+def _normalize_lancedb_row_types(row: dict[str, Any]) -> dict[str, Any]:
+    vector_dim = IngestionConfig.get_vector_size()
+    string_fields = {
+        "point_id",
+        "doc_id",
+        "chunk_id",
+        "pmcid",
+        "pmid",
+        "doi",
+        "page_content",
+        "title",
+        "abstract",
+        "journal",
+        "nlm_unique_id",
+        "country",
+        "evidence_grade",
+        "evidence_term",
+        "evidence_source",
+        "section_type",
+        "section_title",
+        "table_caption",
+        "full_section_text",
+        "section_id",
+        "source",
+        "source_family",
+        "content_type",
+        "nihms_id",
+        "article_type",
+        "license",
+        "text_preview",
+    }
+    int_fields = {"year", "evidence_level", "chunk_index", "total_chunks"}
+    float_fields = {"section_weight"}
+    bool_fields = {"is_table", "is_author_manuscript", "has_full_text", "is_open_access"}
+    list_fields = {"keywords", "mesh_terms", "publication_type", "sparse_indices", "sparse_values"}
+
+    for field in string_fields:
+        value = row.get(field)
+        row[field] = "" if value is None else str(value)
+
+    for field in int_fields:
+        value = row.get(field)
+        if value is None or value == "":
+            row[field] = 0
+        else:
+            try:
+                row[field] = int(value)
+            except (TypeError, ValueError):
+                row[field] = 0
+
+    for field in float_fields:
+        value = row.get(field)
+        if value is None or value == "":
+            row[field] = 0.0
+        else:
+            try:
+                row[field] = float(value)
+            except (TypeError, ValueError):
+                row[field] = 0.0
+
+    for field in bool_fields:
+        row[field] = bool(row.get(field, False))
+
+    for field in list_fields:
+        value = row.get(field)
+        row[field] = value if isinstance(value, list) else []
+
+    vector_value = row.get("vector")
+    if isinstance(vector_value, list) and len(vector_value) == vector_dim:
+        row["vector"] = [float(v) for v in vector_value]
+    else:
+        row["vector"] = [0.0] * vector_dim
+
+    return row
+
+
 def points_to_lancedb_rows(points: Iterable[Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for point in points:
@@ -54,7 +193,7 @@ def points_to_lancedb_rows(points: Iterable[Any]) -> list[dict[str, Any]]:
             "sparse_values": sparse_values,
         }
         row.update(payload)
-        rows.append(row)
+        rows.append(_normalize_lancedb_row_types(row))
     return rows
 
 
@@ -115,8 +254,12 @@ class LanceDBIngestionSink(BaseIngestionSink):
         self.manifest_path = manifest_path or (
             Path(__file__).resolve().parent.parent / "schema" / "lancedb_index_profiles.json"
         )
+        self.write_batch_rows = max(1, int(os.getenv("LANCEDB_WRITE_BATCH_ROWS", "2000")))
+        self.min_write_batch_rows = max(200, int(os.getenv("LANCEDB_MIN_WRITE_BATCH_ROWS", "500")))
+        self._adaptive_batch_rows = self.write_batch_rows
+        self._clean_write_streak = 0
         self._lock = threading.Lock()
-        self._db = lancedb.connect(uri)
+        self._db = _connect_lancedb(uri)
         self._table = None
         self.stats = IngestionSinkStats()
 
@@ -136,7 +279,13 @@ class LanceDBIngestionSink(BaseIngestionSink):
         if not rows:
             raise RuntimeError("Cannot create LanceDB table without rows")
 
-        self._table = self._db.create_table(self.table_name, data=rows, mode="create")
+        table = pa.Table.from_pylist(rows, schema=_lancedb_arrow_schema())
+        self._table = self._db.create_table(
+            self.table_name,
+            data=table.to_batches(max_chunksize=self.write_batch_rows),
+            schema=table.schema,
+            mode="create",
+        )
         return True
 
     def _maybe_reindex(self) -> None:
@@ -168,6 +317,52 @@ class LanceDBIngestionSink(BaseIngestionSink):
         except json.JSONDecodeError:
             logger.info("LanceDB reindex completed")
 
+    def _add_rows_with_retry(self, rows: list[dict[str, Any]]) -> None:
+        table = pa.Table.from_pylist(rows, schema=_lancedb_arrow_schema())
+        attempts = max(1, int(IngestionConfig.MAX_RETRIES))
+        current_batch_rows = max(self.min_write_batch_rows, self._adaptive_batch_rows)
+        for attempt in range(1, attempts + 1):
+            try:
+                self._table.add(table.to_batches(max_chunksize=current_batch_rows))
+                self._clean_write_streak += 1
+                if self._clean_write_streak >= 3:
+                    self._adaptive_batch_rows = min(
+                        self.write_batch_rows,
+                        int(max(self._adaptive_batch_rows, current_batch_rows) * 1.25),
+                    )
+                    self._clean_write_streak = 0
+                return
+            except Exception as exc:
+                self._clean_write_streak = 0
+                if attempt >= attempts:
+                    raise
+                # Adaptive downshift on first failure to reduce payload pressure.
+                current_batch_rows = max(self.min_write_batch_rows, current_batch_rows // 2)
+                self._adaptive_batch_rows = current_batch_rows
+                if attempt >= 2:
+                    self._reconnect_table()
+
+                base_wait = min(4.0, 1.0 * (2 ** (attempt - 1)))
+                jitter = random.uniform(0.0, max(0.1, base_wait * 0.35))
+                wait_seconds = base_wait + jitter
+                logger.warning(
+                    "LanceDB add retry %s/%s (batch_rows=%s wait=%.2fs) after error: %s",
+                    attempt,
+                    attempts,
+                    current_batch_rows,
+                    wait_seconds,
+                    str(exc)[:300],
+                )
+                time.sleep(wait_seconds)
+
+    def _reconnect_table(self) -> None:
+        try:
+            self._db = _connect_lancedb(self.uri)
+            self._table = self._db.open_table(self.table_name)
+            logger.info("Reconnected LanceDB table handle for %s", self.table_name)
+        except Exception as exc:
+            logger.warning("LanceDB reconnect attempt failed: %s", str(exc)[:200])
+
     def write_points(self, points: Iterable[Any]) -> int:
         point_list = list(points)
         if not point_list:
@@ -180,7 +375,7 @@ class LanceDBIngestionSink(BaseIngestionSink):
         with self._lock:
             created_with_rows = self._ensure_table(rows)
             if not created_with_rows:
-                self._table.add(rows)
+                self._add_rows_with_retry(rows)
             self.stats.rows_written += len(rows)
             self.stats.batches_written += 1
             self._maybe_reindex()

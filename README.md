@@ -336,6 +336,28 @@ python3 scripts/07_ingest_dailymed.py --xml-dir /data/ingestion/dailymed/xml
 python3 scripts/21_ingest_pubmed_abstracts.py --input /data/ingestion/pubmed_baseline/filtered/pubmed_abstracts.jsonl
 ```
 
+Direct PMC S3 ingest (no local XML staging):
+
+```bash
+# Optional: cloud connectivity + Arrow batch smoke write
+python3 scripts/lancedb_cloud_pyarrow_smoke.py --uri "$LANCEDB_URI" --table my_table3
+
+# Precreate target table with first valid PMC row
+python3 scripts/06_ingest_pmc_s3.py \
+  --datasets pmc_oa,author_manuscript \
+  --release-mode all \
+  --max-files 50 \
+  --workers 4 \
+  --precreate-only
+
+# Run direct S3 test ingestion
+python3 scripts/06_ingest_pmc_s3.py \
+  --datasets pmc_oa,author_manuscript \
+  --release-mode all \
+  --max-files 50 \
+  --workers 4
+```
+
 Build/validate LanceDB indexes:
 
 ```bash

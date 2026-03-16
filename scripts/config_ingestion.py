@@ -35,6 +35,8 @@ class IngestionConfig:
     VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "lancedb").strip().lower()
     LANCEDB_URI = os.getenv("LANCEDB_URI", "./medical_data.lancedb")
     LANCEDB_TABLE = os.getenv("LANCEDB_TABLE", "medical_docs")
+    LANCEDB_API_KEY = os.getenv("LANCEDB_API_KEY", "")
+    LANCEDB_REGION = os.getenv("LANCEDB_REGION", "")
     LANCEDB_REINDEX_INTERVAL_BATCHES = int(os.getenv("LANCEDB_REINDEX_INTERVAL_BATCHES", "50"))
     INGEST_DRY_RUN = _as_bool(os.getenv("INGEST_DRY_RUN"), default=False)
 

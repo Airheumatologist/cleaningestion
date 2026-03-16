@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -84,7 +85,15 @@ def _ensure_version() -> str:
 
 
 def _connect_and_table(uri: str, table_name: str):
-    db = lancedb.connect(uri)
+    connect_kwargs: dict[str, Any] = {}
+    if uri.startswith("db://"):
+        api_key = os.getenv("LANCEDB_API_KEY", "").strip()
+        region = os.getenv("LANCEDB_REGION", "").strip()
+        if api_key:
+            connect_kwargs["api_key"] = api_key
+        if region:
+            connect_kwargs["region"] = region
+    db = lancedb.connect(uri, **connect_kwargs)
     table = db.open_table(table_name)
     return db, table
 
@@ -141,7 +150,20 @@ def _build_indexes(table: Any, manifest: dict[str, Any], profile_name: str) -> d
         "replace": True,
         **{k: v for k, v in dense_profile.items() if v is not None},
     }
-    table.create_index(**create_kwargs)
+    # Remote tables can lag local SDK kwargs support (e.g. sample_rate).
+    while True:
+        try:
+            table.create_index(**create_kwargs)
+            break
+        except TypeError as exc:
+            message = str(exc)
+            marker = "unexpected keyword argument '"
+            if marker not in message:
+                raise
+            unsupported = message.split(marker, 1)[1].split("'", 1)[0]
+            if unsupported not in create_kwargs:
+                raise
+            create_kwargs.pop(unsupported, None)
     index_names = _wait_for_indices(table)
 
     return {

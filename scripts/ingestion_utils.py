@@ -9,7 +9,7 @@ import re
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 
 import lxml.etree as ET
@@ -91,6 +91,22 @@ class EmbeddingProvider:
         self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
         self.model = IngestionConfig.EMBEDDING_MODEL
         self.openai_client = None
+        self._rate_limiter: Optional[_RequestRateLimiter] = None
+        self._request_log_lock = threading.Lock()
+        self._request_timestamps: deque[float] = deque()
+        self._rate_log_enabled = os.getenv("EMBEDDING_RATE_LOG_ENABLED", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._rate_log_window_seconds = max(
+            1.0, float(os.getenv("EMBEDDING_RATE_LOG_WINDOW_SECONDS", "10"))
+        )
+        self._rate_log_every_seconds = max(
+            1.0, float(os.getenv("EMBEDDING_RATE_LOG_EVERY_SECONDS", "10"))
+        )
+        self._next_rate_log_at = time.monotonic() + self._rate_log_every_seconds
 
         if self.provider != "deepinfra":
             raise ValueError(
@@ -108,6 +124,13 @@ class EmbeddingProvider:
             api_key=api_key,
             base_url=deepinfra_base_url
         )
+        max_requests_per_sec = int(os.getenv("EMBEDDING_MAX_REQUESTS_PER_SEC", "0") or "0")
+        if max_requests_per_sec > 0:
+            self._rate_limiter = _RequestRateLimiter(max_requests_per_sec=max_requests_per_sec)
+            logger.info(
+                "Embedding request limiter enabled: max %s req/sec",
+                max_requests_per_sec,
+            )
         logger.info("✅ DeepInfra embedding provider initialized (model: %s)", self.model)
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
@@ -132,6 +155,7 @@ class EmbeddingProvider:
     def _embed_deepinfra_single(self, texts: List[str]) -> List[List[float]]:
         """Send a single embedding request to DeepInfra."""
         try:
+            self._before_embedding_request()
             response = self.openai_client.embeddings.create(
                 model=self.model,
                 input=texts,
@@ -141,6 +165,60 @@ class EmbeddingProvider:
         except Exception as e:
             logger.error("DeepInfra embedding failed: %s", e)
             raise
+
+    def _before_embedding_request(self) -> None:
+        if self._rate_limiter is not None:
+            self._rate_limiter.acquire()
+        self._record_request_for_telemetry()
+
+    def _record_request_for_telemetry(self) -> None:
+        if not self._rate_log_enabled:
+            return
+
+        now = time.monotonic()
+        with self._request_log_lock:
+            self._request_timestamps.append(now)
+            cutoff = now - self._rate_log_window_seconds
+            while self._request_timestamps and self._request_timestamps[0] < cutoff:
+                self._request_timestamps.popleft()
+
+            if now < self._next_rate_log_at:
+                return
+
+            window_count = len(self._request_timestamps)
+            rate = window_count / self._rate_log_window_seconds
+            logger.info(
+                "Embedding request rate: %.2f req/sec over last %.0fs",
+                rate,
+                self._rate_log_window_seconds,
+            )
+            self._next_rate_log_at = now + self._rate_log_every_seconds
+
+
+class _RequestRateLimiter:
+    """Thread-safe request-rate limiter for outbound embedding API calls."""
+
+    def __init__(self, max_requests_per_sec: int):
+        self.max_requests_per_sec = max(1, int(max_requests_per_sec))
+        self._lock = threading.Lock()
+        self._recent_requests: deque[float] = deque()
+
+    def acquire(self) -> None:
+        while True:
+            now = time.monotonic()
+            with self._lock:
+                cutoff = now - 1.0
+                while self._recent_requests and self._recent_requests[0] <= cutoff:
+                    self._recent_requests.popleft()
+
+                if len(self._recent_requests) < self.max_requests_per_sec:
+                    self._recent_requests.append(now)
+                    return
+
+                earliest = self._recent_requests[0]
+                sleep_seconds = max(0.001, (earliest + 1.0) - now)
+
+            time.sleep(min(sleep_seconds, 0.05))
 
 
 # Evidence hierarchy for article types
@@ -532,21 +610,217 @@ def classify_evidence_grade(article_type: str, pub_types: List[str]) -> tuple:
     result = classify_evidence_metadata(article_type=article_type, pub_types=pub_types, abstract=None)
     return result["grade"], result["level_1_4"]
 
-def parse_pmc_xml(
-    xml_path: Path, 
-    require_pmid: bool = True, 
+def _base_name_from_archive_name(name: str, lowered: str, fallback_stem: str) -> str:
+    if lowered.endswith(".xml.gz"):
+        return name[: -len(".xml.gz")]
+    if lowered.endswith(".nxml.gz"):
+        return name[: -len(".nxml.gz")]
+    if lowered.endswith(".xml"):
+        return name[: -len(".xml")]
+    if lowered.endswith(".nxml"):
+        return name[: -len(".nxml")]
+    return fallback_stem
+
+
+def _parse_pmc_xml_root(
+    root: ET.Element,
+    source_label: str,
+    pmcid_from_file: str,
+    require_pmid: bool = True,
     require_open_access: bool = True,
-    require_commercial_license: bool = False
+    require_commercial_license: bool = False,
+) -> Optional[Dict[str, Any]]:
+    # Get article and article-meta elements
+    # Handle both cases: root IS the article, or article is nested
+    if root.tag == "article" or root.tag.endswith("}article"):
+        article_elem = root
+    else:
+        article_elem = root.find(".//article")
+    if article_elem is None:
+        logger.debug("No article element found in %s", source_label)
+        return None
+
+    article_meta = article_elem.find("front/article-meta")
+    if article_meta is None:
+        logger.debug("No article-meta found in %s", source_label)
+        return None
+
+    # === 1. Document Metadata (PRD Section 1.1) ===
+    article_type = _extract_article_type(root)
+    language = _extract_language(root)
+    identifiers = _extract_identifiers(article_meta)
+
+    # Hard Fail: PMID must exist
+    if require_pmid and not identifiers.get("pmid"):
+        logger.debug("Skipping %s: No PMID found", source_label)
+        return None
+
+    # Use PMCID from filename/url if not in XML
+    if not identifiers.get("pmcid"):
+        identifiers["pmcid"] = pmcid_from_file
+
+    # === 2. Publication Metadata (PRD Section 1.2) ===
+    pub_date, year = _extract_publication_date(article_meta)
+    journal_info = _extract_journal_info(root)
+    country_code, country_name = _extract_country(root)
+
+    # === 3. Content Structure (PRD Section 1.3) ===
+    article_title = _extract_article_title(article_meta)
+    if not article_title:
+        logger.debug("Skipping %s: No article title", source_label)
+        return None
+
+    # Check for body and determine has_full_text
+    body_elem = article_elem.find("body")
+    has_full_text = False
+    body_text = ""
+    if body_elem is not None:
+        body_text = get_text(body_elem).strip()
+        has_full_text = len(body_text) > 100
+
+    # Open Access and Commercial License Check (PRD Section 1.3)
+    is_open_access = _extract_open_access(article_meta)
+    license_type = _extract_license_type(article_meta)
+
+    if require_open_access and not is_open_access:
+        logger.info("Skipping %s: Not open access", source_label)
+        return None
+
+    if require_commercial_license and not _is_commercial_license(license_type):
+        logger.info("Skipping %s: Non-commercial license (%s)", source_label, license_type)
+        return None
+
+    # === 4. Controlled Vocabulary (PRD Section 1.4) ===
+    mesh_terms, keywords = _extract_keywords(article_meta)
+
+    # === 5. Full Text Sections (PRD Section 1.5) ===
+    sections = _extract_full_text_sections(body_elem)
+
+    # Update has_full_text based on sections
+    if sections:
+        has_full_text = True
+
+    # === 6. Tables (PRD Section 1.6) ===
+    tables = _extract_tables(article_elem)
+    tables_in_floats = sum(1 for t in tables if t.get("location") == "floating")
+
+    # === 7. Evidence Grade (existing functionality) ===
+    pub_types = [get_text(s) for s in root.xpath(".//article-categories//subject")]
+    abstract_text = _extract_abstract(article_meta)
+    evidence = classify_evidence_metadata(
+        article_type=article_type,
+        pub_types=pub_types,
+        abstract=abstract_text,
+    )
+    evidence_grade = evidence["grade"]
+    evidence_level = evidence["level_1_4"]
+    evidence_term = evidence["matched_term"]
+    evidence_source = evidence["matched_from"]
+
+    # === Build Output Structure per PRD Section 3 ===
+    output = {
+        # Document ID for indexing
+        "document_id": (
+            f"pmid_{identifiers['pmid']}"
+            if identifiers.get("pmid")
+            else f"pmcid_{identifiers['pmcid']}"
+        ),
+        "metadata": {
+            "article_type": article_type,
+            "language": language,
+            "identifiers": {
+                "pmid": identifiers.get("pmid"),
+                "doi": identifiers.get("doi"),
+                "pmcid": identifiers.get("pmcid"),
+                "publisher_id": identifiers.get("publisher_id"),
+                "nihms_id": identifiers.get("nihms_id"),
+            },
+            "publication": {
+                "date": pub_date,
+                "year": year,
+                "journal": {
+                    "title": journal_info["title"],
+                    "abbreviation": journal_info["abbreviation"],
+                    "publisher": journal_info["publisher"],
+                    "issn": journal_info["issn_electronic"],
+                    "nlm_unique_id": journal_info["nlm_unique_id"],
+                },
+                "country": country_code,
+                "country_name": country_name,
+            },
+            "content_flags": {
+                "has_full_text": has_full_text,
+                "is_open_access": is_open_access,
+            },
+            "classification": {
+                "mesh_terms": mesh_terms,
+                "keywords": keywords,
+            },
+        },
+        "content": {
+            "title": article_title,
+            "sections": sections,
+            "tables": tables,
+        },
+        "extraction_metadata": {
+            "schema_version": "1.0",
+            "processing_date": datetime.utcnow().strftime("%Y-%m-%d"),
+            "empty_body_detected": not has_full_text,
+            "tables_in_floats_group": tables_in_floats,
+        },
+        # Legacy fields for backward compatibility
+        "pmcid": identifiers.get("pmcid"),
+        "pmid": identifiers.get("pmid"),
+        "doi": identifiers.get("doi"),
+        "nihms_id": identifiers.get("nihms_id"),
+        "title": article_title,
+        "abstract": abstract_text,
+        "full_text": body_text if has_full_text else "",
+        "structured_sections": sections,  # Renamed for clarity
+        "section_titles": [s["title"] for s in sections],
+        "tables": [
+            {
+                "id": t["id"],
+                "caption": f"{t['label']}: {t['caption_title']}".strip(": "),
+                "markdown": t["content"],
+                "row_by_row": t["content"],  # Same for now
+                "is_image_only": False,
+            }
+            for t in tables
+        ],
+        "year": year,
+        "journal": journal_info["title"],
+        "keywords": keywords,
+        "mesh_terms": mesh_terms,
+        "country": country_code or country_name,
+        "evidence_grade": evidence_grade,
+        "evidence_level": evidence_level,
+        "evidence_term": evidence_term,
+        "evidence_source": evidence_source,
+        "article_type": article_type,
+        "publication_type_list": pub_types,
+        "is_open_access": is_open_access,
+        "has_full_text": has_full_text,
+        "license": license_type,
+    }
+    return output
+
+
+def parse_pmc_xml(
+    xml_path: Path,
+    require_pmid: bool = True,
+    require_open_access: bool = True,
+    require_commercial_license: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Parse PMC XML using lxml with PRD v1.0 compliant extraction.
-    
+
     Args:
         xml_path: Path to the XML file
         require_pmid: If True, skip articles without PMID (PRD Hard Fail rule)
         require_open_access: If True, skip non-open-access articles
         require_commercial_license: If True, skip non-commercial licenses (CC-BY-NC, etc.)
-    
+
     Returns:
         Article dict following PRD JSON structure, or None if invalid/skipped.
     """
@@ -554,205 +828,60 @@ def parse_pmc_xml(
         xml_path = Path(xml_path)  # Accept both str and Path
         file_name = xml_path.name
         lowered_name = file_name.lower()
-
-        def _base_name_from_archive(name: str, lowered: str) -> str:
-            if lowered.endswith(".xml.gz"):
-                return name[: -len(".xml.gz")]
-            if lowered.endswith(".nxml.gz"):
-                return name[: -len(".nxml.gz")]
-            if lowered.endswith(".xml"):
-                return name[: -len(".xml")]
-            if lowered.endswith(".nxml"):
-                return name[: -len(".nxml")]
-            return xml_path.stem
+        pmcid_from_file = _base_name_from_archive_name(file_name, lowered_name, xml_path.stem)
 
         # Parse XML
         if lowered_name.endswith(".gz"):
             with gzip.open(xml_path, "rb") as f:
                 root = ET.fromstring(f.read())
-            pmcid_from_file = _base_name_from_archive(file_name, lowered_name)
         else:
             root = ET.parse(str(xml_path)).getroot()
-            pmcid_from_file = _base_name_from_archive(file_name, lowered_name)
 
-        # Get article and article-meta elements
-        # Handle both cases: root IS the article, or article is nested
-        if root.tag == "article" or root.tag.endswith("}article"):
-            article_elem = root
-        else:
-            article_elem = root.find(".//article")
-        if article_elem is None:
-            logger.debug(f"No article element found in {xml_path}")
-            return None
-        
-        article_meta = article_elem.find("front/article-meta")
-        if article_meta is None:
-            logger.debug(f"No article-meta found in {xml_path}")
-            return None
-
-        # === 1. Document Metadata (PRD Section 1.1) ===
-        article_type = _extract_article_type(root)
-        language = _extract_language(root)
-        identifiers = _extract_identifiers(article_meta)
-        
-        # Hard Fail: PMID must exist
-        if require_pmid and not identifiers.get("pmid"):
-            logger.debug(f"Skipping {xml_path}: No PMID found")
-            return None
-        
-        # Use PMCID from file if not in XML
-        if not identifiers.get("pmcid"):
-            identifiers["pmcid"] = pmcid_from_file
-
-        # === 2. Publication Metadata (PRD Section 1.2) ===
-        pub_date, year = _extract_publication_date(article_meta)
-        journal_info = _extract_journal_info(root)
-        country_code, country_name = _extract_country(root)
-
-        # === 3. Content Structure (PRD Section 1.3) ===
-        article_title = _extract_article_title(article_meta)
-        if not article_title:
-            logger.debug(f"Skipping {xml_path}: No article title")
-            return None
-
-        # Check for body and determine has_full_text
-        body_elem = article_elem.find("body")
-        has_full_text = False
-        body_text = ""
-        if body_elem is not None:
-            body_text = get_text(body_elem).strip()
-            has_full_text = len(body_text) > 100
-
-        # Open Access and Commercial License Check (PRD Section 1.3)
-        is_open_access = _extract_open_access(article_meta)
-        license_type = _extract_license_type(article_meta)
-        
-        if require_open_access and not is_open_access:
-            logger.info(f"Skipping {xml_path.name}: Not open access")
-            return None
-            
-        if require_commercial_license:
-            if not _is_commercial_license(license_type):
-                logger.info(f"Skipping {xml_path.name}: Non-commercial license ({license_type})")
-                return None
-
-        # === 4. Controlled Vocabulary (PRD Section 1.4) ===
-        mesh_terms, keywords = _extract_keywords(article_meta)
-
-        # === 5. Full Text Sections (PRD Section 1.5) ===
-        sections = _extract_full_text_sections(body_elem)
-        
-        # Update has_full_text based on sections
-        if sections:
-            has_full_text = True
-
-        # === 6. Tables (PRD Section 1.6) ===
-        tables = _extract_tables(article_elem)
-        tables_in_floats = sum(1 for t in tables if t.get("location") == "floating")
-
-        # === 7. Evidence Grade (existing functionality) ===
-        pub_types = [get_text(s) for s in root.xpath(".//article-categories//subject")]
-        abstract_text = _extract_abstract(article_meta)
-        evidence = classify_evidence_metadata(
-            article_type=article_type,
-            pub_types=pub_types,
-            abstract=abstract_text,
+        return _parse_pmc_xml_root(
+            root=root,
+            source_label=str(xml_path),
+            pmcid_from_file=pmcid_from_file,
+            require_pmid=require_pmid,
+            require_open_access=require_open_access,
+            require_commercial_license=require_commercial_license,
         )
-        evidence_grade = evidence["grade"]
-        evidence_level = evidence["level_1_4"]
-        evidence_term = evidence["matched_term"]
-        evidence_source = evidence["matched_from"]
-
-        # === Build Output Structure per PRD Section 3 ===
-        output = {
-            # Document ID for indexing
-            "document_id": f"pmid_{identifiers['pmid']}" if identifiers.get("pmid") else f"pmcid_{identifiers['pmcid']}",
-            
-            "metadata": {
-                "article_type": article_type,
-                "language": language,
-                "identifiers": {
-                    "pmid": identifiers.get("pmid"),
-                    "doi": identifiers.get("doi"),
-                    "pmcid": identifiers.get("pmcid"),
-                    "publisher_id": identifiers.get("publisher_id"),
-                    "nihms_id": identifiers.get("nihms_id"),
-                },
-                "publication": {
-                    "date": pub_date,
-                    "year": year,
-                    "journal": {
-                        "title": journal_info["title"],
-                        "abbreviation": journal_info["abbreviation"],
-                        "publisher": journal_info["publisher"],
-                        "issn": journal_info["issn_electronic"],
-                        "nlm_unique_id": journal_info["nlm_unique_id"],
-                    },
-                    "country": country_code,
-                    "country_name": country_name,
-                },
-                "content_flags": {
-                    "has_full_text": has_full_text,
-                    "is_open_access": is_open_access,
-                },
-                "classification": {
-                    "mesh_terms": mesh_terms,
-                    "keywords": keywords,
-                }
-            },
-            "content": {
-                "title": article_title,
-                "sections": sections,
-                "tables": tables,
-            },
-            "extraction_metadata": {
-                "schema_version": "1.0",
-                "processing_date": datetime.utcnow().strftime("%Y-%m-%d"),
-                "empty_body_detected": not has_full_text,
-                "tables_in_floats_group": tables_in_floats,
-            },
-            
-            # Legacy fields for backward compatibility
-            "pmcid": identifiers.get("pmcid"),
-            "pmid": identifiers.get("pmid"),
-            "doi": identifiers.get("doi"),
-            "nihms_id": identifiers.get("nihms_id"),
-            "title": article_title,
-            "abstract": abstract_text,
-            "full_text": body_text if has_full_text else "",
-            "structured_sections": sections,  # Renamed for clarity
-            "section_titles": [s["title"] for s in sections],
-            "tables": [
-                {
-                    "id": t["id"],
-                    "caption": f"{t['label']}: {t['caption_title']}".strip(": "),
-                    "markdown": t["content"],
-                    "row_by_row": t["content"],  # Same for now
-                    "is_image_only": False,
-                } for t in tables
-            ],
-            "year": year,
-            "journal": journal_info["title"],
-            "keywords": keywords,
-            "mesh_terms": mesh_terms,
-            "country": country_code or country_name,
-            "evidence_grade": evidence_grade,
-            "evidence_level": evidence_level,
-            "evidence_term": evidence_term,
-            "evidence_source": evidence_source,
-            "article_type": article_type,
-            "publication_type_list": pub_types,
-            "is_open_access": is_open_access,
-            "has_full_text": has_full_text,
-            "license": license_type,
-        }
-
-        return output
 
     except Exception as e:
         _increment_pmc_xml_parse_failure_count()
         logger.warning("Error parsing %s: %s", xml_path, e)
         logger.debug("PMC XML parse traceback for %s", xml_path, exc_info=True)
+        return None
+
+
+def parse_pmc_xml_bytes(
+    xml_bytes: bytes,
+    source_name: str = "s3_object.xml",
+    require_pmid: bool = True,
+    require_open_access: bool = True,
+    require_commercial_license: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Parse PMC XML from in-memory bytes with the same behavior as parse_pmc_xml()."""
+    try:
+        lowered_name = source_name.lower()
+        pmcid_from_file = _base_name_from_archive_name(source_name, lowered_name, Path(source_name).stem)
+
+        payload = xml_bytes
+        if lowered_name.endswith(".gz") or xml_bytes.startswith(b"\x1f\x8b"):
+            payload = gzip.decompress(xml_bytes)
+
+        root = ET.fromstring(payload)
+        return _parse_pmc_xml_root(
+            root=root,
+            source_label=source_name,
+            pmcid_from_file=pmcid_from_file,
+            require_pmid=require_pmid,
+            require_open_access=require_open_access,
+            require_commercial_license=require_commercial_license,
+        )
+    except Exception as e:
+        _increment_pmc_xml_parse_failure_count()
+        logger.warning("Error parsing %s: %s", source_name, e)
+        logger.debug("PMC XML parse traceback for %s", source_name, exc_info=True)
         return None
 
 
