@@ -241,3 +241,86 @@
   - Result: `OK`
 - Net status:
   - Phase 1-8 migration implementation is now covered by passing compatibility, schema, index, retriever contract, ingestion sink, canary tooling, benchmark tooling, and routing/fanout tests.
+
+---
+
+# Pre-Ingestion LanceDB Parity Hardening (Implemented)
+
+## Objective
+- Close all pre-ingestion blockers so LanceDB rows, vector config, and retriever behavior are parity-safe with current Qdrant expectations.
+- Enforce parity gates on actual stored row schema, including vector-critical fields and dimension/profile compatibility.
+
+## Critical Discrepancies Resolved
+
+### 1. Vector-critical fields added to schema contract/parity gate
+- [x] Row-level schema parity now validates:
+  - `point_id`
+  - `vector`
+  - `sparse_indices`
+  - `sparse_values`
+- [x] `scripts/lancedb_schema_parity.py` now derives observed rows using canonical ingestion row conversion logic shared with sink code.
+- [x] `schema/lancedb_schema_contract.json` updated with vector-critical required fields.
+- [x] `lancedb_schema_parity_spec.md` regenerated to document row-level fields and constraints.
+
+### 2. Vector dimension/config consistency enforcement
+- [x] Added vector dimension validation in parity gate:
+  - expected dimension from `IngestionConfig.get_vector_size()`
+  - hard consistency check against `src.config.EMBEDDING_DIMENSION`
+  - failure if any observed dense vector length mismatches expected dimension
+- [x] Added index-profile compatibility checks:
+  - `vector_column` must be `vector`
+  - if profile sets `num_sub_vectors`, dense dimension must be divisible by it
+- [x] Parity JSON output now includes dedicated `vector_validation` status/errors.
+
+### 3. PMC `license` schema drift fixed
+- [x] Added `license` to emitted PMC chunk payload in `scripts/06_ingest_pmc.py`.
+- [x] Added `license` to schema contract/spec so payload and contract stay aligned.
+
+### 4. Retriever/runtime parity regressions fixed
+- [x] `src/retriever_lancedb.py:get_all_chunks_for_doc` no longer uses unsupported `.text()` path.
+- [x] Implemented filter-only retrieval path for doc reconstruction (`doc_id` / `pmcid`) with deterministic chunk sorting and safe empty fallback on query failure.
+- [x] Fixed dense-only ranking semantics by converting LanceDB `_distance` to monotonic similarity before recency boost + descending sort.
+- [x] Added missing `gov_agency` parity filter via `gov_agencies` array membership match.
+
+### 5. Ingestion periodic reindex reliability fixed
+- [x] Corrected `scripts/lancedb_ingestion_sink.py` periodic reindex command arg ordering (`--json` before subcommand).
+- [x] Retained non-fatal reindex failures during ingestion, with improved diagnostics (command context + stderr snippet).
+- [x] Added unit test asserting parse-safe command shape.
+
+### 6. Tooling fallback for non-`rg` environments
+- [x] `scripts/lancedb_decommission_audit.py` now uses:
+  - `rg` when available
+  - `grep -R -n -E` fallback when `rg` missing
+- [x] Output contract unchanged (`status`, `blockers`, `next_steps`, etc.).
+- [x] Added test coverage for fallback path.
+
+## Files Updated for Hardening Pass
+- `scripts/lancedb_schema_parity.py`
+- `schema/lancedb_schema_contract.json`
+- `lancedb_schema_parity_spec.md`
+- `scripts/lancedb_ingestion_sink.py`
+- `scripts/06_ingest_pmc.py`
+- `src/retriever_lancedb.py`
+- `scripts/lancedb_decommission_audit.py`
+- `tests/test_lancedb_schema_parity.py`
+- `tests/test_lancedb_retriever_contract.py`
+- `tests/test_lancedb_ingestion_sink.py`
+- `tests/test_lancedb_phase5_8_tools.py`
+
+## Verification (Post-Hardening)
+- `PYTHONPATH=. python3 -m unittest tests/test_lancedb_compat_smoke.py tests/test_lancedb_schema_parity.py tests/test_lancedb_index_manager.py tests/test_lancedb_retriever_contract.py tests/test_lancedb_ingestion_sink.py tests/test_lancedb_dual_read_canary.py tests/test_lancedb_phase5_8_tools.py tests/test_pipeline_fanout_routing.py tests/test_retriever_fanout.py tests/test_pmc_ingest_author_manuscript.py`
+  - Result: `OK` (`27` tests passed)
+- `python3 scripts/lancedb_schema_parity.py --json`
+  - Result: `status=ok`, `errors=[]`, `vector_validation.status=ok`
+- Commit containing hardening pass:
+  - `4f62cd9` (`Implement LanceDB pre-ingestion parity hardening`)
+
+## Pre-Ingestion Go/No-Go Checklist
+- [x] Schema parity gate passes with zero drift.
+- [x] Vector dimension checks pass and match runtime config.
+- [x] Index profile compatibility checks pass.
+- [x] Retriever reconstruction and dense ranking regressions covered by tests.
+- [x] Ingestion reindex command validated by unit test.
+- [x] Decommission audit works with and without `rg`.
+- [x] All migration gate suites currently green.
+- [ ] Start ingestion run.
