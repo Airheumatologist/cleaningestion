@@ -8,8 +8,6 @@
 - **`indexing_threshold=0` disables HNSW entirely** — the collection falls back to brute-force scan (22M vectors = 22s/query).
 - After any ingestion or collection setup, always verify and set: `update_collection(optimizers_config=OptimizersConfigDiff(indexing_threshold=10000))`.
 - Confirm HNSW is built: each segment dir should contain a `vector_index-dense/` subdirectory under `/opt/qdrant/qdrant_storage/collections/<name>/<shard>/segments/<id>/`.
-- Use `scripts/43_latency_split.py --dummy-vector` to isolate Qdrant latency from embedding latency.
-- Use `scripts/44_compact_segments.py` to inspect/trigger segment compaction.
 
 # Model Provider Guardrails
 - Use `Groq` as the canonical runtime LLM provider for `openai/gpt-oss-20b` generation/query decomposition (unless explicitly overridden by env).
@@ -28,12 +26,6 @@
 - **SSH Connection**: run `ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new root@65.109.112.253` from the workspace directory.
 - **Server App Path**: `/opt/RAG-pipeline`
 - **Current API Stack**: `rag-gateway` + `rag-api-1` + `rag-api-2` + `rag-api-3` + `rag-api-4` (Qdrant unchanged).
-- **Safe API-only restart (required)**:
-  `ssh -i ~/.ssh/id_ed25519 root@65.109.112.253 "cd /opt/RAG-pipeline/deploy/hetzner && docker compose --env-file ../../.env up -d --build --no-deps rag-api-1 rag-api-2 rag-api-3 rag-api-4 rag-gateway"`
-- **API-only status/logs**:
-  - On server: `cd /opt/RAG-pipeline/deploy/hetzner && docker compose ps rag-gateway rag-api-1 rag-api-2 rag-api-3 rag-api-4`
-  - On server (live): `cd /opt/RAG-pipeline/deploy/hetzner && docker compose logs -f --tail=100 rag-gateway rag-api-1 rag-api-2 rag-api-3 rag-api-4`
-  - From local (live): `ssh -i ~/.ssh/id_ed25519 root@65.109.112.253 "cd /opt/RAG-pipeline/deploy/hetzner && docker compose logs -f --tail=100 rag-gateway rag-api-1 rag-api-2 rag-api-3 rag-api-4"`
 - **If gateway fails to bind port 8000**: remove stale legacy container once: `docker rm -f rag-api`, then restart API stack above.
 - **Repo sync**: Prefer `git pull origin main` in `/opt/RAG-pipeline` before restart.
-- **Environment Variables**: The `docker-compose.yml` loads `env_file: ../../.env`, which resolves to `/opt/RAG-pipeline/.env` (the **root** `.env`), NOT `deploy/hetzner/.env`. Always edit `/opt/RAG-pipeline/.env` on the server when changing runtime env vars (e.g. model names, API keys). The `deploy/hetzner/.env` is only used for Qdrant-specific compose variables.
+- **Environment Variables**: Always edit `/opt/RAG-pipeline/.env` on the server when changing runtime env vars (e.g. model names, API keys).

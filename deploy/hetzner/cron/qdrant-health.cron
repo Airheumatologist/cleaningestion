@@ -1,5 +1,0 @@
-# Qdrant health check every 5 minutes
-# Install with: sudo cp deploy/hetzner/cron/qdrant-health.cron /etc/cron.d/qdrant-health
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/5 * * * * root cd /opt/RAG-pipeline && /bin/bash -lc 'set -a && source .env && set +a && ./deploy/hetzner/healthcheck.sh' >> /var/log/qdrant-health.log 2>&1

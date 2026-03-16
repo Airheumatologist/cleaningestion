@@ -239,8 +239,7 @@ Hetzner rag-gateway
 ```
 
 Reference docs:
-1. `deploy/hetzner/README.md`
-2. `deploy/integration/README.md`
+1. `deploy/integration/README.md`
 
 ---
 
@@ -280,7 +279,6 @@ RAG-pipeline/
 │   ├── query_preprocessor.py               # LLM query decomposition
 │   ├── config.py                           # Central configuration
 │   ├── prompts.py                          # LLM system prompts
-│   ├── medical_qdrant_client.py            # Qdrant client wrapper
 │   ├── medical_entity_expander.py          # MeSH acronym expansion
 │   ├── bm25_sparse.py                      # BM25 sparse encoder
 │   ├── service_auth.py                     # Bearer token validation + hash utils
@@ -299,8 +297,7 @@ RAG-pipeline/
 │   ├── config_ingestion.py                 # Ingestion config
 │   ├── ingestion_utils.py                  # Core ingestion utilities
 │   ├── ingestion_utils_enhanced.py         # Enhanced chunking/validation
-│   ├── 43_latency_split.py                  # Isolate embedding vs Qdrant HNSW latency (--dummy-vector flag)
-│   └── 44_compact_segments.py               # Inspect/trigger Qdrant segment compaction
+│   └── generate_drug_lookup.py             # Build DailyMed drug name lookup cache
 │
 ├── frontend/                               # Next.js React frontend
 │   ├── src/app/
@@ -311,9 +308,6 @@ RAG-pipeline/
 │   └── next.config.ts                      # Next.js configuration
 │
 ├── deploy/                                 # Deployment configurations
-│   ├── hetzner/docker-compose.yml          # Qdrant + rag-api-1..4 + rag-gateway
-│   ├── hetzner/nginx-rag-gateway.conf      # Nginx upstream config for API replicas
-│   ├── hetzner/README.md                   # Co-located Hetzner stack (Qdrant + gateway + API replicas)
 │   └── integration/README.md               # Service integration contract + examples
 │
 ├── start_ingestion.sh                      # Interactive ingestion starter
@@ -700,14 +694,6 @@ python scripts/21_ingest_pubmed_abstracts.py
 - Regenerates `src/data/drug_setid_lookup.json` automatically via `scripts/generate_drug_lookup.py` after DailyMed ingestion.
 - Re-enables Qdrant HNSW safety guardrail at end of run with `indexing_threshold=10000` and fails the weekly run if this enforcement fails.
 
-**Semiannual PMC schedule (`deploy/hetzner/run_pmc_biannual_update.sh`):**
-- Run at `01:00 America/Chicago` on June 30 and December 30 via cron.
-- Executes:
-  - `01_download_pmc_unified.py --datasets pmc_oa,author_manuscript --release-mode incremental`
-  - `06_ingest_pmc.py --delete-source`
-  - `05_setup_qdrant.py --finalize --indexing-threshold 10000`
-- Backup is chained after success in `deploy/hetzner/cron/medical-rag-update.cron`.
-
 **Monitor Progress:**
 ```bash
 # Check logs
@@ -910,9 +896,6 @@ Production rule:
 # Validate configuration
 python src/config.py
 
-# Test Qdrant connection
-python src/medical_qdrant_client.py
-
 # Test reranker
 python src/reranker.py
 
@@ -924,13 +907,8 @@ python src/query_preprocessor.py
 
 ## 🚢 Deployment
 
-### Production Server (Hetzner)
-
-Qdrant is self-hosted on Hetzner AX52 (64GB RAM, AMD Ryzen 7000).
-
-Use these production docs:
-1. [deploy/hetzner/README.md](deploy/hetzner/README.md)
-2. [deploy/integration/README.md](deploy/integration/README.md)
+Use this integration doc:
+1. [deploy/integration/README.md](deploy/integration/README.md)
 
 ### Backend Deployment
 
@@ -1041,12 +1019,6 @@ client.update_collection(
     collection_name="rag_pipeline",
     optimizers_config=OptimizersConfigDiff(indexing_threshold=10000),
 )
-```
-
-**Diagnose latency split** (embedding API vs Qdrant):
-```bash
-docker exec rag-api-1 python3 scripts/43_latency_split.py \
-  --qdrant-url http://qdrant:6333 --dummy-vector --n 3
 ```
 
 ### MeSH Dictionary Downloads & Concurrency
