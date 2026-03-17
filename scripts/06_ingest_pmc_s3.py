@@ -187,60 +187,102 @@ def _run_super_batch_pipeline(
     article_queue_size: int,
     points_queue_size: int,
     embed_article_batch_size: int,
+    embed_workers: int = 1,
 ) -> tuple[int, int]:
+    """Run one super-batch through a parallel pipeline.
+
+    Architecture:
+      - ``workers`` threads fetch & parse metadata entries (I/O bound)
+      - ``embed_workers`` threads each embed a batch of articles (CPU+network bound)
+      - 1 writer thread writes points to LanceDB/Qdrant
+
+    The article_queue feeds all embed workers. Each embed worker emits a
+    None sentinel to the points_queue when it finishes; the writer thread
+    counts N sentinels before terminating.
+    """
+    effective_article_queue = max(1, article_queue_size)
+    effective_points_queue = max(1, points_queue_size * max(1, embed_workers))
+
     article_queue: queue.Queue[Optional[Tuple[Dict[str, Any], str]]] = queue.Queue(
-        maxsize=max(1, article_queue_size)
+        maxsize=effective_article_queue
     )
     points_queue: queue.Queue[Optional[Tuple[list[Any], list[str]]]] = queue.Queue(
-        maxsize=max(1, points_queue_size)
+        maxsize=effective_points_queue
     )
     error_queue: queue.Queue[BaseException] = queue.Queue()
     processed_lock = threading.Lock()
     counters = {"inserted": 0, "skipped": 0}
+    embed_done_count = 0
+    embed_done_lock = threading.Lock()
 
     def _enqueue_error(exc: BaseException) -> None:
         if error_queue.empty():
             error_queue.put(exc)
 
-    def _embed_worker() -> None:
+    def _embed_worker(worker_idx: int) -> None:
+        """One of ``embed_workers`` parallel embedding threads."""
         batch_articles: list[Dict[str, Any]] = []
         batch_checkpoint_ids: list[str] = []
         try:
             while True:
-                item = article_queue.get()
+                try:
+                    item = article_queue.get(timeout=300)
+                except Exception:
+                    break
                 if item is None:
+                    # Poison pill - put back for the next waiting embed worker
+                    article_queue.put(None)
                     break
                 article, checkpoint_id = item
                 batch_articles.append(article)
                 batch_checkpoint_ids.append(checkpoint_id)
                 if len(batch_articles) >= embed_article_batch_size:
+                    if not error_queue.empty():
+                        break
+                    try:
+                        points, _ = pmc_ingest_mod.build_points(
+                            batch_articles,
+                            embedding_provider,
+                            sparse_encoder=sparse_encoder,
+                        )
+                        points_queue.put((points, batch_checkpoint_ids.copy()))
+                    except Exception as exc:
+                        _enqueue_error(exc)
+                        return
+                    finally:
+                        batch_articles.clear()
+                        batch_checkpoint_ids.clear()
+
+            # Flush remainder
+            if batch_articles and error_queue.empty():
+                try:
                     points, _ = pmc_ingest_mod.build_points(
                         batch_articles,
                         embedding_provider,
                         sparse_encoder=sparse_encoder,
                     )
                     points_queue.put((points, batch_checkpoint_ids.copy()))
-                    batch_articles.clear()
-                    batch_checkpoint_ids.clear()
-
-            if batch_articles:
-                points, _ = pmc_ingest_mod.build_points(
-                    batch_articles,
-                    embedding_provider,
-                    sparse_encoder=sparse_encoder,
-                )
-                points_queue.put((points, batch_checkpoint_ids.copy()))
+                except Exception as exc:
+                    _enqueue_error(exc)
         except Exception as exc:
             _enqueue_error(exc)
         finally:
-            points_queue.put(None)
+            nonlocal embed_done_count
+            with embed_done_lock:
+                embed_done_count += 1
+                if embed_done_count >= embed_workers:
+                    # Last embed worker sends the terminal sentinel to writer
+                    points_queue.put(None)
 
     def _writer_worker() -> None:
         try:
             while True:
-                payload = points_queue.get()
-                if payload is None:
+                try:
+                    payload = points_queue.get(timeout=600)
+                except Exception:
                     break
+                if payload is None:
+                    break  # All embed workers done
                 points, checkpoint_ids = payload
                 if not points:
                     counters["skipped"] += len(checkpoint_ids)
@@ -255,9 +297,25 @@ def _run_super_batch_pipeline(
         except Exception as exc:
             _enqueue_error(exc)
 
-    embed_thread = threading.Thread(target=_embed_worker, name="pmc-s3-embed-worker", daemon=True)
-    write_thread = threading.Thread(target=_writer_worker, name="pmc-s3-write-worker", daemon=True)
-    embed_thread.start()
+    actual_embed_workers = max(1, embed_workers)
+    logger.info(
+        "Super-batch pipeline: %s download workers, %s embed workers, 1 write worker",
+        workers,
+        actual_embed_workers,
+    )
+    embed_threads = [
+        threading.Thread(
+            target=_embed_worker,
+            args=(i,),
+            name=f"pmc-s3-embed-{i}",
+            daemon=True,
+        )
+        for i in range(actual_embed_workers)
+    ]
+    write_thread = threading.Thread(target=_writer_worker, name="pmc-s3-write", daemon=True)
+
+    for t in embed_threads:
+        t.start()
     write_thread.start()
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -293,8 +351,10 @@ def _run_super_batch_pipeline(
                 continue
             article_queue.put((article, checkpoint_id))
 
+    # Signal all embed workers to stop via single None (they relay it)
     article_queue.put(None)
-    embed_thread.join()
+    for t in embed_threads:
+        t.join()
     write_thread.join()
 
     if not error_queue.empty():
@@ -314,6 +374,7 @@ def run_ingestion_s3(
     article_queue_size: int = 256,
     points_queue_size: int = 32,
     embed_article_batch_size: int = 120,
+    embed_workers: int = 1,
 ) -> None:
     ensure_data_dirs()
     reset_pmc_xml_parse_failure_count()
@@ -424,6 +485,7 @@ def run_ingestion_s3(
                 article_queue_size=article_queue_size,
                 points_queue_size=points_queue_size,
                 embed_article_batch_size=embed_article_batch_size,
+                embed_workers=embed_workers,
             )
             total_inserted += inserted_now
             total_skipped += skipped_now
@@ -494,6 +556,17 @@ def main() -> None:
         help="Number of parsed articles per embedding/write payload batch.",
     )
     parser.add_argument(
+        "--embed-workers",
+        type=int,
+        default=int(os.getenv("EMBEDDING_CONCURRENCY", "1")),
+        help=(
+            "Number of parallel embedding worker threads. Each worker independently "
+            "pulls articles from the queue and calls DeepInfra. "
+            "Set to match EMBEDDING_CONCURRENCY for best throughput. "
+            "Must stay within DeepInfra rate limits (200 req/sec)."
+        ),
+    )
+    parser.add_argument(
         "--precreate-only",
         action="store_true",
         help="Create target table with first valid ingested row, then stop.",
@@ -522,6 +595,7 @@ def main() -> None:
         article_queue_size=args.article_queue_size,
         points_queue_size=args.points_queue_size,
         embed_article_batch_size=args.embed_article_batch_size,
+        embed_workers=args.embed_workers,
     )
 
 

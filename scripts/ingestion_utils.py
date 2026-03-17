@@ -85,8 +85,8 @@ ISO_COUNTRY_CODES = {
 }
 
 class EmbeddingProvider:
-    """Support for DeepInfra embeddings."""
-    
+    """Support for DeepInfra embeddings with concurrent parallel requests."""
+
     def __init__(self) -> None:
         self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
         self.model = IngestionConfig.EMBEDDING_MODEL
@@ -95,10 +95,7 @@ class EmbeddingProvider:
         self._request_log_lock = threading.Lock()
         self._request_timestamps: deque[float] = deque()
         self._rate_log_enabled = os.getenv("EMBEDDING_RATE_LOG_ENABLED", "true").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
+            "1", "true", "yes", "on",
         }
         self._rate_log_window_seconds = max(
             1.0, float(os.getenv("EMBEDDING_RATE_LOG_WINDOW_SECONDS", "10"))
@@ -107,6 +104,14 @@ class EmbeddingProvider:
             1.0, float(os.getenv("EMBEDDING_RATE_LOG_EVERY_SECONDS", "10"))
         )
         self._next_rate_log_at = time.monotonic() + self._rate_log_every_seconds
+        # Number of concurrent embedding request threads
+        self._embed_concurrency = max(
+            1, int(os.getenv("EMBEDDING_CONCURRENCY", "8"))
+        )
+        # Max retries per individual embed request
+        self._embed_max_retries = max(
+            1, int(os.getenv("EMBEDDING_REQUEST_MAX_RETRIES", "6"))
+        )
 
         if self.provider != "deepinfra":
             raise ValueError(
@@ -122,7 +127,10 @@ class EmbeddingProvider:
         deepinfra_base_url = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
         self.openai_client = OpenAI(
             api_key=api_key,
-            base_url=deepinfra_base_url
+            base_url=deepinfra_base_url,
+            # Allow many concurrent connections from threadpool
+            max_retries=0,  # We handle retries ourselves with better backoff
+            timeout=120.0,
         )
         max_requests_per_sec = int(os.getenv("EMBEDDING_MAX_REQUESTS_PER_SEC", "0") or "0")
         if max_requests_per_sec > 0:
@@ -131,20 +139,68 @@ class EmbeddingProvider:
                 "Embedding request limiter enabled: max %s req/sec",
                 max_requests_per_sec,
             )
-        logger.info("✅ DeepInfra embedding provider initialized (model: %s)", self.model)
+        logger.info(
+            "✅ DeepInfra embedding provider initialized (model: %s, concurrency: %s)",
+            self.model,
+            self._embed_concurrency,
+        )
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Embed a flat list of texts. Sub-batches serially."""
         return self._embed_deepinfra(texts)
+
+    def embed_batches_concurrent(
+        self,
+        text_batches: List[List[str]],
+    ) -> List[List[List[float]]]:
+        """Embed multiple pre-split batches concurrently.
+
+        Args:
+            text_batches: List of text lists. Each inner list becomes one
+                          sub-batched embedding call.
+
+        Returns:
+            List of embedding lists, one per input text_batch, in the same order.
+        """
+        if not text_batches:
+            return []
+        if len(text_batches) == 1:
+            return [self._embed_deepinfra(text_batches[0])]
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+        results: List[Optional[List[List[float]]]] = [None] * len(text_batches)
+        errors: List[Optional[Exception]] = [None] * len(text_batches)
+
+        with ThreadPoolExecutor(
+            max_workers=min(self._embed_concurrency, len(text_batches)),
+            thread_name_prefix="embed-concurrent",
+        ) as pool:
+            future_to_idx = {
+                pool.submit(self._embed_deepinfra, batch): idx
+                for idx, batch in enumerate(text_batches)
+            }
+            for future in _as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:
+                    errors[idx] = exc
+
+        first_error = next((e for e in errors if e is not None), None)
+        if first_error is not None:
+            raise first_error
+
+        return results  # type: ignore[return-value]
 
     def _embed_deepinfra(self, texts: List[str]) -> List[List[float]]:
         """Embed using DeepInfra OpenAI-compatible API with sub-batching."""
-        batch_size = IngestionConfig.EMBEDDING_BATCH_SIZE  # 64
-        
-        # Small enough to send in one call
+        batch_size = IngestionConfig.EMBEDDING_BATCH_SIZE
+
         if len(texts) <= batch_size:
             return self._embed_deepinfra_single(texts)
-        
-        # Sub-batch large requests to avoid 500 errors
+
+        # Sub-batch large requests
         all_embeddings: List[List[float]] = []
         for i in range(0, len(texts), batch_size):
             sub_batch = texts[i:i + batch_size]
@@ -153,18 +209,73 @@ class EmbeddingProvider:
         return all_embeddings
 
     def _embed_deepinfra_single(self, texts: List[str]) -> List[List[float]]:
-        """Send a single embedding request to DeepInfra."""
-        try:
-            self._before_embedding_request()
-            response = self.openai_client.embeddings.create(
-                model=self.model,
-                input=texts,
-                encoding_format="float"
-            )
-            return [data.embedding for data in response.data]
-        except Exception as e:
-            logger.error("DeepInfra embedding failed: %s", e)
-            raise
+        """Send a single embedding request to DeepInfra with retry/backoff."""
+        import random as _random
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self._embed_max_retries + 1):
+            try:
+                self._before_embedding_request()
+                response = self.openai_client.embeddings.create(
+                    model=self.model,
+                    input=texts,
+                    encoding_format="float",
+                )
+                return [data.embedding for data in response.data]
+            except Exception as exc:
+                last_exc = exc
+                exc_str = str(exc)
+                is_rate_limit = (
+                    "429" in exc_str
+                    or "rate limit" in exc_str.lower()
+                    or "too many requests" in exc_str.lower()
+                )
+                is_transient = (
+                    "500" in exc_str
+                    or "502" in exc_str
+                    or "503" in exc_str
+                    or "504" in exc_str
+                    or "connection" in exc_str.lower()
+                    or "timeout" in exc_str.lower()
+                    or "reset" in exc_str.lower()
+                )
+
+                if attempt >= self._embed_max_retries:
+                    logger.error(
+                        "DeepInfra embedding failed after %s attempts: %s",
+                        attempt, exc_str[:300],
+                    )
+                    raise
+
+                if is_rate_limit:
+                    # Rate-limited: longer wait, then retry
+                    base_wait = min(30.0, 2.0 * (2 ** (attempt - 1)))
+                    jitter = _random.uniform(0.5, 1.5)
+                    wait = base_wait * jitter
+                    logger.warning(
+                        "DeepInfra rate-limited (attempt %s/%s), pausing %.1fs: %s",
+                        attempt, self._embed_max_retries, wait, exc_str[:120],
+                    )
+                    time.sleep(wait)
+                elif is_transient:
+                    # Transient 5xx: shorter backoff
+                    base_wait = min(8.0, 1.0 * (2 ** (attempt - 1)))
+                    jitter = _random.uniform(0.25, 1.25)
+                    wait = base_wait * jitter
+                    logger.warning(
+                        "DeepInfra transient error (attempt %s/%s), retrying in %.1fs: %s",
+                        attempt, self._embed_max_retries, wait, exc_str[:120],
+                    )
+                    time.sleep(wait)
+                else:
+                    # Non-retriable error
+                    logger.error("DeepInfra non-retriable error: %s", exc_str[:300])
+                    raise
+
+        # Should be unreachable
+        if last_exc is not None:
+            raise last_exc
+        return []
 
     def _before_embedding_request(self) -> None:
         if self._rate_limiter is not None:
@@ -196,7 +307,7 @@ class EmbeddingProvider:
 
 
 class _RequestRateLimiter:
-    """Thread-safe request-rate limiter for outbound embedding API calls."""
+    """Thread-safe token-bucket rate limiter for outbound embedding API calls."""
 
     def __init__(self, max_requests_per_sec: int):
         self.max_requests_per_sec = max(1, int(max_requests_per_sec))
@@ -204,6 +315,7 @@ class _RequestRateLimiter:
         self._recent_requests: deque[float] = deque()
 
     def acquire(self) -> None:
+        """Block until a request token is available."""
         while True:
             now = time.monotonic()
             with self._lock:
@@ -218,7 +330,7 @@ class _RequestRateLimiter:
                 earliest = self._recent_requests[0]
                 sleep_seconds = max(0.001, (earliest + 1.0) - now)
 
-            time.sleep(min(sleep_seconds, 0.05))
+            time.sleep(min(sleep_seconds, 0.02))
 
 
 # Evidence hierarchy for article types

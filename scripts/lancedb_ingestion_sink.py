@@ -280,13 +280,43 @@ class LanceDBIngestionSink(BaseIngestionSink):
             raise RuntimeError("Cannot create LanceDB table without rows")
 
         table = pa.Table.from_pylist(rows, schema=_lancedb_arrow_schema())
-        self._table = self._db.create_table(
-            self.table_name,
-            data=table.to_batches(max_chunksize=self.write_batch_rows),
-            schema=table.schema,
-            mode="create",
-        )
-        return True
+        max_retries = int(os.getenv("MAX_RETRIES", "5"))
+        
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._table = self._db.create_table(
+                    self.table_name,
+                    data=table.to_batches(max_chunksize=self.write_batch_rows),
+                    schema=table.schema,
+                    mode="create",
+                )
+                if attempt > 1:
+                    logger.info("LanceDB table %s created successfully on attempt %s", self.table_name, attempt)
+                return True
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= max_retries:
+                    break
+                # Only retry simple http errors or timeouts
+                exc_str = str(exc).lower()
+                if "already exists" in exc_str:
+                    logger.warning("LanceDB table %s exists but open_table failed previously", self.table_name)
+                    # Try to open it again
+                    try:
+                        self._table = self._db.open_table(self.table_name)
+                        return False
+                    except Exception as inner_exc:
+                        last_exc = inner_exc
+                else:
+                    wait = 2.0 * (2 ** (attempt - 1)) * random.uniform(0.8, 1.2)
+                    logger.warning(
+                        "LanceDB table creation retry %s/%s (wait=%.2fs) after error: %s",
+                        attempt, max_retries, wait, str(exc)[:200]
+                    )
+                    time.sleep(wait)
+                    
+        raise RuntimeError(f"Failed to create LanceDB table after {max_retries} attempts: {last_exc}") from last_exc
 
     def _maybe_reindex(self) -> None:
         if self.reindex_interval_batches <= 0:

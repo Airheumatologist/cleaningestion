@@ -514,8 +514,8 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     try:
         vectors = embedding_provider.embed_batch(all_texts)
     except Exception as e:
-        logger.error("Embedding failed: %s", e)
-        raise RuntimeError(f"Embedding failed for batch of {len(all_texts)} chunks") from e
+        logger.error("Embedding completely failed for batch of %s chunks: %s. Skipping these articles.", len(all_texts), e)
+        return [], []
 
     sparse_vectors: List[Optional[Any]] = []
     if sparse_encoder is not None:
