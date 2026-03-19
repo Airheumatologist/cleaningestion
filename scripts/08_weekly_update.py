@@ -29,8 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse, urlunparse
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import OptimizersConfigDiff, PointStruct
+from qdrant_client.models import PointStruct
 
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -41,7 +40,6 @@ from config_ingestion import IngestionConfig, ensure_data_dirs
 from ingestion_utils import (
     Chunker as BaseChunker,
     EmbeddingProvider,
-    upsert_with_retry,
     append_checkpoint as append_checkpoint_file,
     generate_section_id,
     get_section_weight,
@@ -50,17 +48,11 @@ from ingestion_utils import (
     get_evidence_level,
     extract_gov_affiliations_from_pubmed_xml,
 )
+from lancedb_ingestion_sink import build_ingestion_sink
 from pubmed_publication_filters import (
     is_target_article,
     map_publication_type,
 )
-
-# Import BM25SparseEncoder (optional)
-spec = importlib.util.find_spec("src.bm25_sparse")
-if spec is not None:
-    from src.bm25_sparse import BM25SparseEncoder
-else:
-    BM25SparseEncoder = None  # type: ignore
 
 # Import enhanced utilities for semantic chunking
 try:
@@ -156,26 +148,10 @@ def _resolve_qdrant_url_for_weekly(raw_url: str, container_name: str) -> str:
     return resolved_url
 
 
-def enforce_hnsw_indexing(
-    client: QdrantClient,
-    collection_name: str,
-    indexing_threshold: int = 10000,
-) -> None:
-    """Ensure HNSW indexing is re-enabled after weekly ingestion."""
-    logger.info(
-        "Enforcing HNSW indexing threshold for collection=%s indexing_threshold=%d",
-        collection_name,
-        indexing_threshold,
-    )
-    try:
-        client.update_collection(
-            collection_name=collection_name,
-            optimizers_config=OptimizersConfigDiff(indexing_threshold=indexing_threshold),
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to enforce Qdrant HNSW indexing_threshold=10000. Weekly update aborted to avoid brute-force query mode."
-        ) from exc
+def enforce_hnsw_indexing(collection_name: str, indexing_threshold: int = 10000) -> None:
+    _ = collection_name, indexing_threshold
+    # Turbopuffer indexes asynchronously without manual HNSW thresholds.
+    return
 
 def load_processed_files() -> Set[str]:
     if not PROCESSED_TRACKER.exists():
@@ -671,7 +647,6 @@ def parse_pubmed_update_xml(
 
 
 def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider,
-                 sparse_encoder: Optional[Any] = None,
                  validate_chunks: bool = True, dedup_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
     """Build Qdrant points from article batch with semantic chunking.
 
@@ -682,7 +657,6 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     Args:
         batch: List of parsed articles
         embedding_provider: Provider for generating embeddings
-        sparse_encoder: Optional sparse encoder for hybrid search (created once and reused)
         validate_chunks: Whether to validate chunk quality before ingestion
         dedup_chunks: Whether to deduplicate chunks within batch
     """
@@ -868,25 +842,12 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     # Embed all chunks using shared embedding provider
     vectors = embedding_provider.embed_batch(all_chunks_text)
 
-    # Batch encode sparse vectors (if enabled)
-    sparse_vectors = []
-    if sparse_encoder:
-        try:
-            sparse_vectors = sparse_encoder.encode_batch(all_chunks_text)
-        except Exception as e:
-            logger.warning("Sparse encoding failed for batch: %s", e)
-            sparse_vectors = [None] * len(all_chunks_text)
-
     for i, vector in enumerate(vectors):
         payload = chunk_metadata[i]
         # Deterministic UUID matching 21_ingest_pubmed_abstracts.py so upserts
         # overwrite baseline points rather than creating duplicates.
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pubmed:{payload['chunk_id']}"))
         vector_data: Any = {"dense": vector}
-
-        # Add sparse vector if available
-        if sparse_vectors and i < len(sparse_vectors) and sparse_vectors[i]:
-            vector_data["sparse"] = sparse_vectors[i].model_dump() if hasattr(sparse_vectors[i], 'model_dump') else sparse_vectors[i]
 
         points.append(PointStruct(id=point_id, vector=vector_data, payload=payload))
         point_pmid = str(payload.get("pmid") or "").strip()
@@ -898,7 +859,7 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
 
 
 def ingest_pubmed_updates(
-    client: QdrantClient,
+    sink: Any,
     embedding_provider: EmbeddingProvider,
     max_files: Optional[int],
     min_year: int = DEFAULT_MIN_YEAR,
@@ -950,23 +911,6 @@ def ingest_pubmed_updates(
                 IngestionConfig.CHUNK_OVERLAP_TOKENS,
                 chunker.__class__.__name__)
 
-    # Create sparse encoder once (reused for all batches)
-    sparse_encoder: Optional[Any] = None
-    if (
-        IngestionConfig.SPARSE_ENABLED
-        and IngestionConfig.SPARSE_MODE == "bm25"
-        and BM25SparseEncoder is not None
-    ):
-        sparse_encoder = BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
-        logger.info("BM25 sparse encoder initialized for hybrid search")
-    elif IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25":
-        logger.warning("BM25 sparse encoder unavailable; continuing with dense-only indexing")
-
     inserted = 0
     total_articles_processed = 0
     total_batches_upserted = 0
@@ -989,12 +933,11 @@ def ingest_pubmed_updates(
             points, ingested_pmids = build_points(
                 batch,
                 embedding_provider,
-                sparse_encoder,
                 validate_chunks=ENHANCED_UTILS_AVAILABLE,
                 dedup_chunks=ENHANCED_UTILS_AVAILABLE,
             )
             if points:
-                upsert_with_retry(client, points)
+                sink.write_points(points)
                 new_checkpoint_pmids = [pmid for pmid in ingested_pmids if pmid not in baseline_pmids]
                 checkpoint_ids = [_checkpoint_id(pmid) for pmid in new_checkpoint_pmids]
                 if checkpoint_ids:
@@ -1012,12 +955,11 @@ def ingest_pubmed_updates(
             points, ingested_pmids = build_points(
                 batch,
                 embedding_provider,
-                sparse_encoder,
                 validate_chunks=ENHANCED_UTILS_AVAILABLE,
                 dedup_chunks=ENHANCED_UTILS_AVAILABLE,
             )
             if points:
-                upsert_with_retry(client, points)
+                sink.write_points(points)
                 new_checkpoint_pmids = [pmid for pmid in ingested_pmids if pmid not in baseline_pmids]
                 checkpoint_ids = [_checkpoint_id(pmid) for pmid in new_checkpoint_pmids]
                 if checkpoint_ids:
@@ -1176,31 +1118,19 @@ def main() -> None:
         logger.error("DEEPINFRA_API_KEY not set!")
         sys.exit(1)
 
-    if not IngestionConfig.QDRANT_API_KEY:
-        logger.error("QDRANT_API_KEY not set!")
+    if not IngestionConfig.TURBOPUFFER_API_KEY:
+        logger.error("TURBOPUFFER_API_KEY not set!")
         sys.exit(1)
 
-    resolved_qdrant_url = _resolve_qdrant_url_for_weekly(
-        IngestionConfig.QDRANT_URL,
-        os.getenv("QDRANT_CONTAINER_NAME", "qdrant"),
-    )
-    os.environ["QDRANT_URL"] = resolved_qdrant_url
-    IngestionConfig.QDRANT_URL = resolved_qdrant_url
-
     embedding_provider = EmbeddingProvider()
-    client = QdrantClient(
-        url=resolved_qdrant_url,
-        api_key=IngestionConfig.QDRANT_API_KEY or None,
-        timeout=600,
-        prefer_grpc=IngestionConfig.USE_GRPC,
-    )
+    sink = build_ingestion_sink(namespace_override=IngestionConfig.TURBOPUFFER_NAMESPACE_PUBMED)
 
     started = time.time()
     total_inserted = 0
 
     if not args.skip_pubmed:
         total_inserted += ingest_pubmed_updates(
-            client, embedding_provider,
+            sink, embedding_provider,
             max_files=args.max_files,
             min_year=args.min_year,
             batch_size=args.batch_size,
@@ -1213,12 +1143,10 @@ def main() -> None:
     if not args.skip_pmc:
         run_pmc_refresh()
 
-    enforce_hnsw_indexing(client, IngestionConfig.COLLECTION_NAME, indexing_threshold=10000)
-
-    info = client.get_collection(IngestionConfig.COLLECTION_NAME)
+    enforce_hnsw_indexing("turbopuffer", indexing_threshold=10000)
     logger.info(
-        "Weekly update complete inserted=%s total_points=%s elapsed=%.1fs",
-        total_inserted, info.points_count, time.time() - started,
+        "Weekly update complete inserted=%s elapsed=%.1fs",
+        total_inserted, time.time() - started,
     )
 
 

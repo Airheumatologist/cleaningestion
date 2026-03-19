@@ -32,12 +32,21 @@ class IngestionConfig:
     QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
     QDRANT_GRPC_URL = os.getenv("QDRANT_GRPC_URL", "localhost:6334")
     COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", os.getenv("COLLECTION_NAME", "rag_pipeline"))
-    VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "lancedb").strip().lower()
-    LANCEDB_URI = os.getenv("LANCEDB_URI", "./medical_data.lancedb")
-    LANCEDB_TABLE = os.getenv("LANCEDB_TABLE", "medical_docs")
-    LANCEDB_API_KEY = os.getenv("LANCEDB_API_KEY", "")
-    LANCEDB_REGION = os.getenv("LANCEDB_REGION", "")
-    LANCEDB_REINDEX_INTERVAL_BATCHES = int(os.getenv("LANCEDB_REINDEX_INTERVAL_BATCHES", "50"))
+    VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "turbopuffer").strip().lower()
+    TURBOPUFFER_API_KEY = os.getenv("TURBOPUFFER_API_KEY", "")
+    TURBOPUFFER_NAMESPACE_PMC = os.getenv("TURBOPUFFER_NAMESPACE_PMC", "medical_pmc")
+    TURBOPUFFER_NAMESPACE_PUBMED = os.getenv("TURBOPUFFER_NAMESPACE_PUBMED", "medical_pubmed")
+    TURBOPUFFER_NAMESPACE_DAILYMED = os.getenv("TURBOPUFFER_NAMESPACE_DAILYMED", "medical_dailymed")
+    TURBOPUFFER_WRITE_BATCH_SIZE = int(os.getenv("TURBOPUFFER_WRITE_BATCH_SIZE", "500"))
+    TURBOPUFFER_MAX_CONCURRENT_WRITES = int(os.getenv("TURBOPUFFER_MAX_CONCURRENT_WRITES", "4"))
+    TURBOPUFFER_MAX_RETRIES = int(os.getenv("TURBOPUFFER_MAX_RETRIES", "5"))
+    # Deprecated legacy knobs kept for compatibility with older utility scripts.
+    SPARSE_ENABLED = _as_bool(os.getenv("SPARSE_ENABLED"), default=False)
+    SPARSE_MODE = os.getenv("SPARSE_MODE", "disabled").strip().lower()
+    SPARSE_MAX_TERMS_DOC = int(os.getenv("SPARSE_MAX_TERMS_DOC", "0"))
+    SPARSE_MAX_TERMS_QUERY = int(os.getenv("SPARSE_MAX_TERMS_QUERY", "0"))
+    SPARSE_MIN_TOKEN_LEN = int(os.getenv("SPARSE_MIN_TOKEN_LEN", "0"))
+    SPARSE_REMOVE_STOPWORDS = _as_bool(os.getenv("SPARSE_REMOVE_STOPWORDS"), default=False)
     INGEST_DRY_RUN = _as_bool(os.getenv("INGEST_DRY_RUN"), default=False)
 
     # Embedding provider: DeepInfra only
@@ -91,14 +100,6 @@ class IngestionConfig:
     # 2048 tokens provides rich context while fitting comfortably in 32k window
     CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "2048"))
     CHUNK_OVERLAP_TOKENS = int(os.getenv("CHUNK_OVERLAP_TOKENS", "256"))
-
-    # Sparse indexing (BM25-style lexical sparse vectors)
-    SPARSE_ENABLED = _as_bool(os.getenv("SPARSE_ENABLED"), default=True)
-    SPARSE_MODE = os.getenv("SPARSE_MODE", "bm25").strip().lower()
-    SPARSE_MAX_TERMS_DOC = int(os.getenv("SPARSE_MAX_TERMS_DOC", "256"))
-    SPARSE_MAX_TERMS_QUERY = int(os.getenv("SPARSE_MAX_TERMS_QUERY", "64"))
-    SPARSE_MIN_TOKEN_LEN = int(os.getenv("SPARSE_MIN_TOKEN_LEN", "2"))
-    SPARSE_REMOVE_STOPWORDS = _as_bool(os.getenv("SPARSE_REMOVE_STOPWORDS"), default=True)
 
     # Quantization configuration
     # Options: "scalar" (int8, recommended), "binary" (faster, less accurate), "none"

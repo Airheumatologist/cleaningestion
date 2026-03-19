@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 try:
     import lxml.etree as ET
-    from qdrant_client import QdrantClient
     from qdrant_client.models import Document, PointStruct
 
     sys.path.insert(0, str(Path(__file__).parent))         # Add scripts/ to path
@@ -28,8 +27,6 @@ try:
     from config_ingestion import IngestionConfig, ensure_data_dirs
     from ingestion_utils import (
         EmbeddingProvider,
-        upsert_with_retry,
-        validate_qdrant_collection_schema,
         get_chunker as get_shared_chunker,
         load_checkpoint as load_checkpoint_file,
         append_checkpoint as append_checkpoint_file,
@@ -48,14 +45,6 @@ try:
         ContentDeduplicator = None  # type: ignore
         ENHANCED_UTILS_AVAILABLE = False
         logger.warning("Enhanced utils not available, using base Chunker")
-    
-    # Import BM25SparseEncoder
-    import importlib.util
-    spec = importlib.util.find_spec("src.bm25_sparse")
-    if spec is not None:
-        from src.bm25_sparse import BM25SparseEncoder
-    else:
-        BM25SparseEncoder = None  # type: ignore
 except Exception as import_err:
     logger.error("Failed to import required modules: %s", import_err)
     logger.error("Please ensure all dependencies are installed: pip install -r requirements.txt")
@@ -561,14 +550,13 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
 
 
 
-def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[BM25SparseEncoder],
+def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProvider,
                  validate_chunks: bool = True, dedup_chunks: bool = True) -> Tuple[List[PointStruct], List[str]]:
     """Convert chunks into Qdrant PointStructs with embeddings.
     
     Args:
         chunks: List of chunk dictionaries
         embedding_provider: Provider for generating embeddings
-        sparse_encoder: Optional sparse encoder for hybrid search
         validate_chunks: Whether to validate chunk quality before ingestion
         dedup_chunks: Whether to deduplicate chunks within batch
     """
@@ -608,27 +596,13 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
     points = []
     chunk_ids = []
     
-    # 2. Generate Sparse Vectors (if enabled)
-    sparse_vectors = []
-    if sparse_encoder:
-        try:
-            sparse_vectors = sparse_encoder.encode_batch(texts)
-        except Exception as e:
-            logger.warning("Sparse parsing failed batch: %s", e)
-            # Fallback to empty if failed, or skip?
-            # Let's fill with empty to keep alignment
-            sparse_vectors = [None] * len(texts)
-    
-    # 3. Build Points
+    # 2. Build Points
     for i, chunk in enumerate(chunks):
         try:
             # Generate UUID from chunk_id for consistent ID
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"dailymed:{chunk['chunk_id']}"))
             
             vector = {"dense": embeddings[i]}
-            
-            if sparse_encoder and i < len(sparse_vectors) and sparse_vectors[i]:
-                vector["sparse"] = sparse_vectors[i]
             
             # Build canonical payload aligned with PMC/PubMed schemas
             payload = {
@@ -750,10 +724,9 @@ def load_checkpoint_namespaced(path: Path) -> set[str]:
     }
 
 def process_batch(
-    client: QdrantClient,
+    client: Any,
     batch_files: List[Path],
     embedding_provider: EmbeddingProvider,
-    sparse_encoder: Optional[BM25SparseEncoder],
     processed_ids: set[str],
     processed_lock: threading.Lock,
     chunker: Any,
@@ -826,14 +799,12 @@ def process_batch(
         return 0, len(batch_files)
 
     try:
-        points, chunk_ids = build_points(all_chunks, embedding_provider, sparse_encoder,
+        points, chunk_ids = build_points(all_chunks, embedding_provider,
                                         validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
         
         if points:
             if sink is not None:
                 sink.write_points(points)
-            else:
-                upsert_with_retry(client, points)
             
             # Update checkpoints
             # new_ids are already namespaced via _checkpoint_id() above
@@ -892,39 +863,13 @@ def run_ingestion(
         logger.warning("No XML files found in %s", xml_dir)
         return
 
-    backend = IngestionConfig.VECTOR_BACKEND.strip().lower()
     client = None
-    if backend == "qdrant":
-        client = QdrantClient(
-            url=IngestionConfig.QDRANT_URL,
-            api_key=IngestionConfig.QDRANT_API_KEY or None,
-            timeout=600,
-            prefer_grpc=IngestionConfig.USE_GRPC,
-        )
-
-        try:
-            info = client.get_collection(IngestionConfig.COLLECTION_NAME)
-            logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
-            validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
-        except Exception as e:
-            logger.error("Failed to connect to collection: %s", e)
-            return
-
-    sink = build_ingestion_sink(client=client)
-    logger.info("DailyMed ingestion sink backend=%s dry_run=%s", backend, IngestionConfig.INGEST_DRY_RUN)
+    sink = build_ingestion_sink(namespace_override=IngestionConfig.TURBOPUFFER_NAMESPACE_DAILYMED)
+    logger.info("DailyMed ingestion sink backend=turbopuffer dry_run=%s", IngestionConfig.INGEST_DRY_RUN)
 
     processed_ids = load_checkpoint_namespaced(CHECKPOINT_FILE)
     processed_lock = threading.Lock()
     logger.info("DailyMed checkpoint size=%s", len(processed_ids))
-
-    sparse_encoder = None
-    if IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25" and BM25SparseEncoder is not None:
-        sparse_encoder = BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
 
     logger.info("Starting ingestion of %d files...", len(xml_files))
     
@@ -960,7 +905,6 @@ def run_ingestion(
                     client,
                     batch,
                     embedding_provider,
-                    sparse_encoder,
                     processed_ids,
                     processed_lock,
                     chunker,

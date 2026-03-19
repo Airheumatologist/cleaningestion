@@ -31,7 +31,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import logging
 import time
@@ -40,7 +39,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
 import sys
@@ -52,8 +50,6 @@ from config_ingestion import IngestionConfig, ensure_data_dirs
 from ingestion_utils import (
     Chunker as BaseChunker,
     EmbeddingProvider,
-    upsert_with_retry,
-    validate_qdrant_collection_schema,
     classify_evidence_metadata,
     get_chunker as get_shared_chunker,
     load_checkpoint as load_checkpoint_file,
@@ -78,13 +74,6 @@ except ImportError:
     logger.warning("Enhanced utils not available")
 
 CHUNKER_CLASS = SemanticChunker if ENHANCED_UTILS_AVAILABLE else BaseChunker
-
-# Import BM25SparseEncoder
-spec = importlib.util.find_spec("src.bm25_sparse")
-if spec is not None:
-    from src.bm25_sparse import BM25SparseEncoder
-else:
-    BM25SparseEncoder = None  # type: ignore
 
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
 DEFAULT_INPUT_FILE = IngestionConfig.PUBMED_ABSTRACTS_FILE
@@ -470,7 +459,7 @@ def create_payloads_with_chunking(article: Dict[str, Any]) -> List[Dict[str, Any
     return payloads
 
 
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder: Optional[Any], 
+def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider,
                  validate_chunks: bool = True, dedup_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
     """
     Build Qdrant points from article batch with word-based chunking.
@@ -480,7 +469,6 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     Args:
         batch: List of articles to process
         embedding_provider: Provider for generating embeddings
-        sparse_encoder: Optional sparse encoder for hybrid search
         validate_chunks: Whether to validate chunk quality before ingestion
         dedup_chunks: Whether to deduplicate chunks within batch
     """
@@ -565,25 +553,11 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         logger.error("Embedding failed: %s", e)
         return [], []
 
-    sparse_vectors: List[Optional[Any]] = []
-    if sparse_encoder:
-        try:
-            if hasattr(sparse_encoder, "encode_batch"):
-                sparse_vectors = sparse_encoder.encode_batch(texts_to_embed)
-            else:
-                sparse_vectors = [sparse_encoder.encode_document(text) for text in texts_to_embed]
-        except Exception as e:
-            logger.warning("Sparse encoding failed for batch: %s", e)
-            sparse_vectors = [None] * len(texts_to_embed)
-
     # Create points
     for idx, (meta, vector) in enumerate(zip(text_metas, vectors)):
         pmid = meta["pmid"]
-        
-        # Sparse vector
+
         vector_data: Any = {"dense": vector}
-        if sparse_encoder and idx < len(sparse_vectors) and sparse_vectors[idx] is not None:
-            vector_data["sparse"] = sparse_vectors[idx]
             
         # Point ID (deterministic from chunk_id for uniqueness)
         chunk_id = meta["payload"].get("chunk_id", f"{pmid}_abstract")
@@ -599,10 +573,9 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
 
 
 def process_batch(
-    client: QdrantClient,
+    client: Any,
     batch: List[Dict[str, Any]],
     embedding_provider: EmbeddingProvider,
-    sparse_encoder: Optional[Any],
     validate_chunks: bool = True,
     dedup_chunks: bool = True,
     sink: Optional[BaseIngestionSink] = None,
@@ -612,13 +585,11 @@ def process_batch(
         return 0
     
     try:
-        points, ids = build_points(batch, embedding_provider, sparse_encoder, 
+        points, ids = build_points(batch, embedding_provider,
                                    validate_chunks=validate_chunks, dedup_chunks=dedup_chunks)
         if points:
             if sink is not None:
                 sink.write_points(points)
-            else:
-                upsert_with_retry(client, points)
             # Convert plain PMIDs to namespaced checkpoint IDs
             checkpoint_ids = [_checkpoint_id(pmid) for pmid in ids]
             append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
@@ -651,38 +622,9 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
     except Exception as e:
         logger.warning(f"Shared chunker preload warning: {e}")
     
-    backend = IngestionConfig.VECTOR_BACKEND.strip().lower()
     client = None
-    if backend == "qdrant":
-        client = QdrantClient(
-            url=IngestionConfig.QDRANT_URL,
-            api_key=IngestionConfig.QDRANT_API_KEY or None,
-            timeout=600,
-            prefer_grpc=IngestionConfig.USE_GRPC,
-        )
-
-        try:
-            info = client.get_collection(IngestionConfig.COLLECTION_NAME)
-            logger.info("Connected to %s points=%s", IngestionConfig.COLLECTION_NAME, info.points_count)
-            validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
-        except Exception as e:
-            logger.error("Failed to connect to collection: %s", e)
-            return
-
-    sink = build_ingestion_sink(client=client)
-    logger.info("PubMed ingestion sink backend=%s dry_run=%s", backend, IngestionConfig.INGEST_DRY_RUN)
-
-    # Initialize Sparse Encoder if enabled
-    sparse_encoder = None
-    use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
-    if use_sparse and BM25SparseEncoder is not None:
-        logger.info("Initializing BM25 sparse encoder...")
-        sparse_encoder = BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
+    sink = build_ingestion_sink(namespace_override=IngestionConfig.TURBOPUFFER_NAMESPACE_PUBMED)
+    logger.info("PubMed ingestion sink backend=turbopuffer dry_run=%s", IngestionConfig.INGEST_DRY_RUN)
 
     processed_ids = load_checkpoint_namespaced(CHECKPOINT_FILE)
     logger.info("Loaded checkpoint with %d IDs", len(processed_ids))
@@ -751,7 +693,6 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                         client,
                         list(current_batch),
                         embedding_provider,
-                        sparse_encoder,
                         validate_chunks=ENHANCED_UTILS_AVAILABLE,
                         dedup_chunks=ENHANCED_UTILS_AVAILABLE,
                         sink=sink,
@@ -786,7 +727,6 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                 client,
                 list(current_batch),
                 embedding_provider,
-                sparse_encoder,
                 validate_chunks=ENHANCED_UTILS_AVAILABLE,
                 dedup_chunks=ENHANCED_UTILS_AVAILABLE,
                 sink=sink,

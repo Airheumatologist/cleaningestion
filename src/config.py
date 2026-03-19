@@ -192,11 +192,19 @@ RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD = _env_bool(
     "RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD",
     default=False,
 )
-RETRIEVAL_BACKEND = os.getenv("RETRIEVAL_BACKEND", "qdrant").strip().lower()
+RETRIEVAL_BACKEND = os.getenv("RETRIEVAL_BACKEND", "turbopuffer").strip().lower()
 RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR = _env_bool("RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR", default=True)
 LANCEDB_URI = os.getenv("LANCEDB_URI", "./medical_data.lancedb")
 LANCEDB_TABLE = os.getenv("LANCEDB_TABLE", "medical_docs")
 RETRIEVAL_PREFILTER = _env_bool("RETRIEVAL_PREFILTER", default=True)
+TURBOPUFFER_API_KEY = os.getenv("TURBOPUFFER_API_KEY", "")
+TURBOPUFFER_NAMESPACE_PMC = os.getenv("TURBOPUFFER_NAMESPACE_PMC", "medical_pmc")
+TURBOPUFFER_NAMESPACE_PUBMED = os.getenv("TURBOPUFFER_NAMESPACE_PUBMED", "medical_pubmed")
+TURBOPUFFER_NAMESPACE_DAILYMED = os.getenv("TURBOPUFFER_NAMESPACE_DAILYMED", "medical_dailymed")
+TURBOPUFFER_TIMEOUT_SECONDS = _env_int("TURBOPUFFER_TIMEOUT_SECONDS", 30)
+RETRIEVAL_RRF_K = _env_int("RETRIEVAL_RRF_K", 60)
+RETRIEVAL_DENSE_WEIGHT = _env_float("RETRIEVAL_DENSE_WEIGHT", 0.7)
+RETRIEVAL_SPARSE_WEIGHT = _env_float("RETRIEVAL_SPARSE_WEIGHT", 0.3)
 
 # =============================================================================
 # Reranker Configuration

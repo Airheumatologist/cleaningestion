@@ -16,8 +16,6 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
-from qdrant_client import QdrantClient
-
 from config_ingestion import IngestionConfig, ensure_data_dirs
 from ingestion_utils import (
     EmbeddingProvider,
@@ -26,7 +24,6 @@ from ingestion_utils import (
     parse_pmc_xml_bytes,
     reset_pmc_xml_parse_failure_count,
     get_pmc_xml_parse_failure_count,
-    validate_qdrant_collection_schema,
 )
 from lancedb_ingestion_sink import BaseIngestionSink, build_ingestion_sink
 
@@ -137,7 +134,6 @@ def _flush_articles(
     pmc_ingest_mod: Any,
     sink: BaseIngestionSink,
     embedding_provider: EmbeddingProvider,
-    sparse_encoder: Any,
     articles: list[Dict[str, Any]],
     checkpoint_ids: list[str],
     checkpoint_file: Path,
@@ -150,7 +146,6 @@ def _flush_articles(
     points, _chunk_ids = pmc_ingest_mod.build_points(
         articles,
         embedding_provider,
-        sparse_encoder=sparse_encoder,
     )
     if not points:
         return 0
@@ -178,7 +173,6 @@ def _run_super_batch_pipeline(
     pmc_ingest_mod: Any,
     sink: BaseIngestionSink,
     embedding_provider: EmbeddingProvider,
-    sparse_encoder: Any,
     datasets: list[str],
     workers: int,
     processed_ids: set[str],
@@ -194,7 +188,7 @@ def _run_super_batch_pipeline(
     Architecture:
       - ``workers`` threads fetch & parse metadata entries (I/O bound)
       - ``embed_workers`` threads each embed a batch of articles (CPU+network bound)
-      - 1 writer thread writes points to LanceDB/Qdrant
+      - 1 writer thread writes points to turbopuffer
 
     The article_queue feeds all embed workers. Each embed worker emits a
     None sentinel to the points_queue when it finishes; the writer thread
@@ -243,7 +237,6 @@ def _run_super_batch_pipeline(
                         points, _ = pmc_ingest_mod.build_points(
                             batch_articles,
                             embedding_provider,
-                            sparse_encoder=sparse_encoder,
                         )
                         points_queue.put((points, batch_checkpoint_ids.copy()))
                     except Exception as exc:
@@ -259,7 +252,6 @@ def _run_super_batch_pipeline(
                     points, _ = pmc_ingest_mod.build_points(
                         batch_articles,
                         embedding_provider,
-                        sparse_encoder=sparse_encoder,
                     )
                     points_queue.put((points, batch_checkpoint_ids.copy()))
                 except Exception as exc:
@@ -383,20 +375,8 @@ def run_ingestion_s3(
     downloader_mod = _load_script_module("download_pmc_unified_mod", scripts_dir / "01_download_pmc_unified.py")
     pmc_ingest_mod = _load_script_module("ingest_pmc_mod", scripts_dir / "06_ingest_pmc.py")
 
-    backend = IngestionConfig.VECTOR_BACKEND.strip().lower()
-    client = None
-    if backend == "qdrant":
-        client = QdrantClient(
-            url=IngestionConfig.QDRANT_URL,
-            api_key=IngestionConfig.QDRANT_API_KEY or None,
-            timeout=600,
-            prefer_grpc=IngestionConfig.USE_GRPC,
-        )
-        validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
-
-    sink = build_ingestion_sink(client=client)
+    sink = build_ingestion_sink(namespace_override=IngestionConfig.TURBOPUFFER_NAMESPACE_PMC)
     embedding_provider = EmbeddingProvider()
-    sparse_encoder = pmc_ingest_mod._create_sparse_encoder()
 
     processed_ids = load_checkpoint(checkpoint_file)
     checkpoint_lock = threading.Lock()
@@ -455,7 +435,6 @@ def run_ingestion_s3(
                 pmc_ingest_mod=pmc_ingest_mod,
                 sink=sink,
                 embedding_provider=embedding_provider,
-                sparse_encoder=sparse_encoder,
                 articles=[article],
                 checkpoint_ids=[checkpoint_id],
                 checkpoint_file=checkpoint_file,
@@ -476,7 +455,6 @@ def run_ingestion_s3(
                 pmc_ingest_mod=pmc_ingest_mod,
                 sink=sink,
                 embedding_provider=embedding_provider,
-                sparse_encoder=sparse_encoder,
                 datasets=datasets,
                 workers=workers,
                 processed_ids=processed_ids,

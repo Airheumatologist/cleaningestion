@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import logging
 import threading
@@ -13,7 +12,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from qdrant_client import QdrantClient
 from qdrant_client.models import Document, PointStruct
 
 from config_ingestion import IngestionConfig, ensure_data_dirs
@@ -21,7 +19,6 @@ from ingestion_utils import (
     SectionFilter,
     EmbeddingProvider,
     upsert_with_retry,
-    validate_qdrant_collection_schema,
     reset_pmc_xml_parse_failure_count,
     get_pmc_xml_parse_failure_count,
     get_chunker as get_shared_chunker,
@@ -59,13 +56,6 @@ import sys
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
-
-# Import BM25SparseEncoder
-spec = importlib.util.find_spec("src.bm25_sparse")
-if spec is not None:
-    from src.bm25_sparse import BM25SparseEncoder
-else:
-    BM25SparseEncoder = None  # type: ignore
 
 
 SOURCE_PMC_OA = "pmc_oa"
@@ -441,7 +431,7 @@ def create_chunks_from_article(article: Dict[str, Any], chunker: Any) -> List[Di
     return chunks
 
 
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider, sparse_encoder=None, 
+def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider,
                 validate_chunks: bool = True, dedup_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
     """
     Build Qdrant points from article batch.
@@ -449,7 +439,6 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     Args:
         batch: List of parsed articles
         embedding_provider: Provider for generating embeddings
-        sparse_encoder: Optional sparse encoder for hybrid search
         validate_chunks: Whether to validate chunk quality before ingestion
         dedup_chunks: Whether to deduplicate chunks within batch
     """
@@ -517,27 +506,13 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
         logger.error("Embedding completely failed for batch of %s chunks: %s. Skipping these articles.", len(all_texts), e)
         return [], []
 
-    sparse_vectors: List[Optional[Any]] = []
-    if sparse_encoder is not None:
-        try:
-            if hasattr(sparse_encoder, "encode_batch"):
-                sparse_vectors = sparse_encoder.encode_batch(all_texts)
-            else:
-                sparse_vectors = [sparse_encoder.encode_document(text) for text in all_texts]
-        except Exception as e:
-            logger.warning("Sparse encoding failed for batch: %s", e)
-            sparse_vectors = [None] * len(all_texts)
-    
     # Create points
     for idx, (chunk, vector) in enumerate(zip(all_chunks, vectors)):
         chunk_id = chunk["chunk_id"]
         all_chunk_ids.append(chunk_id)
         source_type = _normalize_source_type(chunk.get("source"))
         
-        # Create sparse vector if enabled
         vector_data: Any = {"dense": vector}
-        if sparse_encoder is not None and idx < len(sparse_vectors) and sparse_vectors[idx] is not None:
-            vector_data["sparse"] = sparse_vectors[idx]
         
         # Create payload with FULL metadata (CRITICAL: page_content for retriever)
         payload = {
@@ -606,26 +581,13 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     
     return points, all_chunk_ids
 
-def _create_sparse_encoder():
-    """Create a BM25SparseEncoder instance if enabled."""
-    use_sparse = IngestionConfig.SPARSE_ENABLED and IngestionConfig.SPARSE_MODE == "bm25"
-    if use_sparse and BM25SparseEncoder is not None:
-        return BM25SparseEncoder(
-            max_terms_doc=IngestionConfig.SPARSE_MAX_TERMS_DOC,
-            max_terms_query=IngestionConfig.SPARSE_MAX_TERMS_QUERY,
-            min_token_len=IngestionConfig.SPARSE_MIN_TOKEN_LEN,
-            remove_stopwords=IngestionConfig.SPARSE_REMOVE_STOPWORDS,
-        )
-    return None
-
 def process_batch(
-    client: QdrantClient,
+    client: Any,
     batch_files: List[Path],
     embedding_provider: EmbeddingProvider,
     processed_ids: set[str],
     processed_lock: threading.Lock,
     xml_root: Path,
-    sparse_encoder=None,
     delete_source: bool = False,
     sink: Optional[BaseIngestionSink] = None,
 ) -> tuple[int, int]:
@@ -683,7 +645,7 @@ def process_batch(
         return 0, len(batch_files)
 
     # 2. Build points (includes embedding)
-    points, _chunk_ids = build_points(articles, embedding_provider, sparse_encoder=sparse_encoder)
+    points, _chunk_ids = build_points(articles, embedding_provider)
     
     if not points:
         return 0, len(batch_files)
@@ -735,27 +697,9 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
     except Exception as e:
         logger.warning("Shared chunker preload warning: %s", e)
     
-    backend = IngestionConfig.VECTOR_BACKEND.strip().lower()
     client = None
-    if backend == "qdrant":
-        # Qdrant client is thread-safe (connection pooling)
-        client = QdrantClient(
-            url=IngestionConfig.QDRANT_URL,
-            api_key=IngestionConfig.QDRANT_API_KEY or None,
-            timeout=600,
-            prefer_grpc=IngestionConfig.USE_GRPC,
-        )
-
-        try:
-            info = client.get_collection(IngestionConfig.COLLECTION_NAME)
-            logger.info("Connected to %s (points=%s)", IngestionConfig.COLLECTION_NAME, info.points_count)
-            validate_qdrant_collection_schema(client, IngestionConfig.COLLECTION_NAME)
-        except Exception as e:
-            logger.error("Failed Qdrant schema preflight for %s: %s", IngestionConfig.COLLECTION_NAME, e)
-            return
-
-    sink = build_ingestion_sink(client=client)
-    logger.info("PMC ingestion sink backend=%s dry_run=%s", backend, IngestionConfig.INGEST_DRY_RUN)
+    sink = build_ingestion_sink(namespace_override=IngestionConfig.TURBOPUFFER_NAMESPACE_PMC)
+    logger.info("PMC ingestion sink backend=turbopuffer dry_run=%s", IngestionConfig.INGEST_DRY_RUN)
 
     processed_ids = load_checkpoint()
     processed_lock = threading.Lock()
@@ -774,9 +718,6 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
         return
         
     logger.info("Found %s XML/NXML files to process", len(all_xml_files))
-
-    # Create shared sparse encoder (thread-safe, stateless)
-    sparse_encoder = _create_sparse_encoder()
 
     # Calculate batches
     THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE # e.g. 25
@@ -811,7 +752,6 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
                     processed_ids,
                     processed_lock,
                     xml_dir,
-                    sparse_encoder,
                     delete_source,
                     sink,
                 ): batch

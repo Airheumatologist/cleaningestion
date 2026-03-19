@@ -60,7 +60,6 @@ class PmcAuthorManuscriptIngestionTests(unittest.TestCase):
                     processed_ids=set(),
                     processed_lock=threading.Lock(),
                     xml_root=xml_root,
-                    sparse_encoder=None,
                     delete_source=False,
                 )
 

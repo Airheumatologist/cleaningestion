@@ -17,7 +17,7 @@ bcrypt>=4.1.0
 
 # Vector Database
 qdrant-client>=1.16.0
-lancedb==0.29.2
+turbopuffer>=0.10.0
 grpcio>=1.78.0
 protobuf>=6.0.0
 portalocker>=3.0.0

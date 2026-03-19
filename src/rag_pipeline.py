@@ -246,7 +246,6 @@ class MedicalRAGPipeline:
         - DailyMed search runs in parallel thread
         """
         from concurrent.futures import ThreadPoolExecutor
-        from qdrant_client.models import SparseVector
         
         logger.info("🔍 Step 2: Passage Retrieval (Batch Hybrid Search)")
         
@@ -278,14 +277,16 @@ class MedicalRAGPipeline:
             len(drug_names),
         )
         
-        def _build_sparse_vectors() -> List[SparseVector]:
+        def _build_sparse_vectors() -> List[Any]:
+            if not hasattr(self.retriever, "build_sparse_query_vectors"):
+                return []
             try:
                 vectors = self.retriever.build_sparse_query_vectors(queries_to_run)
                 logger.info(f"   ⚡ Built {len(vectors)} sparse query vectors")
                 return vectors
             except Exception as e:
                 logger.warning(f"   Sparse query vector build failed: {e}")
-                return [SparseVector(indices=[], values=[]) for _ in queries_to_run]
+                return []
         
         # ========================================================================
         # OPTIMIZATION 2: Run DailyMed search in parallel with batch PMC query
