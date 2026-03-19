@@ -8,8 +8,8 @@ This codebase runs a production-oriented medical QA pipeline with:
 
 - FastAPI backend (`src/api_server.py`)
 - Query decomposition + hybrid retrieval + reranking + answer synthesis (`src/rag_pipeline.py`)
-- LanceDB as the primary vector database backend
-- Optional Qdrant compatibility mode for rollback/canary paths
+- turbopuffer as the primary vector + full-text backend
+- Optional Qdrant retrieval fallback path for rollback/canary testing
 - Optional Next.js frontend (`frontend/`)
 
 ## Architecture (ASCII)
@@ -43,16 +43,16 @@ This codebase runs a production-oriented medical QA pipeline with:
 ┌──────────────────────────────────────────────────┐
 │ Retriever Factory                                │
 │ src/retriever_factory.py                         │
-│ RETRIEVAL_BACKEND=lancedb | qdrant              │
+│ RETRIEVAL_BACKEND=turbopuffer | qdrant          │
 │ RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true|false  │
 └───────────────┬──────────────────────────────────┘
                 │
      ┌──────────┴──────────┐
      ▼                     ▼
 ┌───────────────┐   ┌───────────────┐
-│ LanceDB       │   │ Qdrant        │
+│ turbopuffer   │   │ Qdrant        │
 │ retriever     │   │ retriever     │
-│ primary path  │   │ compat/fallback│
+│ primary path  │   │ fallback      │
 └───────────────┘   └───────────────┘
                 │
                 ▼
@@ -88,23 +88,24 @@ This codebase runs a production-oriented medical QA pipeline with:
                                │ build points + embeddings
                                ▼
 ┌───────────────────────────────────────────────────────────┐
-│ Sink selector                                             │
+│ Sink selector (compat shim)                              │
 │ scripts/lancedb_ingestion_sink.py                        │
-│ VECTOR_BACKEND=lancedb (default) | qdrant                │
+│ -> scripts/turbopuffer_ingestion_sink.py                 │
 └───────────────┬─────────────────────────────┬─────────────┘
-                │                             │
-                ▼                             ▼
-┌───────────────────────────┐      ┌───────────────────────────┐
-│ LanceDBIngestionSink      │      │ QdrantIngestionSink       │
-│ writes rows to LanceDB    │      │ upsert_with_retry client  │
-│ periodic reindex optional │      │                           │
-└───────────────┬───────────┘      └───────────────┬───────────┘
-                │                                   │
-                ▼                                   ▼
-┌───────────────────────────┐      ┌───────────────────────────┐
-│ LanceDB table             │      │ Qdrant collection         │
-│ + index manager tooling   │      │ (compat / rollback mode)  │
-└───────────────────────────┘      └───────────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────────────────────────┐
+│ TurbopufferIngestionSink                                 │
+│ - dense-only vectors                                      │
+│ - native BM25 full-text fields                            │
+│ - namespace routing: medical_pmc / medical_pubmed / ...   │
+└───────────────┬───────────────────────────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────────────────────────┐
+│ turbopuffer namespaces                                     │
+│ medical_pmc | medical_pubmed | medical_dailymed           │
+└───────────────────────────────────────────────────────────┘
 ```
 
 Migration tracker and validation logs:
@@ -180,14 +181,16 @@ Required keys:
 
 - `DEEPINFRA_API_KEY`
 - `GROQ_API_KEY`
+- `TURBOPUFFER_API_KEY`
 
-3. Set migration-era backend flags (recommended).
+3. Set backend flags (recommended).
 
 ```bash
-export RETRIEVAL_BACKEND=lancedb
-export LANCEDB_URI=./medical_data.lancedb
-export LANCEDB_TABLE=medical_docs
-export VECTOR_BACKEND=lancedb
+export RETRIEVAL_BACKEND=turbopuffer
+export VECTOR_BACKEND=turbopuffer
+export TURBOPUFFER_NAMESPACE_PMC=medical_pmc
+export TURBOPUFFER_NAMESPACE_PUBMED=medical_pubmed
+export TURBOPUFFER_NAMESPACE_DAILYMED=medical_dailymed
 ```
 
 Optional local auth bypass:
@@ -259,16 +262,15 @@ Notes:
 
 | Variable | Default | Used for |
 | --- | --- | --- |
-| `VECTOR_BACKEND` | `lancedb` | Select sink backend (`lancedb` or `qdrant`) |
-| `LANCEDB_URI` | `./medical_data.lancedb` | LanceDB database path/URI |
-| `LANCEDB_TABLE` | `medical_docs` | LanceDB table name |
-| `LANCEDB_REINDEX_INTERVAL_BATCHES` | `50` | Auto index rebuild cadence (0 disables) |
+| `VECTOR_BACKEND` | `turbopuffer` | Ingestion backend mode |
+| `TURBOPUFFER_API_KEY` | empty | turbopuffer auth token |
+| `TURBOPUFFER_NAMESPACE_PMC` | `medical_pmc` | PMC ingestion namespace |
+| `TURBOPUFFER_NAMESPACE_PUBMED` | `medical_pubmed` | PubMed ingestion namespace |
+| `TURBOPUFFER_NAMESPACE_DAILYMED` | `medical_dailymed` | DailyMed ingestion namespace |
+| `TURBOPUFFER_WRITE_BATCH_SIZE` | `500` | Rows per write call |
+| `TURBOPUFFER_MAX_CONCURRENT_WRITES` | `4` | Parallel write ceiling |
+| `TURBOPUFFER_MAX_RETRIES` | `5` | Retry attempts for write failures |
 | `INGEST_DRY_RUN` | `false` | Compute rows without writing |
-| `QDRANT_URL` | `http://localhost:6333` | Qdrant endpoint (only used when backend is qdrant) |
-| `QDRANT_API_KEY` | empty | Qdrant auth token |
-| `QDRANT_GRPC_URL` | `localhost:6334` | Qdrant gRPC endpoint |
-| `COLLECTION_NAME` / `QDRANT_COLLECTION` | `rag_pipeline` | Qdrant collection name |
-| `USE_GRPC` | `true` | Qdrant client transport preference |
 | `BATCH_SIZE` | `100` | Ingestion batch size |
 | `MAX_WORKERS` | `8` | Parallel workers |
 | `MAX_RETRIES` | `3` | Retry attempts for transient failures |
@@ -276,56 +278,58 @@ Notes:
 | `INGESTION_EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-0.6B-batch` | Ingestion embedding model |
 | `CHUNK_SIZE_TOKENS` | `2048` | Chunk size |
 | `CHUNK_OVERLAP_TOKENS` | `256` | Chunk overlap |
-| `SPARSE_ENABLED` | `true` | Sparse signal creation |
-| `SPARSE_MODE` | `bm25` | Sparse strategy |
 
 ### Runtime retrieval variables (`src/config.py`)
 
 | Variable | Default | Used for |
 | --- | --- | --- |
-| `RETRIEVAL_BACKEND` | `qdrant` | Runtime retriever choice |
-| `RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR` | `true` | Fall back to Qdrant if LanceDB init fails |
-| `LANCEDB_URI` | `./medical_data.lancedb` | Runtime LanceDB URI |
-| `LANCEDB_TABLE` | `medical_docs` | Runtime LanceDB table |
-| `RETRIEVAL_PREFILTER` | `true` | LanceDB filtered search prefiltering |
+| `RETRIEVAL_BACKEND` | `turbopuffer` | Runtime retriever choice |
+| `RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR` | `true` | Fall back to Qdrant if turbopuffer init fails |
+| `TURBOPUFFER_API_KEY` | empty | turbopuffer auth token |
+| `TURBOPUFFER_NAMESPACE_PMC` | `medical_pmc` | PMC retrieval namespace |
+| `TURBOPUFFER_NAMESPACE_PUBMED` | `medical_pubmed` | PubMed retrieval namespace |
+| `TURBOPUFFER_NAMESPACE_DAILYMED` | `medical_dailymed` | DailyMed retrieval namespace |
+| `RETRIEVAL_RRF_K` | `60` | RRF fusion constant |
+| `RETRIEVAL_DENSE_WEIGHT` | `0.7` | Dense component weight |
+| `RETRIEVAL_SPARSE_WEIGHT` | `0.3` | BM25/lexical component weight |
 
 ### Recommended env profiles
 
-LanceDB primary (recommended now):
+turbopuffer primary (recommended):
 
 ```env
-VECTOR_BACKEND=lancedb
-LANCEDB_URI=./medical_data.lancedb
-LANCEDB_TABLE=medical_docs
-LANCEDB_REINDEX_INTERVAL_BATCHES=50
+VECTOR_BACKEND=turbopuffer
+TURBOPUFFER_API_KEY=<set-turbopuffer-api-key>
+TURBOPUFFER_NAMESPACE_PMC=medical_pmc
+TURBOPUFFER_NAMESPACE_PUBMED=medical_pubmed
+TURBOPUFFER_NAMESPACE_DAILYMED=medical_dailymed
+TURBOPUFFER_WRITE_BATCH_SIZE=500
 INGEST_DRY_RUN=false
 
-RETRIEVAL_BACKEND=lancedb
+RETRIEVAL_BACKEND=turbopuffer
 RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true
-RETRIEVAL_PREFILTER=true
 ```
 
-Qdrant compatibility / rollback mode:
+Qdrant retrieval fallback mode:
 
 ```env
-VECTOR_BACKEND=qdrant
+RETRIEVAL_BACKEND=qdrant
+RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true
 QDRANT_URL=http://localhost:6333
 QDRANT_API_KEY=<set-if-needed>
 QDRANT_COLLECTION=rag_pipeline
-USE_GRPC=true
-
-RETRIEVAL_BACKEND=qdrant
-RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true
 ```
 
-## Ingestion (LanceDB Primary)
+## Ingestion (turbopuffer Primary)
 
 Set backend before running ingestion scripts:
 
 ```bash
-export VECTOR_BACKEND=lancedb
-export LANCEDB_URI=./medical_data.lancedb
-export LANCEDB_TABLE=medical_docs
+export VECTOR_BACKEND=turbopuffer
+export TURBOPUFFER_API_KEY=<set-turbopuffer-api-key>
+export TURBOPUFFER_NAMESPACE_PMC=medical_pmc
+export TURBOPUFFER_NAMESPACE_PUBMED=medical_pubmed
+export TURBOPUFFER_NAMESPACE_DAILYMED=medical_dailymed
 ```
 
 Run source ingesters:
@@ -339,10 +343,7 @@ python3 scripts/21_ingest_pubmed_abstracts.py --input /data/ingestion/pubmed_bas
 Direct PMC S3 ingest (no local XML staging):
 
 ```bash
-# Optional: cloud connectivity + Arrow batch smoke write
-python3 scripts/lancedb_cloud_pyarrow_smoke.py --uri "$LANCEDB_URI" --table my_table3
-
-# Precreate target table with first valid PMC row
+# Precreate target namespace with first valid PMC write
 python3 scripts/06_ingest_pmc_s3.py \
   --datasets pmc_oa,author_manuscript \
   --release-mode all \
@@ -358,38 +359,23 @@ python3 scripts/06_ingest_pmc_s3.py \
   --workers 4
 ```
 
-Build/validate LanceDB indexes:
-
-```bash
-python3 scripts/lancedb_index_manager.py --uri ./medical_data.lancedb --table medical_docs --json build
-python3 scripts/lancedb_index_manager.py --uri ./medical_data.lancedb --table medical_docs --json status
-python3 scripts/lancedb_index_manager.py --uri ./medical_data.lancedb --table medical_docs --json validate
-```
-
 ## Backend Selection and Rollback
 
 Runtime retriever backend is selected by `RETRIEVAL_BACKEND`:
 
-- `lancedb`: uses `src/retriever_lancedb.py`
+- `turbopuffer`: uses `src/retriever_turbopuffer.py` (primary)
 - `qdrant`: uses `src/retriever_qdrant.py`
+- `lancedb`: legacy retriever (only if dependency installed)
 
-`RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true` allows automatic fallback to Qdrant if LanceDB retriever initialization fails.
+`RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true` allows automatic fallback to Qdrant if primary retriever initialization fails.
 
-## Migration Operations Toolkit
+## Validation Commands
 
-- Compatibility smoke: `scripts/lancedb_compat_smoke.py`
-- Schema parity: `scripts/lancedb_schema_parity.py`
-- Index manager: `scripts/lancedb_index_manager.py`
-- Benchmark shootout: `scripts/lancedb_benchmark_shootout.py`
-- Dual-read canary: `scripts/lancedb_dual_read_canary.py`
-- Decommission audit: `scripts/lancedb_decommission_audit.py`
-
-Example checks:
+Run targeted regression checks:
 
 ```bash
-python3 -m unittest tests/test_lancedb_compat_smoke.py
-python3 -m unittest tests/test_lancedb_schema_parity.py
-python3 -m unittest tests/test_lancedb_index_manager.py
+python3 -m pytest -q tests/test_turbopuffer_ingestion_sink.py
+python3 -m pytest -q tests/test_pipeline_fanout_routing.py tests/test_pmc_ingest_author_manuscript.py tests/test_recency_selection.py
 ```
 
 ## Repo Layout
@@ -397,7 +383,7 @@ python3 -m unittest tests/test_lancedb_index_manager.py
 ```text
 src/                    API server and RAG runtime
 scripts/                ingestion + migration utilities
-schema/                 LanceDB schema/index contracts
+schema/                 schema/index contracts (legacy + active)
 tests/                  unit and migration gates
 frontend/               optional Next.js UI
 ingestionplan.md        migration execution tracker
