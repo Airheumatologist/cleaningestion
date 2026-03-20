@@ -47,22 +47,24 @@ class DailyMedDeleteSourceTests(unittest.TestCase):
                 mock.patch.object(module, "_parse_spl_xml_with_status", side_effect=parse_side_effect),
                 mock.patch.object(module, "create_chunks", side_effect=chunks_side_effect),
                 mock.patch.object(module, "build_points", return_value=([object(), object()], ["a", "b"])),
-                mock.patch.object(module, "upsert_with_retry"),
                 mock.patch.object(module, "append_checkpoint_file") as append_mock,
             ):
+                sink = mock.Mock()
+                sink.write_points.return_value = 2
                 inserted, _skipped = module.process_batch(
                     client=mock.Mock(),
                     batch_files=[ok1, ok2, bad],
                     embedding_provider=mock.Mock(),
-                    sparse_encoder=None,
                     processed_ids=processed_ids,
                     processed_lock=lock,
                     chunker=mock.Mock(),
                     refresh=False,
                     delete_source=True,
+                    sink=sink,
                 )
 
             self.assertEqual(inserted, 2)
+            sink.write_points.assert_called_once()
             self.assertFalse(ok1.exists())
             self.assertFalse(ok2.exists())
             self.assertTrue(bad.exists())
@@ -85,24 +87,57 @@ class DailyMedDeleteSourceTests(unittest.TestCase):
                 mock.patch.object(module, "_parse_spl_xml_with_status", return_value=({"set_id": "ok1"}, "ok")),
                 mock.patch.object(module, "create_chunks", return_value=[{"text": "content", "chunk_id": "ok1_chunk", "set_id": "ok1"}]),
                 mock.patch.object(module, "build_points", return_value=([object()], ["x"])),
-                mock.patch.object(module, "upsert_with_retry", side_effect=RuntimeError("upsert failed")),
+                mock.patch.object(module, "append_checkpoint_file") as append_mock,
+            ):
+                sink = mock.Mock()
+                sink.write_points.side_effect = RuntimeError("upsert failed")
+                inserted, skipped = module.process_batch(
+                    client=mock.Mock(),
+                    batch_files=[ok1],
+                    embedding_provider=mock.Mock(),
+                    processed_ids=set(),
+                    processed_lock=threading.Lock(),
+                    chunker=mock.Mock(),
+                    refresh=False,
+                    delete_source=True,
+                    sink=sink,
+                )
+
+            self.assertEqual(inserted, 0)
+            self.assertEqual(skipped, 0)
+            self.assertTrue(ok1.exists())
+            append_mock.assert_not_called()
+
+    def test_checkpoint_is_not_appended_when_sink_write_fails(self):
+        module = load_dailymed_module()
+
+        with TemporaryDirectory() as tmp:
+            ok1 = Path(tmp) / "ok1.xml"
+            ok1.write_text("<label/>", encoding="utf-8")
+            sink = mock.Mock()
+            sink.write_points.side_effect = RuntimeError("turbopuffer write failed")
+
+            with (
+                mock.patch.object(module, "_parse_spl_xml_with_status", return_value=({"set_id": "ok1"}, "ok")),
+                mock.patch.object(module, "create_chunks", return_value=[{"text": "content", "chunk_id": "ok1_chunk", "set_id": "ok1"}]),
+                mock.patch.object(module, "build_points", return_value=([object()], ["x"])),
                 mock.patch.object(module, "append_checkpoint_file") as append_mock,
             ):
                 inserted, skipped = module.process_batch(
                     client=mock.Mock(),
                     batch_files=[ok1],
                     embedding_provider=mock.Mock(),
-                    sparse_encoder=None,
                     processed_ids=set(),
                     processed_lock=threading.Lock(),
                     chunker=mock.Mock(),
                     refresh=False,
-                    delete_source=True,
+                    delete_source=False,
+                    sink=sink,
                 )
 
             self.assertEqual(inserted, 0)
             self.assertEqual(skipped, 0)
-            self.assertTrue(ok1.exists())
+            sink.write_points.assert_called_once()
             append_mock.assert_not_called()
 
 

@@ -1,4 +1,4 @@
-"""turbopuffer retriever adapter with Qdrant-compatible output contract."""
+"""turbopuffer retriever adapter with pipeline-compatible output contract."""
 
 from __future__ import annotations
 
@@ -20,8 +20,13 @@ from .config import (
     HF_INFERENCE_EMBED_TIMEOUT_SECONDS,
     HF_INFERENCE_ENDPOINT_API_KEY,
     HF_INFERENCE_ENDPOINT_URL,
+    RETRIEVAL_DENSE_WEIGHT,
+    RETRIEVAL_RRF_K,
+    RETRIEVAL_SPARSE_WEIGHT,
     SCORE_THRESHOLD,
     TURBOPUFFER_API_KEY,
+    TURBOPUFFER_REGION,
+    TURBOPUFFER_TIMEOUT_SECONDS,
     TURBOPUFFER_NAMESPACE_DAILYMED,
     TURBOPUFFER_NAMESPACE_PMC,
     TURBOPUFFER_NAMESPACE_PUBMED,
@@ -61,10 +66,16 @@ class TurbopufferRetriever:
         self.embedding_model = EMBEDDING_MODEL
         self.embedding_provider = EMBEDDING_PROVIDER
         self.use_hybrid_search = USE_HYBRID_SEARCH
+        self.rrf_k = RETRIEVAL_RRF_K
 
-        self.ns_pmc = tpuf.Namespace(TURBOPUFFER_NAMESPACE_PMC, api_key=TURBOPUFFER_API_KEY)
-        self.ns_pubmed = tpuf.Namespace(TURBOPUFFER_NAMESPACE_PUBMED, api_key=TURBOPUFFER_API_KEY)
-        self.ns_dailymed = tpuf.Namespace(TURBOPUFFER_NAMESPACE_DAILYMED, api_key=TURBOPUFFER_API_KEY)
+        self.tpuf = tpuf.Turbopuffer(
+            api_key=TURBOPUFFER_API_KEY,
+            region=TURBOPUFFER_REGION,
+            timeout=TURBOPUFFER_TIMEOUT_SECONDS,
+        )
+        self.ns_pmc = self.tpuf.namespace(TURBOPUFFER_NAMESPACE_PMC)
+        self.ns_pubmed = self.tpuf.namespace(TURBOPUFFER_NAMESPACE_PUBMED)
+        self.ns_dailymed = self.tpuf.namespace(TURBOPUFFER_NAMESPACE_DAILYMED)
 
         self.openai_client = None
         if self.embedding_provider == "hf_inference_endpoint":
@@ -124,14 +135,13 @@ class TurbopufferRetriever:
             return [str(value)]
         return []
 
-    @staticmethod
-    def _rrf_scores(rows: List[Dict[str, Any]], weight: float) -> Dict[str, float]:
+    def _rrf_scores(self, rows: List[Dict[str, Any]], weight: float) -> Dict[str, float]:
         scores: Dict[str, float] = {}
         for rank, row in enumerate(rows, 1):
             key = str(row.get("_rank_key", ""))
             if not key:
                 continue
-            scores[key] = scores.get(key, 0.0) + ((1.0 / (60.0 + rank)) * weight)
+            scores[key] = scores.get(key, 0.0) + ((1.0 / (float(self.rrf_k) + rank)) * weight)
         return scores
 
     @staticmethod
@@ -146,7 +156,7 @@ class TurbopufferRetriever:
         if query_embedding is None:
             return []
         try:
-            result = ns.query(vector=query_embedding, top_k=limit, include_attributes=True)
+            result = ns.query(rank_by=["vector", "ANN", query_embedding], top_k=limit, include_attributes=True)
             rows = getattr(result, "rows", None) or getattr(result, "results", None) or []
             return [dict(r) for r in rows]
         except Exception as exc:
@@ -155,11 +165,23 @@ class TurbopufferRetriever:
 
     def _query_namespace_fts(self, ns: Any, query_text: str, limit: int) -> List[Dict[str, Any]]:
         try:
-            result = ns.query(text=query_text, top_k=limit, include_attributes=True)
+            result = ns.query(rank_by=["page_content", "BM25", query_text], top_k=limit, include_attributes=True)
             rows = getattr(result, "rows", None) or getattr(result, "results", None) or []
             return [dict(r) for r in rows]
         except Exception as exc:
             logger.warning("FTS query failed: %s", exc)
+            return []
+
+    def _query_namespace_fts_with_title_fallback(self, ns: Any, query_text: str, limit: int) -> List[Dict[str, Any]]:
+        rows = self._query_namespace_fts(ns, query_text, limit)
+        if rows:
+            return rows
+        try:
+            result = ns.query(rank_by=["title", "BM25", query_text], top_k=limit, include_attributes=True)
+            fallback_rows = getattr(result, "rows", None) or getattr(result, "results", None) or []
+            return [dict(r) for r in fallback_rows]
+        except Exception as exc:
+            logger.warning("Title BM25 fallback failed: %s", exc)
             return []
 
     def _row_to_passage(self, row: Dict[str, Any], score: float, stype: str) -> Dict[str, Any]:
@@ -219,8 +241,8 @@ class TurbopufferRetriever:
         self,
         queries: List[str],
         sparse_vectors: Optional[List[Any]] = None,
-        dense_weight: float = 0.7,
-        sparse_weight: float = 0.3,
+        dense_weight: float = RETRIEVAL_DENSE_WEIGHT,
+        sparse_weight: float = RETRIEVAL_SPARSE_WEIGHT,
         **filter_kwargs: Any,
     ) -> List[Dict[str, Any]]:
         _ = sparse_vectors, filter_kwargs
@@ -237,7 +259,7 @@ class TurbopufferRetriever:
             fts_rows: List[Dict[str, Any]] = []
             for ns in namespaces:
                 dense_rows.extend(self._query_namespace_dense(ns, dense_embeddings[i], self.n_retrieval))
-                fts_rows.extend(self._query_namespace_fts(ns, query, self.n_retrieval))
+                fts_rows.extend(self._query_namespace_fts_with_title_fallback(ns, query, self.n_retrieval))
 
             for row in dense_rows:
                 key = self._rank_key_from_row(row)
@@ -327,8 +349,8 @@ class TurbopufferRetriever:
         self,
         query: str,
         passages: List[Dict[str, Any]],
-        dense_weight: float = 0.7,
-        sparse_weight: float = 0.3,
+        dense_weight: float = RETRIEVAL_DENSE_WEIGHT,
+        sparse_weight: float = RETRIEVAL_SPARSE_WEIGHT,
     ) -> List[Dict[str, Any]]:
         if not passages:
             return passages

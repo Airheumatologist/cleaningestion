@@ -59,6 +59,7 @@ class PmcAuthorManuscriptIngestionTests(unittest.TestCase):
                     embedding_provider=mock.Mock(),
                     processed_ids=set(),
                     processed_lock=threading.Lock(),
+                    inflight_ids=set(),
                     xml_root=xml_root,
                     delete_source=False,
                 )

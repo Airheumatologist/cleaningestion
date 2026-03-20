@@ -21,7 +21,6 @@ from config_ingestion import IngestionConfig
 
 logger = logging.getLogger(__name__)
 
-
 @dataclass
 class IngestionSinkStats:
     rows_written: int = 0
@@ -61,9 +60,33 @@ def _coerce_scalar(value: Any) -> Any:
     return str(value)
 
 
+def _infer_schema_type(values: list[Any]) -> Any:
+    non_null_values = [value for value in values if value is not None]
+    if not non_null_values:
+        return "string"
+
+    if all(isinstance(value, bool) for value in non_null_values):
+        return "bool"
+
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in non_null_values):
+        return "int"
+
+    if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in non_null_values):
+        return "float" if any(isinstance(value, float) for value in non_null_values) else "int"
+
+    if all(isinstance(value, list) for value in non_null_values):
+        if all(
+            all(item is None or isinstance(item, str) for item in value)
+            for value in non_null_values
+        ):
+            return "[]string"
+
+    return "string"
+
+
 class TurbopufferIngestionSink(BaseIngestionSink):
     def __init__(self, namespace: str, dry_run: bool = False):
-        if getattr(tpuf, "Namespace", None) is None:
+        if getattr(tpuf, "Turbopuffer", None) is None:
             raise RuntimeError("turbopuffer package is not installed. Install requirements first.")
         if not IngestionConfig.TURBOPUFFER_API_KEY:
             raise RuntimeError("TURBOPUFFER_API_KEY is required for turbopuffer ingestion")
@@ -74,16 +97,41 @@ class TurbopufferIngestionSink(BaseIngestionSink):
         self._lock = threading.Lock()
         self._schema_declared = False
         self.stats = IngestionSinkStats()
-        self.ns = tpuf.Namespace(namespace, api_key=IngestionConfig.TURBOPUFFER_API_KEY)
+        client = tpuf.Turbopuffer(
+            api_key=IngestionConfig.TURBOPUFFER_API_KEY,
+            region=IngestionConfig.TURBOPUFFER_REGION,
+        )
+        self.ns = client.namespace(namespace)
 
     @staticmethod
     def _schema_for_columns(columns: dict[str, list[Any]]) -> dict[str, Any]:
+        vector_dims = IngestionConfig.get_vector_size()
+        int_fields = {"year", "evidence_level", "chunk_index", "total_chunks", "table_count", "token_count"}
+        float_fields = {"section_weight", "ingestion_timestamp"}
+        bool_fields = {
+            "is_table",
+            "is_author_manuscript",
+            "has_full_text",
+            "is_open_access",
+            "has_tables",
+            "is_gov_affiliated",
+            "has_structured_abstract",
+        }
+        list_string_fields = {"keywords", "mesh_terms", "publication_type", "active_ingredients", "gov_agencies"}
         schema: dict[str, Any] = {}
-        for key in columns:
+        for key, values in columns.items():
             if key == "id":
-                schema[key] = {"type": "uuid"}
+                schema[key] = "uuid"
             elif key == "vector":
-                schema[key] = {"type": "f16"}
+                schema[key] = {"type": f"[{vector_dims}]f16", "ann": True}
+            elif key in int_fields:
+                schema[key] = "int"
+            elif key in float_fields:
+                schema[key] = "float"
+            elif key in bool_fields:
+                schema[key] = "bool"
+            elif key in list_string_fields:
+                schema[key] = "[]string"
             elif key in {
                 "page_content",
                 "title",
@@ -97,7 +145,8 @@ class TurbopufferIngestionSink(BaseIngestionSink):
             }:
                 schema[key] = {"type": "string", "filterable": False}
             else:
-                schema[key] = {"type": "string"}
+                inferred = _infer_schema_type(values)
+                schema[key] = inferred
         if "page_content" in schema:
             schema["page_content"] = {
                 "type": "string",
@@ -119,7 +168,13 @@ class TurbopufferIngestionSink(BaseIngestionSink):
         point_id = str(getattr(point, "id", ""))
         row: dict[str, Any] = {"id": point_id, "vector": _extract_dense_vector(vector)}
         for key, value in payload.items():
-            row[key] = _coerce_scalar(value)
+            coerced = _coerce_scalar(value)
+            if key == "section_weight" and coerced is not None:
+                try:
+                    coerced = float(coerced)
+                except (TypeError, ValueError):
+                    coerced = 0.0
+            row[key] = coerced
         return row
 
     @staticmethod
@@ -135,7 +190,7 @@ class TurbopufferIngestionSink(BaseIngestionSink):
     def _write_columns_with_retry(self, columns: dict[str, list[Any]]) -> None:
         for attempt in range(1, self.max_retries + 1):
             try:
-                kwargs: dict[str, Any] = {"upsert_columns": columns}
+                kwargs: dict[str, Any] = {"upsert_columns": columns, "distance_metric": "cosine_distance"}
                 if not self._schema_declared:
                     kwargs["schema"] = self._schema_for_columns(columns)
                 self.ns.write(**kwargs)

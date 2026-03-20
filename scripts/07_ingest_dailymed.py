@@ -32,7 +32,7 @@ try:
         append_checkpoint as append_checkpoint_file,
     )
     from ingestion_utils import Chunker as BaseChunker
-    from lancedb_ingestion_sink import BaseIngestionSink, build_ingestion_sink
+    from turbopuffer_ingestion_sink import BaseIngestionSink, build_ingestion_sink
     
     # Import enhanced utilities for semantic chunking and validation
     try:
@@ -803,24 +803,27 @@ def process_batch(
                                         validate_chunks=ENHANCED_UTILS_AVAILABLE, dedup_chunks=ENHANCED_UTILS_AVAILABLE)
         
         if points:
-            if sink is not None:
-                sink.write_points(points)
-            
-            # Update checkpoints
-            # new_ids are already namespaced via _checkpoint_id() above
-            append_checkpoint_file(CHECKPOINT_FILE, new_ids)
-            with processed_lock:
-                processed_ids.update(new_ids)
+            if sink is None:
+                logger.warning("No sink configured; skipping checkpoint update for batch")
+                return 0, len(batch_files) - len(drugs)
 
-            # Delete source XML only after successful upsert + checkpoint update
-            if delete_source:
-                for xml_path in processed_files:
-                    try:
-                        xml_path.unlink()
-                    except OSError as e:
-                        logger.warning("Failed to delete %s: %s", xml_path, e)
+            written = sink.write_points(points)
+            if written > 0:
+                # Update checkpoints only after a successful write.
+                # new_ids are already namespaced via _checkpoint_id() above
+                append_checkpoint_file(CHECKPOINT_FILE, new_ids)
+                with processed_lock:
+                    processed_ids.update(new_ids)
+
+                # Delete source XML only after successful upsert + checkpoint update
+                if delete_source:
+                    for xml_path in processed_files:
+                        try:
+                            xml_path.unlink()
+                        except OSError as e:
+                            logger.warning("Failed to delete %s: %s", xml_path, e)
                 
-            inserted = len(points)
+                inserted = written
     except Exception as e:
         logger.error("Batch upsert failed: %s", e)
         

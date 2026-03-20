@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,7 +57,7 @@ from ingestion_utils import (
     append_checkpoint as append_checkpoint_file,
     generate_section_id,
 )
-from lancedb_ingestion_sink import BaseIngestionSink, build_ingestion_sink
+from turbopuffer_ingestion_sink import BaseIngestionSink, build_ingestion_sink
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -578,6 +579,8 @@ def process_batch(
     embedding_provider: EmbeddingProvider,
     validate_chunks: bool = True,
     dedup_chunks: bool = True,
+    processed_ids: Optional[set[str]] = None,
+    processed_lock: Optional[threading.Lock] = None,
     sink: Optional[BaseIngestionSink] = None,
 ) -> int:
     """Process a single batch in a worker thread."""
@@ -588,12 +591,21 @@ def process_batch(
         points, ids = build_points(batch, embedding_provider,
                                    validate_chunks=validate_chunks, dedup_chunks=dedup_chunks)
         if points:
-            if sink is not None:
-                sink.write_points(points)
-            # Convert plain PMIDs to namespaced checkpoint IDs
-            checkpoint_ids = [_checkpoint_id(pmid) for pmid in ids]
-            append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
-            return len(points)
+            if sink is None:
+                logger.warning("No sink configured; skipping checkpoint update for batch")
+                return 0
+            written = sink.write_points(points)
+            if written > 0:
+                # Convert plain PMIDs to namespaced checkpoint IDs
+                checkpoint_ids = [_checkpoint_id(pmid) for pmid in ids]
+                append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
+                if processed_ids is not None:
+                    if processed_lock is not None:
+                        with processed_lock:
+                            processed_ids.update(checkpoint_ids)
+                    else:
+                        processed_ids.update(checkpoint_ids)
+                return written
     except Exception as e:
         logger.error("Batch processing failed: %s", e)
     
@@ -627,6 +639,7 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
     logger.info("PubMed ingestion sink backend=turbopuffer dry_run=%s", IngestionConfig.INGEST_DRY_RUN)
 
     processed_ids = load_checkpoint_namespaced(CHECKPOINT_FILE)
+    processed_ids_lock = threading.Lock()
     logger.info("Loaded checkpoint with %d IDs", len(processed_ids))
     logger.info("Chunking config: size=%d, overlap=%d, chunker=%s, validation=%s, dedup=%s", 
                 IngestionConfig.CHUNK_SIZE_TOKENS, 
@@ -665,8 +678,9 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
 
                 pmid = str(article.get("pmid"))
                 checkpoint_id = _checkpoint_id(pmid)
-                if checkpoint_id in processed_ids:
-                    continue
+                with processed_ids_lock:
+                    if checkpoint_id in processed_ids:
+                        continue
 
                 current_batch.append(article)
                 
@@ -695,6 +709,8 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                         embedding_provider,
                         validate_chunks=ENHANCED_UTILS_AVAILABLE,
                         dedup_chunks=ENHANCED_UTILS_AVAILABLE,
+                        processed_ids=processed_ids,
+                        processed_lock=processed_ids_lock,
                         sink=sink,
                     )
                     futures.append(future)
@@ -729,6 +745,8 @@ def run_ingestion(input_file: Path, limit: Optional[int], embedding_provider: Em
                 embedding_provider,
                 validate_chunks=ENHANCED_UTILS_AVAILABLE,
                 dedup_chunks=ENHANCED_UTILS_AVAILABLE,
+                processed_ids=processed_ids,
+                processed_lock=processed_ids_lock,
                 sink=sink,
             )
             futures.append(future)

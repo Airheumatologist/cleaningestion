@@ -48,7 +48,7 @@ from ingestion_utils import (
     get_evidence_level,
     extract_gov_affiliations_from_pubmed_xml,
 )
-from lancedb_ingestion_sink import build_ingestion_sink
+from turbopuffer_ingestion_sink import build_ingestion_sink
 from pubmed_publication_filters import (
     is_target_article,
     map_publication_type,

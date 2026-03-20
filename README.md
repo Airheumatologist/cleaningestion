@@ -9,7 +9,7 @@ This codebase runs a production-oriented medical QA pipeline with:
 - FastAPI backend (`src/api_server.py`)
 - Query decomposition + hybrid retrieval + reranking + answer synthesis (`src/rag_pipeline.py`)
 - turbopuffer as the primary vector + full-text backend
-- Optional Qdrant retrieval fallback path for rollback/canary testing
+- Runtime retrieval is turbopuffer-only
 - Optional Next.js frontend (`frontend/`)
 
 ## Architecture (ASCII)
@@ -43,17 +43,13 @@ This codebase runs a production-oriented medical QA pipeline with:
 ┌──────────────────────────────────────────────────┐
 │ Retriever Factory                                │
 │ src/retriever_factory.py                         │
-│ RETRIEVAL_BACKEND=turbopuffer | qdrant          │
-│ RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true|false  │
+│ RETRIEVAL_BACKEND=turbopuffer                    │
 └───────────────┬──────────────────────────────────┘
                 │
-     ┌──────────┴──────────┐
-     ▼                     ▼
-┌───────────────┐   ┌───────────────┐
-│ turbopuffer   │   │ Qdrant        │
-│ retriever     │   │ retriever     │
-│ primary path  │   │ fallback      │
-└───────────────┘   └───────────────┘
+┌───────────────────────────────┐
+│ turbopuffer retriever         │
+│ primary runtime path          │
+└───────────────────────────────┘
                 │
                 ▼
 ┌───────────────────────────────┐
@@ -89,8 +85,7 @@ This codebase runs a production-oriented medical QA pipeline with:
                                ▼
 ┌───────────────────────────────────────────────────────────┐
 │ Sink selector (compat shim)                              │
-│ scripts/lancedb_ingestion_sink.py                        │
-│ -> scripts/turbopuffer_ingestion_sink.py                 │
+│ scripts/turbopuffer_ingestion_sink.py                    │
 └───────────────┬─────────────────────────────┬─────────────┘
                 │
                 ▼
@@ -111,7 +106,6 @@ This codebase runs a production-oriented medical QA pipeline with:
 Migration tracker and validation logs:
 
 - `ingestionplan.md`
-- `lancedb_migration_verification_report.md`
 
 ## API Contract
 
@@ -188,6 +182,7 @@ Required keys:
 ```bash
 export RETRIEVAL_BACKEND=turbopuffer
 export VECTOR_BACKEND=turbopuffer
+export TURBOPUFFER_REGION=gcp-us-central1
 export TURBOPUFFER_NAMESPACE_PMC=medical_pmc
 export TURBOPUFFER_NAMESPACE_PUBMED=medical_pubmed
 export TURBOPUFFER_NAMESPACE_DAILYMED=medical_dailymed
@@ -284,11 +279,12 @@ Notes:
 | Variable | Default | Used for |
 | --- | --- | --- |
 | `RETRIEVAL_BACKEND` | `turbopuffer` | Runtime retriever choice |
-| `RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR` | `true` | Fall back to Qdrant if turbopuffer init fails |
 | `TURBOPUFFER_API_KEY` | empty | turbopuffer auth token |
+| `TURBOPUFFER_REGION` | `gcp-us-central1` | turbopuffer region for runtime queries |
 | `TURBOPUFFER_NAMESPACE_PMC` | `medical_pmc` | PMC retrieval namespace |
 | `TURBOPUFFER_NAMESPACE_PUBMED` | `medical_pubmed` | PubMed retrieval namespace |
 | `TURBOPUFFER_NAMESPACE_DAILYMED` | `medical_dailymed` | DailyMed retrieval namespace |
+| `TURBOPUFFER_TIMEOUT_SECONDS` | `30` | turbopuffer client timeout |
 | `RETRIEVAL_RRF_K` | `60` | RRF fusion constant |
 | `RETRIEVAL_DENSE_WEIGHT` | `0.7` | Dense component weight |
 | `RETRIEVAL_SPARSE_WEIGHT` | `0.3` | BM25/lexical component weight |
@@ -300,6 +296,7 @@ turbopuffer primary (recommended):
 ```env
 VECTOR_BACKEND=turbopuffer
 TURBOPUFFER_API_KEY=<set-turbopuffer-api-key>
+TURBOPUFFER_REGION=gcp-us-central1
 TURBOPUFFER_NAMESPACE_PMC=medical_pmc
 TURBOPUFFER_NAMESPACE_PUBMED=medical_pubmed
 TURBOPUFFER_NAMESPACE_DAILYMED=medical_dailymed
@@ -307,17 +304,7 @@ TURBOPUFFER_WRITE_BATCH_SIZE=500
 INGEST_DRY_RUN=false
 
 RETRIEVAL_BACKEND=turbopuffer
-RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true
-```
-
-Qdrant retrieval fallback mode:
-
-```env
-RETRIEVAL_BACKEND=qdrant
-RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true
-QDRANT_URL=http://localhost:6333
-QDRANT_API_KEY=<set-if-needed>
-QDRANT_COLLECTION=rag_pipeline
+TURBOPUFFER_TIMEOUT_SECONDS=30
 ```
 
 ## Ingestion (turbopuffer Primary)
@@ -327,6 +314,7 @@ Set backend before running ingestion scripts:
 ```bash
 export VECTOR_BACKEND=turbopuffer
 export TURBOPUFFER_API_KEY=<set-turbopuffer-api-key>
+export TURBOPUFFER_REGION=gcp-us-central1
 export TURBOPUFFER_NAMESPACE_PMC=medical_pmc
 export TURBOPUFFER_NAMESPACE_PUBMED=medical_pubmed
 export TURBOPUFFER_NAMESPACE_DAILYMED=medical_dailymed
@@ -359,15 +347,12 @@ python3 scripts/06_ingest_pmc_s3.py \
   --workers 4
 ```
 
-## Backend Selection and Rollback
+## Backend Selection
 
 Runtime retriever backend is selected by `RETRIEVAL_BACKEND`:
 
-- `turbopuffer`: uses `src/retriever_turbopuffer.py` (primary)
-- `qdrant`: uses `src/retriever_qdrant.py`
-- `lancedb`: legacy retriever (only if dependency installed)
-
-`RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR=true` allows automatic fallback to Qdrant if primary retriever initialization fails.
+- `turbopuffer`: uses `src/retriever_turbopuffer.py`
+- Any other value fails fast during retriever creation
 
 ## Validation Commands
 

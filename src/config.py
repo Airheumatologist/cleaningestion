@@ -193,11 +193,9 @@ RETRIEVAL_SOURCE_FANOUT_FALLBACK_BROAD = _env_bool(
     default=False,
 )
 RETRIEVAL_BACKEND = os.getenv("RETRIEVAL_BACKEND", "turbopuffer").strip().lower()
-RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR = _env_bool("RETRIEVAL_BACKEND_ROLLBACK_ON_ERROR", default=True)
-LANCEDB_URI = os.getenv("LANCEDB_URI", "./medical_data.lancedb")
-LANCEDB_TABLE = os.getenv("LANCEDB_TABLE", "medical_docs")
 RETRIEVAL_PREFILTER = _env_bool("RETRIEVAL_PREFILTER", default=True)
 TURBOPUFFER_API_KEY = os.getenv("TURBOPUFFER_API_KEY", "")
+TURBOPUFFER_REGION = os.getenv("TURBOPUFFER_REGION", "gcp-us-central1").strip()
 TURBOPUFFER_NAMESPACE_PMC = os.getenv("TURBOPUFFER_NAMESPACE_PMC", "medical_pmc")
 TURBOPUFFER_NAMESPACE_PUBMED = os.getenv("TURBOPUFFER_NAMESPACE_PUBMED", "medical_pubmed")
 TURBOPUFFER_NAMESPACE_DAILYMED = os.getenv("TURBOPUFFER_NAMESPACE_DAILYMED", "medical_dailymed")
@@ -260,14 +258,14 @@ def validate_config():
     """Validate that all required environment variables are set."""
     errors = []
 
-    if not QDRANT_URL:
-        errors.append("QDRANT_URL not set in .env")
-    if not QDRANT_API_KEY:
-        errors.append("QDRANT_API_KEY not set in .env")
     if QDRANT_QUERY_BACKEND not in {"batch", "prefetch"}:
         errors.append("QDRANT_QUERY_BACKEND must be one of: batch, prefetch")
     if RETRIEVAL_SOURCE_FANOUT_MODE not in {"parallel"}:
         errors.append("RETRIEVAL_SOURCE_FANOUT_MODE must be: parallel")
+    if RETRIEVAL_BACKEND not in {"turbopuffer"}:
+        errors.append("RETRIEVAL_BACKEND must be: turbopuffer")
+    if not TURBOPUFFER_REGION:
+        errors.append("TURBOPUFFER_REGION not set")
     # Only require DeepInfra key when it is actually used for embeddings or LLM
     if EMBEDDING_PROVIDER == "deepinfra" and not DEEPINFRA_API_KEY:
         errors.append("DEEPINFRA_API_KEY not set (required when EMBEDDING_PROVIDER=deepinfra)")
@@ -295,7 +293,10 @@ if __name__ == "__main__":
     try:
         validate_config()
         print(f"✅ QDRANT_URL: {QDRANT_URL[:50]}...")
-        print(f"✅ QDRANT_API_KEY: {QDRANT_API_KEY[:20]}...")
+        if QDRANT_API_KEY:
+            print(f"✅ QDRANT_API_KEY: {QDRANT_API_KEY[:20]}...")
+        else:
+            print("INFO: QDRANT_API_KEY not set (runtime retrieval is turbopuffer-only)")
         print(f"✅ DEEPINFRA_API_KEY: {DEEPINFRA_API_KEY[:20]}...")
         if GROQ_API_KEY:
             print(f"✅ GROQ_API_KEY: {GROQ_API_KEY[:20]}...")

@@ -26,7 +26,7 @@ from ingestion_utils import (
     append_checkpoint as append_checkpoint_file,
 )
 from ingestion_utils import Chunker as BaseChunker  # Fallback
-from lancedb_ingestion_sink import BaseIngestionSink, build_ingestion_sink
+from turbopuffer_ingestion_sink import BaseIngestionSink, build_ingestion_sink
 
 # Initialize logging FIRST before any imports that might use logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -130,6 +130,54 @@ def load_checkpoint() -> set[str]:
 
 def append_checkpoint(ids: Iterable[str]) -> None:
     append_checkpoint_file(CHECKPOINT_FILE, ids)
+
+
+def _reserve_checkpoint_ids(
+    processed_ids: set[str],
+    inflight_ids: set[str],
+    checkpoint_lock: threading.Lock,
+    candidate_ids: Iterable[str],
+) -> list[str]:
+    reserved_ids = [checkpoint_id for checkpoint_id in dict.fromkeys(candidate_ids) if checkpoint_id]
+    if not reserved_ids:
+        return []
+
+    with checkpoint_lock:
+        if any(checkpoint_id in processed_ids or checkpoint_id in inflight_ids for checkpoint_id in reserved_ids):
+            return []
+        inflight_ids.update(reserved_ids)
+    return reserved_ids
+
+
+def _release_checkpoint_ids(
+    inflight_ids: set[str],
+    checkpoint_lock: threading.Lock,
+    checkpoint_ids: Iterable[str],
+) -> None:
+    with checkpoint_lock:
+        for checkpoint_id in checkpoint_ids:
+            inflight_ids.discard(checkpoint_id)
+
+
+def _finalize_checkpoint_ids(
+    processed_ids: set[str],
+    inflight_ids: set[str],
+    checkpoint_lock: threading.Lock,
+    checkpoint_ids: Iterable[str],
+    reserved_ids: Optional[Iterable[str]] = None,
+) -> None:
+    normalized_checkpoint_ids = list(dict.fromkeys(checkpoint_ids))
+    normalized_reserved_ids = list(dict.fromkeys(reserved_ids or normalized_checkpoint_ids))
+    if not normalized_checkpoint_ids:
+        _release_checkpoint_ids(inflight_ids, checkpoint_lock, normalized_reserved_ids)
+        return
+
+    try:
+        append_checkpoint(normalized_checkpoint_ids)
+        with checkpoint_lock:
+            processed_ids.update(normalized_checkpoint_ids)
+    finally:
+        _release_checkpoint_ids(inflight_ids, checkpoint_lock, normalized_reserved_ids)
 
 
 def _extract_stem_id(xml_path: Path) -> str:
@@ -587,6 +635,7 @@ def process_batch(
     embedding_provider: EmbeddingProvider,
     processed_ids: set[str],
     processed_lock: threading.Lock,
+    inflight_ids: set[str],
     xml_root: Path,
     delete_source: bool = False,
     sink: Optional[BaseIngestionSink] = None,
@@ -596,10 +645,13 @@ def process_batch(
     
     articles: List[Dict[str, Any]] = []
     new_ids: List[str] = []
+    reserved_ids_for_write: List[str] = []
     processed_files: List[Path] = []  # Track files for potential deletion
     
     # 1. Parse all files in this batch
     for xml_path in batch_files:
+        reserved_ids: List[str] = []
+        keep_reservation = False
         try:
             source_type = _detect_source_type(xml_path, xml_root)
             
@@ -609,7 +661,13 @@ def process_batch(
                 candidate_ids.add(_checkpoint_id(source_type, stem_id))
             if stem_id and not stem_id.upper().startswith("PMC"):
                 candidate_ids.add(_checkpoint_id(source_type, f"PMC{stem_id}"))
-            if any(value in processed_ids for value in candidate_ids):
+            reserved_ids = _reserve_checkpoint_ids(
+                processed_ids,
+                inflight_ids,
+                processed_lock,
+                candidate_ids,
+            )
+            if not reserved_ids:
                 continue
 
             # For PMC OAArticles, enforce strict commercial license filtering
@@ -621,6 +679,7 @@ def process_batch(
                 require_commercial_license=strict_oa,
             )
             if not article:
+                _release_checkpoint_ids(inflight_ids, processed_lock, reserved_ids)
                 continue
 
             article["_source_type"] = source_type
@@ -631,23 +690,47 @@ def process_batch(
                 continue
 
             namespaced_id = _checkpoint_id(source_type, source_id)
+            if namespaced_id not in reserved_ids:
+                extra_reserved = _reserve_checkpoint_ids(
+                    processed_ids,
+                    inflight_ids,
+                    processed_lock,
+                    [namespaced_id],
+                )
+                if not extra_reserved:
+                    _release_checkpoint_ids(inflight_ids, processed_lock, reserved_ids)
+                    continue
+                reserved_ids.extend(extra_reserved)
+
             if namespaced_id in processed_ids:
+                _release_checkpoint_ids(inflight_ids, processed_lock, reserved_ids)
                 continue
 
             # If we get here, it's a new article
             articles.append(article)
             new_ids.append(namespaced_id)
+            reserved_ids_for_write.extend(reserved_ids)
+            keep_reservation = True
             processed_files.append(xml_path)  # Track for potential deletion
         except Exception as e:
             logger.error("Failed to parse %s: %s", xml_path.name, e)
+        finally:
+            if reserved_ids and not keep_reservation:
+                _release_checkpoint_ids(inflight_ids, processed_lock, reserved_ids)
 
     if not articles:
         return 0, len(batch_files)
 
     # 2. Build points (includes embedding)
-    points, _chunk_ids = build_points(articles, embedding_provider)
+    try:
+        points, _chunk_ids = build_points(articles, embedding_provider)
+    except Exception as e:
+        _release_checkpoint_ids(inflight_ids, processed_lock, reserved_ids_for_write)
+        logger.error("Failed to build points: %s", e)
+        return 0, 0
     
     if not points:
+        _release_checkpoint_ids(inflight_ids, processed_lock, reserved_ids_for_write)
         return 0, len(batch_files)
 
     # 3. Write to selected vector sink
@@ -659,9 +742,13 @@ def process_batch(
         
         # 4. Update checkpoint
         checkpoint_ids = list(dict.fromkeys(new_ids))
-        append_checkpoint(checkpoint_ids)
-        with processed_lock:
-            processed_ids.update(checkpoint_ids)
+        _finalize_checkpoint_ids(
+            processed_ids,
+            inflight_ids,
+            processed_lock,
+            checkpoint_ids,
+            reserved_ids_for_write,
+        )
         
         # 5. Delete source files if requested (after successful ingestion)
         if delete_source:
@@ -674,6 +761,7 @@ def process_batch(
             
         return len(points), len(batch_files) - len(articles) # inserted, skipped
     except Exception as e:
+        _release_checkpoint_ids(inflight_ids, processed_lock, reserved_ids_for_write)
         logger.error("Failed to upsert batch: %s", e)
         return 0, 0
 
@@ -703,6 +791,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
 
     processed_ids = load_checkpoint()
     processed_lock = threading.Lock()
+    inflight_ids: set[str] = set()
     logger.info("Already ingested from checkpoint: %s", len(processed_ids))
 
     all_xml_files = sorted(
@@ -751,6 +840,7 @@ def run_ingestion(xml_dir: Path, embedding_provider: EmbeddingProvider, delete_s
                     embedding_provider,
                     processed_ids,
                     processed_lock,
+                    inflight_ids,
                     xml_dir,
                     delete_source,
                     sink,

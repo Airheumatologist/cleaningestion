@@ -12,7 +12,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
@@ -25,7 +25,7 @@ from ingestion_utils import (
     reset_pmc_xml_parse_failure_count,
     get_pmc_xml_parse_failure_count,
 )
-from lancedb_ingestion_sink import BaseIngestionSink, build_ingestion_sink
+from turbopuffer_ingestion_sink import BaseIngestionSink, build_ingestion_sink
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -67,6 +67,41 @@ def _checkpoint_key(source: str, metadata_key: str, etag: str) -> str:
     return f"{source}:{metadata_key}:{etag}"
 
 
+def _reserve_checkpoint_key(
+    processed_ids: set[str],
+    inflight_ids: set[str],
+    checkpoint_lock: threading.Lock,
+    checkpoint_key: str,
+) -> bool:
+    with checkpoint_lock:
+        if checkpoint_key in processed_ids or checkpoint_key in inflight_ids:
+            return False
+        inflight_ids.add(checkpoint_key)
+        return True
+
+
+def _release_checkpoint_keys(
+    inflight_ids: set[str],
+    checkpoint_lock: threading.Lock,
+    checkpoint_keys: Iterable[str],
+) -> None:
+    with checkpoint_lock:
+        for checkpoint_key in checkpoint_keys:
+            inflight_ids.discard(checkpoint_key)
+
+
+def _finalize_checkpoint_key(
+    processed_ids: set[str],
+    inflight_ids: set[str],
+    checkpoint_lock: threading.Lock,
+    checkpoint_key: str,
+) -> None:
+    append_checkpoint([checkpoint_key])
+    with checkpoint_lock:
+        processed_ids.add(checkpoint_key)
+        inflight_ids.discard(checkpoint_key)
+
+
 def _select_source_type(metadata: Dict[str, Any], datasets: list[str]) -> Optional[str]:
     if "pmc_oa" in datasets and bool(metadata.get("is_pmc_openaccess")):
         return SOURCE_PMC_OA
@@ -92,7 +127,12 @@ def _process_metadata_entry(
     metadata_key: str,
     etag: str,
     datasets: list[str],
+    processed_ids: set[str],
+    inflight_ids: set[str],
+    checkpoint_lock: threading.Lock,
 ) -> Optional[Tuple[Dict[str, Any], str]]:
+    checkpoint_key = ""
+    reserved = False
     try:
         metadata = downloader_mod._download_metadata_json(metadata_key)
         if not isinstance(metadata, dict):
@@ -103,6 +143,9 @@ def _process_metadata_entry(
             return None
 
         checkpoint_key = _checkpoint_key(source_type, metadata_key, etag)
+        if not _reserve_checkpoint_key(processed_ids, inflight_ids, checkpoint_lock, checkpoint_key):
+            return None
+        reserved = True
 
         xml_url = metadata.get("xml_url")
         if not isinstance(xml_url, str) or not xml_url:
@@ -124,10 +167,14 @@ def _process_metadata_entry(
             return None
 
         article["_source_type"] = source_type
+        reserved = False
         return article, checkpoint_key
     except Exception as exc:  # pragma: no cover - network dependent
         logger.warning("Failed metadata entry %s: %s", metadata_key, exc)
         return None
+    finally:
+        if reserved:
+            _release_checkpoint_keys(inflight_ids, checkpoint_lock, [checkpoint_key])
 
 
 def _flush_articles(
@@ -138,23 +185,39 @@ def _flush_articles(
     checkpoint_ids: list[str],
     checkpoint_file: Path,
     processed_ids: set[str],
+    inflight_ids: set[str],
     checkpoint_lock: threading.Lock,
 ) -> int:
     if not articles:
         return 0
 
-    points, _chunk_ids = pmc_ingest_mod.build_points(
-        articles,
-        embedding_provider,
-    )
+    try:
+        points, _chunk_ids = pmc_ingest_mod.build_points(
+            articles,
+            embedding_provider,
+        )
+    except Exception:
+        _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
+        raise
+
     if not points:
+        _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
         return 0
 
-    written = sink.write_points(points)
+    try:
+        written = sink.write_points(points)
+    except Exception:
+        _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
+        raise
     if written > 0 and checkpoint_ids:
-        with checkpoint_lock:
+        try:
             append_checkpoint(checkpoint_file, checkpoint_ids)
-            processed_ids.update(checkpoint_ids)
+            with checkpoint_lock:
+                processed_ids.update(checkpoint_ids)
+        finally:
+            _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
+    else:
+        _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
     return written
 
 
@@ -176,6 +239,7 @@ def _run_super_batch_pipeline(
     datasets: list[str],
     workers: int,
     processed_ids: set[str],
+    inflight_ids: set[str],
     checkpoint_file: Path,
     checkpoint_lock: threading.Lock,
     article_queue_size: int,
@@ -204,7 +268,6 @@ def _run_super_batch_pipeline(
         maxsize=effective_points_queue
     )
     error_queue: queue.Queue[BaseException] = queue.Queue()
-    processed_lock = threading.Lock()
     counters = {"inserted": 0, "skipped": 0}
     embed_done_count = 0
     embed_done_lock = threading.Lock()
@@ -217,11 +280,19 @@ def _run_super_batch_pipeline(
         """One of ``embed_workers`` parallel embedding threads."""
         batch_articles: list[Dict[str, Any]] = []
         batch_checkpoint_ids: list[str] = []
+
+        def _release_pending_batch() -> None:
+            if batch_checkpoint_ids:
+                _release_checkpoint_keys(inflight_ids, checkpoint_lock, batch_checkpoint_ids)
+                batch_checkpoint_ids.clear()
+            batch_articles.clear()
+
         try:
             while True:
                 try:
                     item = article_queue.get(timeout=300)
                 except Exception:
+                    _release_pending_batch()
                     break
                 if item is None:
                     # Poison pill - put back for the next waiting embed worker
@@ -232,6 +303,7 @@ def _run_super_batch_pipeline(
                 batch_checkpoint_ids.append(checkpoint_id)
                 if len(batch_articles) >= embed_article_batch_size:
                     if not error_queue.empty():
+                        _release_pending_batch()
                         break
                     try:
                         points, _ = pmc_ingest_mod.build_points(
@@ -240,6 +312,7 @@ def _run_super_batch_pipeline(
                         )
                         points_queue.put((points, batch_checkpoint_ids.copy()))
                     except Exception as exc:
+                        _release_pending_batch()
                         _enqueue_error(exc)
                         return
                     finally:
@@ -255,8 +328,12 @@ def _run_super_batch_pipeline(
                     )
                     points_queue.put((points, batch_checkpoint_ids.copy()))
                 except Exception as exc:
+                    _release_pending_batch()
                     _enqueue_error(exc)
+            elif batch_articles:
+                _release_pending_batch()
         except Exception as exc:
+            _release_pending_batch()
             _enqueue_error(exc)
         finally:
             nonlocal embed_done_count
@@ -278,14 +355,23 @@ def _run_super_batch_pipeline(
                 points, checkpoint_ids = payload
                 if not points:
                     counters["skipped"] += len(checkpoint_ids)
+                    _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
                     continue
-                written = sink.write_points(points)
+                try:
+                    written = sink.write_points(points)
+                except Exception as exc:
+                    _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
+                    raise
                 counters["inserted"] += written
-                if checkpoint_ids:
-                    with checkpoint_lock:
+                if checkpoint_ids and written > 0:
+                    try:
                         append_checkpoint(checkpoint_file, checkpoint_ids)
-                    with processed_lock:
-                        processed_ids.update(checkpoint_ids)
+                        with checkpoint_lock:
+                            processed_ids.update(checkpoint_ids)
+                    finally:
+                        _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
+                elif checkpoint_ids:
+                    _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
         except Exception as exc:
             _enqueue_error(exc)
 
@@ -318,6 +404,9 @@ def _run_super_batch_pipeline(
                 metadata_key,
                 etag,
                 datasets,
+                processed_ids,
+                inflight_ids,
+                checkpoint_lock,
             ): metadata_key
             for metadata_key, _last_modified, etag in super_batch_entries
         }
@@ -338,7 +427,12 @@ def _run_super_batch_pipeline(
                 continue
 
             article, checkpoint_id = result
-            if checkpoint_id in processed_ids:
+            should_skip = False
+            with checkpoint_lock:
+                if checkpoint_id in processed_ids:
+                    should_skip = True
+            if should_skip:
+                _release_checkpoint_keys(inflight_ids, checkpoint_lock, [checkpoint_id])
                 counters["skipped"] += 1
                 continue
             article_queue.put((article, checkpoint_id))
@@ -379,6 +473,7 @@ def run_ingestion_s3(
     embedding_provider = EmbeddingProvider()
 
     processed_ids = load_checkpoint(checkpoint_file)
+    inflight_ids: set[str] = set()
     checkpoint_lock = threading.Lock()
     logger.info("PMC S3 checkpoint loaded: %s IDs", len(processed_ids))
 
@@ -425,11 +520,25 @@ def run_ingestion_s3(
 
     if precreate_only:
         for metadata_key, _last_modified, etag in eligible_entries:
-            result = _process_metadata_entry(downloader_mod, metadata_key, etag, datasets)
+            result = _process_metadata_entry(
+                downloader_mod,
+                metadata_key,
+                etag,
+                datasets,
+                processed_ids,
+                inflight_ids,
+                checkpoint_lock,
+            )
             if result is None:
                 continue
             article, checkpoint_id = result
-            if checkpoint_id in processed_ids:
+            should_skip = False
+            with checkpoint_lock:
+                if checkpoint_id in processed_ids:
+                    should_skip = True
+            if should_skip:
+                _release_checkpoint_keys(inflight_ids, checkpoint_lock, [checkpoint_id])
+                counters["skipped"] += 1
                 continue
             written = _flush_articles(
                 pmc_ingest_mod=pmc_ingest_mod,
@@ -439,6 +548,7 @@ def run_ingestion_s3(
                 checkpoint_ids=[checkpoint_id],
                 checkpoint_file=checkpoint_file,
                 processed_ids=processed_ids,
+                inflight_ids=inflight_ids,
                 checkpoint_lock=checkpoint_lock,
             )
             total_inserted += written
@@ -458,6 +568,7 @@ def run_ingestion_s3(
                 datasets=datasets,
                 workers=workers,
                 processed_ids=processed_ids,
+                inflight_ids=inflight_ids,
                 checkpoint_file=checkpoint_file,
                 checkpoint_lock=checkpoint_lock,
                 article_queue_size=article_queue_size,
