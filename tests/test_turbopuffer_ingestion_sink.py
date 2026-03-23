@@ -95,6 +95,31 @@ class TurbopufferIngestionSinkTests(unittest.TestCase):
     @mock.patch("turbopuffer_ingestion_sink.IngestionConfig.TURBOPUFFER_API_KEY", "test-key")
     @mock.patch("turbopuffer_ingestion_sink.IngestionConfig.TURBOPUFFER_REGION", "test-region")
     @mock.patch("turbopuffer_ingestion_sink.tpuf.Turbopuffer", create=True)
+    @mock.patch("turbopuffer_ingestion_sink.IngestionConfig.TURBOPUFFER_WRITE_BATCH_SIZE", 1)
+    @mock.patch("turbopuffer_ingestion_sink.time.sleep")
+    @mock.patch("turbopuffer_ingestion_sink.time.monotonic", side_effect=[0.0, 0.0, 0.0])
+    def test_min_batch_interval_paces_writes(
+        self,
+        _mock_monotonic,
+        mock_sleep,
+        mock_tpuf_cls,
+    ):
+        client = mock.Mock()
+        ns = mock.Mock()
+        client.namespace.return_value = ns
+        mock_tpuf_cls.return_value = client
+        with mock.patch.dict("os.environ", {"TURBOPUFFER_MIN_BATCH_INTERVAL_SECONDS": "0.25"}, clear=False):
+            sink = TurbopufferIngestionSink(namespace="medical_pmc", dry_run=False)
+            p1 = _Point("77777777-7777-7777-7777-777777777777", [0.1], {"title": "x"})
+            p2 = _Point("88888888-8888-8888-8888-888888888888", [0.2], {"title": "y"})
+            sink.write_points([p1, p2])
+
+        self.assertEqual(ns.write.call_count, 2)
+        mock_sleep.assert_called_once_with(0.25)
+
+    @mock.patch("turbopuffer_ingestion_sink.IngestionConfig.TURBOPUFFER_API_KEY", "test-key")
+    @mock.patch("turbopuffer_ingestion_sink.IngestionConfig.TURBOPUFFER_REGION", "test-region")
+    @mock.patch("turbopuffer_ingestion_sink.tpuf.Turbopuffer", create=True)
     def test_dry_run_skips_writes(self, mock_namespace_cls):
         client = mock.Mock()
         ns = mock.Mock()

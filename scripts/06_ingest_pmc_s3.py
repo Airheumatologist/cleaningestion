@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import logging
 import os
@@ -16,19 +17,23 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config_ingestion import IngestionConfig, ensure_data_dirs
 from ingestion_utils import (
     EmbeddingProvider,
     append_checkpoint,
+    get_pmc_xml_parse_failure_count,
     load_checkpoint,
     parse_pmc_xml_bytes,
+    pop_last_pmc_parse_skip_reason,
     reset_pmc_xml_parse_failure_count,
-    get_pmc_xml_parse_failure_count,
 )
 from turbopuffer_ingestion_sink import BaseIngestionSink, build_ingestion_sink
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+_thread_local = threading.local()
 
 SOURCE_PMC_OA = "pmc_oa"
 SOURCE_PMC_AUTHOR = "pmc_author_manuscript"
@@ -39,6 +44,22 @@ DATASET_TO_SOURCE = {
 RELEASE_MODES = ("all", "baseline", "incremental")
 DEFAULT_CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pmc_s3_ingested_ids.txt"
 DEFAULT_STATE_FILE = IngestionConfig.DATA_DIR / ".pmc_s3_inventory_state.json"
+DEFAULT_XML_FETCH_TIMEOUT_SECONDS = int(os.getenv("PMC_S3_XML_FETCH_TIMEOUT_SECONDS", "120"))
+DEFAULT_XML_FETCH_RETRIES = int(os.getenv("PMC_S3_XML_FETCH_RETRIES", "3"))
+DEFAULT_XML_FETCH_BACKOFF_FACTOR = float(os.getenv("PMC_S3_XML_FETCH_BACKOFF_FACTOR", "0.5"))
+DEFAULT_ARTICLE_QUEUE_WAIT_TIMEOUT_SECONDS = float(
+    os.getenv("PMC_S3_ARTICLE_QUEUE_WAIT_TIMEOUT_SECONDS", "300")
+)
+DEFAULT_POINTS_QUEUE_WAIT_TIMEOUT_SECONDS = float(
+    os.getenv("PMC_S3_POINTS_QUEUE_WAIT_TIMEOUT_SECONDS", "600")
+)
+DEFAULT_NAMESPACE_SHARD_COUNT = int(os.getenv("PMC_S3_NAMESPACE_SHARD_COUNT", "1") or "1")
+DEFAULT_NAMESPACE_SHARD_PATTERN = os.getenv(
+    "PMC_S3_NAMESPACE_SHARD_PATTERN",
+    "{base}_shard_{shard}",
+)
+FAILED_METADATA_KEYS_ENV = "PMC_S3_FAILED_METADATA_KEYS_FILE"
+SKIPPED_CHECKPOINT_SUFFIX = ".skipped.tsv"
 
 
 def _load_script_module(name: str, path: Path):
@@ -110,8 +131,284 @@ def _select_source_type(metadata: Dict[str, Any], datasets: list[str]) -> Option
     return None
 
 
-def _download_xml_bytes(xml_http_url: str, timeout_seconds: int = 120) -> bytes:
-    response = requests.get(xml_http_url, timeout=timeout_seconds)
+def _derive_skipped_checkpoint_file(checkpoint_file: Path) -> Path:
+    if checkpoint_file.suffix:
+        return checkpoint_file.with_name(f"{checkpoint_file.stem}{SKIPPED_CHECKPOINT_SUFFIX}")
+    return checkpoint_file.with_name(f"{checkpoint_file.name}{SKIPPED_CHECKPOINT_SUFFIX}")
+
+
+def _load_skipped_checkpoint(skip_checkpoint_file: Path) -> set[str]:
+    if not skip_checkpoint_file.exists():
+        return set()
+
+    skipped_ids: set[str] = set()
+    try:
+        for raw_line in skip_checkpoint_file.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            checkpoint_key = line.split("\t", 1)[0].strip()
+            if checkpoint_key:
+                skipped_ids.add(checkpoint_key)
+    except Exception as exc:
+        logger.warning("Failed to load skipped checkpoint from %s: %s", skip_checkpoint_file, exc)
+        return set()
+    return skipped_ids
+
+
+def _metadata_non_open_reason(metadata: Dict[str, Any], source_type: str) -> Optional[str]:
+    if source_type != SOURCE_PMC_OA:
+        return None
+
+    bool_fields = (
+        "is_pmc_openaccess",
+        "is_open_access",
+        "open_access",
+        "openaccess",
+        "is_commercial_license",
+        "commercial_license",
+        "allows_commercial_use",
+    )
+    for field in bool_fields:
+        if field not in metadata:
+            continue
+        value = metadata.get(field)
+        if isinstance(value, bool):
+            if not value:
+                if field in {"is_commercial_license", "commercial_license", "allows_commercial_use"}:
+                    return f"metadata field {field} is false"
+                return f"metadata field {field} is false"
+            continue
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"false", "0", "no", "n"}:
+                if field in {"is_commercial_license", "commercial_license", "allows_commercial_use"}:
+                    return f"metadata field {field} is false"
+                return f"metadata field {field} is false"
+
+    license_fields = (
+        "license",
+        "license_type",
+        "license-name",
+        "license_name",
+        "license_text",
+    )
+    non_commercial_markers = (
+        "cc-by-nc",
+        "by-nc",
+        "non-commercial",
+        "noncommercial",
+    )
+    for field in license_fields:
+        value = metadata.get(field)
+        if not isinstance(value, str):
+            continue
+        lowered = value.strip().lower()
+        if lowered and any(marker in lowered for marker in non_commercial_markers):
+            return f"metadata field {field} marks a non-commercial license ({value})"
+
+    return None
+
+
+def _append_skipped_checkpoint(
+    skip_checkpoint_file: Optional[Path],
+    skip_checkpoint_lock: Optional[threading.Lock],
+    checkpoint_key: str,
+    stage: str,
+    reason: str,
+) -> None:
+    if skip_checkpoint_file is None:
+        return
+
+    safe_stage = " ".join(stage.split())
+    safe_reason = " ".join(reason.split())
+    skip_checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    lock = skip_checkpoint_lock or threading.Lock()
+    with lock:
+        with skip_checkpoint_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"{checkpoint_key}\t{safe_stage}\t{safe_reason}\n")
+
+
+def _finalize_skipped_checkpoint_key(
+    completed_ids: set[str],
+    skipped_ids: set[str],
+    inflight_ids: set[str],
+    checkpoint_lock: threading.Lock,
+    checkpoint_key: str,
+    *,
+    skip_checkpoint_file: Optional[Path],
+    skip_checkpoint_lock: Optional[threading.Lock],
+    stage: str,
+    reason: str,
+) -> None:
+    _append_skipped_checkpoint(
+        skip_checkpoint_file,
+        skip_checkpoint_lock,
+        checkpoint_key,
+        stage,
+        reason,
+    )
+    with checkpoint_lock:
+        completed_ids.add(checkpoint_key)
+        skipped_ids.add(checkpoint_key)
+        inflight_ids.discard(checkpoint_key)
+
+
+def _compute_namespace_shards(
+    *,
+    base_namespace: str,
+    shard_count: int,
+    pattern: str,
+) -> list[str]:
+    count = max(1, int(shard_count))
+    if count == 1:
+        return [base_namespace]
+
+    template = (pattern or "").strip() or "{base}_shard_{shard}"
+    if "{base}" not in template:
+        template = "{base}_" + template
+    if "{shard}" not in template:
+        template = template + "_{shard}"
+
+    namespaces: list[str] = []
+    for shard in range(count):
+        namespace = template.format(base=base_namespace, shard=shard)
+        namespaces.append(namespace)
+    return namespaces
+
+
+def _stable_shard_index(token: str, shard_count: int) -> int:
+    if shard_count <= 1:
+        return 0
+    digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big", signed=False) % shard_count
+
+
+def _extract_doc_id_from_point(point: Any) -> str:
+    payload = getattr(point, "payload", None)
+    if isinstance(payload, dict):
+        doc_id = payload.get("doc_id")
+        if doc_id is not None:
+            value = str(doc_id).strip()
+            if value:
+                return value
+    return ""
+
+
+def _extract_point_id(point: Any) -> str:
+    point_id = getattr(point, "id", None)
+    if point_id is None:
+        return ""
+    value = str(point_id).strip()
+    return value
+
+
+def _dedupe_points_for_upsert(points: list[Any]) -> list[Any]:
+    if not points:
+        return points
+
+    deduped_points: list[Any] = []
+    seen_ids: set[str] = set()
+    duplicates_removed = 0
+
+    for point in points:
+        point_id = _extract_point_id(point)
+        if point_id and point_id in seen_ids:
+            duplicates_removed += 1
+            continue
+        if point_id:
+            seen_ids.add(point_id)
+        deduped_points.append(point)
+
+    if duplicates_removed:
+        logger.warning(
+            "Dropped %s duplicate point IDs from write batch before upsert",
+            duplicates_removed,
+        )
+    return deduped_points
+
+
+def _write_points(
+    *,
+    points: list[Any],
+    checkpoint_ids: list[str],
+    sink: BaseIngestionSink,
+    shard_sinks: Optional[list[BaseIngestionSink]],
+) -> int:
+    points = _dedupe_points_for_upsert(points)
+    if not points:
+        return 0
+    if not shard_sinks or len(shard_sinks) <= 1:
+        return sink.write_points(points)
+
+    shard_count = len(shard_sinks)
+    shard_to_points: dict[int, list[Any]] = {i: [] for i in range(shard_count)}
+    fallback_token = checkpoint_ids[0] if checkpoint_ids else "pmc_s3"
+    for index, point in enumerate(points):
+        doc_id = _extract_doc_id_from_point(point)
+        route_token = doc_id or f"{fallback_token}:{index}"
+        shard_idx = _stable_shard_index(route_token, shard_count)
+        shard_to_points[shard_idx].append(point)
+
+    written = 0
+    for shard_idx in sorted(shard_to_points):
+        shard_points = shard_to_points[shard_idx]
+        if not shard_points:
+            continue
+        written += shard_sinks[shard_idx].write_points(shard_points)
+    return written
+
+
+def _get_xml_download_session(
+    *,
+    max_retries: int,
+    backoff_factor: float,
+    pool_size: int = 64,
+) -> requests.Session:
+    session_cache = getattr(_thread_local, "xml_download_sessions", None)
+    if session_cache is None:
+        session_cache = {}
+        _thread_local.xml_download_sessions = session_cache
+
+    cache_key = (max_retries, backoff_factor, pool_size)
+    session = session_cache.get(cache_key)
+    if session is not None:
+        return session
+
+    retry = Retry(
+        total=max(0, max_retries),
+        connect=max(0, max_retries),
+        read=max(0, max_retries),
+        status=max(0, max_retries),
+        backoff_factor=max(0.0, backoff_factor),
+        allowed_methods=frozenset({"GET"}),
+        status_forcelist=(408, 429, 500, 502, 503, 504),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=retry,
+    )
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session_cache[cache_key] = session
+    return session
+
+
+def _download_xml_bytes(
+    xml_http_url: str,
+    timeout_seconds: int = DEFAULT_XML_FETCH_TIMEOUT_SECONDS,
+    max_retries: int = DEFAULT_XML_FETCH_RETRIES,
+    backoff_factor: float = DEFAULT_XML_FETCH_BACKOFF_FACTOR,
+) -> bytes:
+    session = _get_xml_download_session(
+        max_retries=max_retries,
+        backoff_factor=backoff_factor,
+    )
+    response = session.get(xml_http_url, timeout=timeout_seconds)
     response.raise_for_status()
     return response.content
 
@@ -122,56 +419,225 @@ def _extract_source_name(xml_url: str) -> str:
     return name or "s3_object.xml"
 
 
+def _format_failure_reason(exc: BaseException) -> str:
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+def _append_failed_metadata_key(
+    failed_metadata_keys_file: Optional[Path],
+    failed_metadata_keys_lock: Optional[threading.Lock],
+    metadata_key: str,
+    stage: str,
+    reason: str,
+) -> None:
+    if failed_metadata_keys_file is None:
+        return
+
+    safe_reason = " ".join(reason.split())
+    failed_metadata_keys_file.parent.mkdir(parents=True, exist_ok=True)
+    lock = failed_metadata_keys_lock or threading.Lock()
+    with lock:
+        with failed_metadata_keys_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"{metadata_key}\t{stage}\t{safe_reason}\n")
+
+
+def _record_metadata_entry_issue(
+    metadata_key: str,
+    stage: str,
+    reason: str,
+    *,
+    failed_metadata_keys_file: Optional[Path],
+    failed_metadata_keys_lock: Optional[threading.Lock],
+    level: int,
+) -> None:
+    logger.log(level, "Skipping metadata entry %s at %s stage: %s", metadata_key, stage, reason)
+    _append_failed_metadata_key(
+        failed_metadata_keys_file,
+        failed_metadata_keys_lock,
+        metadata_key,
+        stage,
+        reason,
+    )
+
+
 def _process_metadata_entry(
     downloader_mod: Any,
     metadata_key: str,
     etag: str,
     datasets: list[str],
     processed_ids: set[str],
+    skipped_ids: set[str],
     inflight_ids: set[str],
     checkpoint_lock: threading.Lock,
+    xml_fetch_timeout_seconds: int = DEFAULT_XML_FETCH_TIMEOUT_SECONDS,
+    xml_fetch_retries: int = DEFAULT_XML_FETCH_RETRIES,
+    xml_fetch_backoff_factor: float = DEFAULT_XML_FETCH_BACKOFF_FACTOR,
+    failed_metadata_keys_file: Optional[Path] = None,
+    failed_metadata_keys_lock: Optional[threading.Lock] = None,
+    skip_checkpoint_file: Optional[Path] = None,
+    skip_checkpoint_lock: Optional[threading.Lock] = None,
 ) -> Optional[Tuple[Dict[str, Any], str]]:
     checkpoint_key = ""
     reserved = False
     try:
-        metadata = downloader_mod._download_metadata_json(metadata_key)
+        try:
+            metadata = downloader_mod._download_metadata_json(metadata_key)
+        except Exception as exc:
+            _record_metadata_entry_issue(
+                metadata_key,
+                "metadata fetch",
+                _format_failure_reason(exc),
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
+                level=logging.WARNING,
+            )
+            return None
+
         if not isinstance(metadata, dict):
+            _record_metadata_entry_issue(
+                metadata_key,
+                "metadata fetch",
+                "metadata payload unavailable or invalid",
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
+                level=logging.WARNING,
+            )
             return None
 
         source_type = _select_source_type(metadata, datasets)
         if source_type is None:
+            _record_metadata_entry_issue(
+                metadata_key,
+                "source filter",
+                f"metadata does not match requested datasets={','.join(datasets)}",
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
+                level=logging.INFO,
+            )
             return None
 
         checkpoint_key = _checkpoint_key(source_type, metadata_key, etag)
+        if checkpoint_key in skipped_ids:
+            return None
         if not _reserve_checkpoint_key(processed_ids, inflight_ids, checkpoint_lock, checkpoint_key):
             return None
         reserved = True
 
-        xml_url = metadata.get("xml_url")
-        if not isinstance(xml_url, str) or not xml_url:
+        early_skip_reason = _metadata_non_open_reason(metadata, source_type)
+        if early_skip_reason is not None:
+            _record_metadata_entry_issue(
+                metadata_key,
+                "metadata filter",
+                early_skip_reason,
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
+                level=logging.INFO,
+            )
+            _finalize_skipped_checkpoint_key(
+                processed_ids,
+                skipped_ids,
+                inflight_ids,
+                checkpoint_lock,
+                checkpoint_key,
+                skip_checkpoint_file=skip_checkpoint_file,
+                skip_checkpoint_lock=skip_checkpoint_lock,
+                stage="metadata filter",
+                reason=early_skip_reason,
+            )
+            reserved = False
             return None
 
-        xml_http_url = downloader_mod._normalize_s3_or_https_url(xml_url)
-        xml_name = _extract_source_name(xml_http_url)
-        xml_bytes = _download_xml_bytes(xml_http_url)
+        xml_url = metadata.get("xml_url")
+        if not isinstance(xml_url, str) or not xml_url:
+            _record_metadata_entry_issue(
+                metadata_key,
+                "xml_url missing",
+                "metadata is missing xml_url",
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
+                level=logging.INFO,
+            )
+            return None
 
-        strict_oa = source_type == SOURCE_PMC_OA
-        article = parse_pmc_xml_bytes(
-            xml_bytes,
-            source_name=xml_name,
-            require_pmid=strict_oa,
-            require_open_access=strict_oa,
-            require_commercial_license=strict_oa,
-        )
+        try:
+            xml_http_url = downloader_mod._normalize_s3_or_https_url(xml_url)
+            xml_bytes = _download_xml_bytes(
+                xml_http_url,
+                timeout_seconds=xml_fetch_timeout_seconds,
+                max_retries=xml_fetch_retries,
+                backoff_factor=xml_fetch_backoff_factor,
+            )
+        except Exception as exc:
+            _record_metadata_entry_issue(
+                metadata_key,
+                "xml download",
+                _format_failure_reason(exc),
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
+                level=logging.WARNING,
+            )
+            return None
+
+        xml_name = _extract_source_name(xml_http_url)
+
+        try:
+            article = parse_pmc_xml_bytes(
+                xml_bytes,
+                source_name=xml_name,
+                require_pmid=False,
+                require_open_access=False,
+                require_commercial_license=True,
+            )
+        except Exception as exc:
+            _record_metadata_entry_issue(
+                metadata_key,
+                "parse",
+                _format_failure_reason(exc),
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
+                level=logging.WARNING,
+            )
+            _finalize_skipped_checkpoint_key(
+                processed_ids,
+                skipped_ids,
+                inflight_ids,
+                checkpoint_lock,
+                checkpoint_key,
+                skip_checkpoint_file=skip_checkpoint_file,
+                skip_checkpoint_lock=skip_checkpoint_lock,
+                stage="parse",
+                reason=_format_failure_reason(exc),
+            )
+            reserved = False
+            return None
         if not article:
+            skip_reason = pop_last_pmc_parse_skip_reason() or "PMC XML parser returned no article"
+            _record_metadata_entry_issue(
+                metadata_key,
+                "parse",
+                skip_reason,
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
+                level=logging.WARNING,
+            )
+            _finalize_skipped_checkpoint_key(
+                processed_ids,
+                skipped_ids,
+                inflight_ids,
+                checkpoint_lock,
+                checkpoint_key,
+                skip_checkpoint_file=skip_checkpoint_file,
+                skip_checkpoint_lock=skip_checkpoint_lock,
+                stage="parse",
+                reason=skip_reason,
+            )
+            reserved = False
             return None
 
         article["_source_type"] = source_type
         reserved = False
         return article, checkpoint_key
-    except Exception as exc:  # pragma: no cover - network dependent
-        logger.warning("Failed metadata entry %s: %s", metadata_key, exc)
-        return None
     finally:
         if reserved:
             _release_checkpoint_keys(inflight_ids, checkpoint_lock, [checkpoint_key])
@@ -180,6 +646,7 @@ def _process_metadata_entry(
 def _flush_articles(
     pmc_ingest_mod: Any,
     sink: BaseIngestionSink,
+    shard_sinks: Optional[list[BaseIngestionSink]],
     embedding_provider: EmbeddingProvider,
     articles: list[Dict[str, Any]],
     checkpoint_ids: list[str],
@@ -205,7 +672,12 @@ def _flush_articles(
         return 0
 
     try:
-        written = sink.write_points(points)
+        written = _write_points(
+            points=points,
+            checkpoint_ids=checkpoint_ids,
+            sink=sink,
+            shard_sinks=shard_sinks,
+        )
     except Exception:
         _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
         raise
@@ -235,17 +707,28 @@ def _run_super_batch_pipeline(
     downloader_mod: Any,
     pmc_ingest_mod: Any,
     sink: BaseIngestionSink,
+    shard_sinks: Optional[list[BaseIngestionSink]],
     embedding_provider: EmbeddingProvider,
     datasets: list[str],
     workers: int,
     processed_ids: set[str],
+    skipped_ids: set[str],
     inflight_ids: set[str],
     checkpoint_file: Path,
     checkpoint_lock: threading.Lock,
+    skip_checkpoint_file: Optional[Path],
+    skip_checkpoint_lock: threading.Lock,
     article_queue_size: int,
     points_queue_size: int,
     embed_article_batch_size: int,
     embed_workers: int = 1,
+    xml_fetch_timeout_seconds: int = DEFAULT_XML_FETCH_TIMEOUT_SECONDS,
+    xml_fetch_retries: int = DEFAULT_XML_FETCH_RETRIES,
+    xml_fetch_backoff_factor: float = DEFAULT_XML_FETCH_BACKOFF_FACTOR,
+    article_queue_wait_timeout_seconds: float = DEFAULT_ARTICLE_QUEUE_WAIT_TIMEOUT_SECONDS,
+    points_queue_wait_timeout_seconds: float = DEFAULT_POINTS_QUEUE_WAIT_TIMEOUT_SECONDS,
+    failed_metadata_keys_file: Optional[Path] = None,
+    failed_metadata_keys_lock: Optional[threading.Lock] = None,
 ) -> tuple[int, int]:
     """Run one super-batch through a parallel pipeline.
 
@@ -290,7 +773,7 @@ def _run_super_batch_pipeline(
         try:
             while True:
                 try:
-                    item = article_queue.get(timeout=300)
+                    item = article_queue.get(timeout=article_queue_wait_timeout_seconds)
                 except Exception:
                     _release_pending_batch()
                     break
@@ -347,7 +830,7 @@ def _run_super_batch_pipeline(
         try:
             while True:
                 try:
-                    payload = points_queue.get(timeout=600)
+                    payload = points_queue.get(timeout=points_queue_wait_timeout_seconds)
                 except Exception:
                     break
                 if payload is None:
@@ -358,7 +841,12 @@ def _run_super_batch_pipeline(
                     _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
                     continue
                 try:
-                    written = sink.write_points(points)
+                    written = _write_points(
+                        points=points,
+                        checkpoint_ids=checkpoint_ids,
+                        sink=sink,
+                        shard_sinks=shard_sinks,
+                    )
                 except Exception as exc:
                     _release_checkpoint_keys(inflight_ids, checkpoint_lock, checkpoint_ids)
                     raise
@@ -405,8 +893,16 @@ def _run_super_batch_pipeline(
                 etag,
                 datasets,
                 processed_ids,
+                skipped_ids,
                 inflight_ids,
                 checkpoint_lock,
+                xml_fetch_timeout_seconds,
+                xml_fetch_retries,
+                xml_fetch_backoff_factor,
+                failed_metadata_keys_file,
+                failed_metadata_keys_lock,
+                skip_checkpoint_file,
+                skip_checkpoint_lock,
             ): metadata_key
             for metadata_key, _last_modified, etag in super_batch_entries
         }
@@ -461,6 +957,14 @@ def run_ingestion_s3(
     points_queue_size: int = 32,
     embed_article_batch_size: int = 120,
     embed_workers: int = 1,
+    xml_fetch_timeout_seconds: int = DEFAULT_XML_FETCH_TIMEOUT_SECONDS,
+    xml_fetch_retries: int = DEFAULT_XML_FETCH_RETRIES,
+    xml_fetch_backoff_factor: float = DEFAULT_XML_FETCH_BACKOFF_FACTOR,
+    article_queue_wait_timeout_seconds: float = DEFAULT_ARTICLE_QUEUE_WAIT_TIMEOUT_SECONDS,
+    points_queue_wait_timeout_seconds: float = DEFAULT_POINTS_QUEUE_WAIT_TIMEOUT_SECONDS,
+    failed_metadata_keys_file: Optional[Path] = None,
+    namespace_shard_count: int = DEFAULT_NAMESPACE_SHARD_COUNT,
+    namespace_shard_pattern: str = DEFAULT_NAMESPACE_SHARD_PATTERN,
 ) -> None:
     ensure_data_dirs()
     reset_pmc_xml_parse_failure_count()
@@ -469,17 +973,49 @@ def run_ingestion_s3(
     downloader_mod = _load_script_module("download_pmc_unified_mod", scripts_dir / "01_download_pmc_unified.py")
     pmc_ingest_mod = _load_script_module("ingest_pmc_mod", scripts_dir / "06_ingest_pmc.py")
 
-    sink = build_ingestion_sink(namespace_override=IngestionConfig.TURBOPUFFER_NAMESPACE_PMC)
+    base_namespace = IngestionConfig.TURBOPUFFER_NAMESPACE_PMC
+    shard_namespaces = _compute_namespace_shards(
+        base_namespace=base_namespace,
+        shard_count=namespace_shard_count,
+        pattern=namespace_shard_pattern,
+    )
+    sink = build_ingestion_sink(namespace_override=base_namespace)
+    shard_sinks: Optional[list[BaseIngestionSink]] = None
+    if len(shard_namespaces) > 1:
+        shard_sinks = [build_ingestion_sink(namespace_override=ns) for ns in shard_namespaces]
+        logger.info(
+            "PMC S3 namespace sharding enabled: count=%s pattern=%s namespaces=%s",
+            len(shard_namespaces),
+            namespace_shard_pattern,
+            ",".join(shard_namespaces),
+        )
     embedding_provider = EmbeddingProvider()
 
     processed_ids = load_checkpoint(checkpoint_file)
+    skip_checkpoint_file = _derive_skipped_checkpoint_file(checkpoint_file)
+    skipped_ids = _load_skipped_checkpoint(skip_checkpoint_file)
+    processed_ids.update(skipped_ids)
     inflight_ids: set[str] = set()
     checkpoint_lock = threading.Lock()
-    logger.info("PMC S3 checkpoint loaded: %s IDs", len(processed_ids))
+    skip_checkpoint_lock = threading.Lock()
+    failed_metadata_keys_lock = threading.Lock()
+    logger.info(
+        "PMC S3 checkpoint loaded: %s processed IDs, %s skipped IDs",
+        len(processed_ids) - len(skipped_ids),
+        len(skipped_ids),
+    )
 
     state = downloader_mod._load_state(state_file)
     dataset_sig = downloader_mod._dataset_signature(datasets)
     cutoff = downloader_mod._select_cutoff_for_incremental(state, dataset_sig, release_mode)
+
+    completed_metadata_keys = set()
+    for cp_key in processed_ids | skipped_ids:
+        parts = cp_key.split(":")
+        if len(parts) >= 2:
+            completed_metadata_keys.add(parts[1])
+        else:
+            completed_metadata_keys.add(cp_key)
 
     eligible_entries: list[tuple[str, str, str]] = []
     max_seen_last_modified: Optional[str] = None
@@ -494,6 +1030,9 @@ def run_ingestion_s3(
             max_seen_last_modified = last_modified
 
         if not downloader_mod._should_include_entry(last_modified, cutoff):
+            continue
+
+        if metadata_key in completed_metadata_keys:
             continue
 
         included += 1
@@ -526,8 +1065,16 @@ def run_ingestion_s3(
                 etag,
                 datasets,
                 processed_ids,
+                skipped_ids,
                 inflight_ids,
                 checkpoint_lock,
+                xml_fetch_timeout_seconds,
+                xml_fetch_retries,
+                xml_fetch_backoff_factor,
+                failed_metadata_keys_file,
+                failed_metadata_keys_lock,
+                skip_checkpoint_file,
+                skip_checkpoint_lock,
             )
             if result is None:
                 continue
@@ -538,11 +1085,12 @@ def run_ingestion_s3(
                     should_skip = True
             if should_skip:
                 _release_checkpoint_keys(inflight_ids, checkpoint_lock, [checkpoint_id])
-                counters["skipped"] += 1
+                total_skipped += 1
                 continue
             written = _flush_articles(
                 pmc_ingest_mod=pmc_ingest_mod,
                 sink=sink,
+                shard_sinks=shard_sinks,
                 embedding_provider=embedding_provider,
                 articles=[article],
                 checkpoint_ids=[checkpoint_id],
@@ -564,17 +1112,28 @@ def run_ingestion_s3(
                 downloader_mod=downloader_mod,
                 pmc_ingest_mod=pmc_ingest_mod,
                 sink=sink,
+                shard_sinks=shard_sinks,
                 embedding_provider=embedding_provider,
                 datasets=datasets,
                 workers=workers,
                 processed_ids=processed_ids,
+                skipped_ids=skipped_ids,
                 inflight_ids=inflight_ids,
                 checkpoint_file=checkpoint_file,
                 checkpoint_lock=checkpoint_lock,
+                skip_checkpoint_file=skip_checkpoint_file,
+                skip_checkpoint_lock=skip_checkpoint_lock,
                 article_queue_size=article_queue_size,
                 points_queue_size=points_queue_size,
                 embed_article_batch_size=embed_article_batch_size,
                 embed_workers=embed_workers,
+                xml_fetch_timeout_seconds=xml_fetch_timeout_seconds,
+                xml_fetch_retries=xml_fetch_retries,
+                xml_fetch_backoff_factor=xml_fetch_backoff_factor,
+                article_queue_wait_timeout_seconds=article_queue_wait_timeout_seconds,
+                points_queue_wait_timeout_seconds=points_queue_wait_timeout_seconds,
+                failed_metadata_keys_file=failed_metadata_keys_file,
+                failed_metadata_keys_lock=failed_metadata_keys_lock,
             )
             total_inserted += inserted_now
             total_skipped += skipped_now
@@ -670,6 +1229,59 @@ def main() -> None:
         type=Path,
         default=Path(os.getenv("PMC_S3_STATE_FILE", str(DEFAULT_STATE_FILE))),
     )
+    parser.add_argument(
+        "--xml-fetch-timeout-seconds",
+        type=int,
+        default=DEFAULT_XML_FETCH_TIMEOUT_SECONDS,
+        help="Timeout in seconds for XML downloads from PMC S3/HTTPS URLs.",
+    )
+    parser.add_argument(
+        "--xml-fetch-retries",
+        type=int,
+        default=DEFAULT_XML_FETCH_RETRIES,
+        help="Retry attempts for transient XML download failures.",
+    )
+    parser.add_argument(
+        "--xml-fetch-backoff-factor",
+        type=float,
+        default=DEFAULT_XML_FETCH_BACKOFF_FACTOR,
+        help="Exponential backoff factor for transient XML download retries.",
+    )
+    parser.add_argument(
+        "--article-queue-wait-timeout-seconds",
+        type=float,
+        default=DEFAULT_ARTICLE_QUEUE_WAIT_TIMEOUT_SECONDS,
+        help="How long embed workers wait for parsed articles before stopping.",
+    )
+    parser.add_argument(
+        "--points-queue-wait-timeout-seconds",
+        type=float,
+        default=DEFAULT_POINTS_QUEUE_WAIT_TIMEOUT_SECONDS,
+        help="How long the write worker waits for embedded points before stopping.",
+    )
+    parser.add_argument(
+        "--failed-metadata-keys-file",
+        type=Path,
+        default=Path(os.getenv(FAILED_METADATA_KEYS_ENV))
+        if os.getenv(FAILED_METADATA_KEYS_ENV)
+        else None,
+        help="Optional append-only TSV file for skipped/failed metadata keys and reasons.",
+    )
+    parser.add_argument(
+        "--namespace-shard-count",
+        type=int,
+        default=DEFAULT_NAMESPACE_SHARD_COUNT,
+        help="Number of turbopuffer namespaces to shard PMC S3 writes across (default: 1).",
+    )
+    parser.add_argument(
+        "--namespace-shard-pattern",
+        type=str,
+        default=DEFAULT_NAMESPACE_SHARD_PATTERN,
+        help=(
+            "Namespace naming pattern for PMC S3 sharding. "
+            "Supports {base} and {shard}; example: {base}_shard_{shard}."
+        ),
+    )
     args = parser.parse_args()
 
     run_ingestion_s3(
@@ -685,6 +1297,14 @@ def main() -> None:
         points_queue_size=args.points_queue_size,
         embed_article_batch_size=args.embed_article_batch_size,
         embed_workers=args.embed_workers,
+        xml_fetch_timeout_seconds=args.xml_fetch_timeout_seconds,
+        xml_fetch_retries=args.xml_fetch_retries,
+        xml_fetch_backoff_factor=args.xml_fetch_backoff_factor,
+        article_queue_wait_timeout_seconds=args.article_queue_wait_timeout_seconds,
+        points_queue_wait_timeout_seconds=args.points_queue_wait_timeout_seconds,
+        failed_metadata_keys_file=args.failed_metadata_keys_file,
+        namespace_shard_count=args.namespace_shard_count,
+        namespace_shard_pattern=args.namespace_shard_pattern,
     )
 
 

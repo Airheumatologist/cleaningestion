@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import threading
 import time
@@ -52,6 +53,8 @@ def _coerce_scalar(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, list):
+        if not value:
+            return None
         if all(isinstance(item, (str, int, float, bool, type(None))) for item in value):
             return value
         return json.dumps(value, ensure_ascii=True)
@@ -94,14 +97,29 @@ class TurbopufferIngestionSink(BaseIngestionSink):
         self.dry_run = dry_run
         self.batch_size = max(1, int(IngestionConfig.TURBOPUFFER_WRITE_BATCH_SIZE))
         self.max_retries = max(1, int(IngestionConfig.TURBOPUFFER_MAX_RETRIES))
+        self.min_batch_interval_seconds = max(
+            0.0,
+            float(os.getenv("TURBOPUFFER_MIN_BATCH_INTERVAL_SECONDS", "0") or "0"),
+        )
         self._lock = threading.Lock()
         self._schema_declared = False
+        self._last_batch_write_at: float | None = None
         self.stats = IngestionSinkStats()
         client = tpuf.Turbopuffer(
             api_key=IngestionConfig.TURBOPUFFER_API_KEY,
             region=IngestionConfig.TURBOPUFFER_REGION,
         )
         self.ns = client.namespace(namespace)
+
+    def _pace_next_batch_if_needed(self) -> None:
+        if self.min_batch_interval_seconds <= 0:
+            return
+        if self._last_batch_write_at is None:
+            return
+        now = time.monotonic()
+        elapsed = now - self._last_batch_write_at
+        if elapsed < self.min_batch_interval_seconds:
+            time.sleep(self.min_batch_interval_seconds - elapsed)
 
     @staticmethod
     def _schema_for_columns(columns: dict[str, list[Any]]) -> dict[str, Any]:
@@ -118,6 +136,15 @@ class TurbopufferIngestionSink(BaseIngestionSink):
             "has_structured_abstract",
         }
         list_string_fields = {"keywords", "mesh_terms", "publication_type", "active_ingredients", "gov_agencies"}
+        json_large_fields = {
+            "abstract_structured",
+            "mesh_terms_full",
+            "keywords_full",
+            "publication_types_full",
+            "journal_full",
+            "publication_date",
+            "other_ids",
+        }
         schema: dict[str, Any] = {}
         for key, values in columns.items():
             if key == "id":
@@ -132,6 +159,8 @@ class TurbopufferIngestionSink(BaseIngestionSink):
                 schema[key] = "bool"
             elif key in list_string_fields:
                 schema[key] = "[]string"
+            elif key in json_large_fields:
+                schema[key] = {"type": "string", "filterable": False}
             elif key in {
                 "page_content",
                 "title",
@@ -198,7 +227,12 @@ class TurbopufferIngestionSink(BaseIngestionSink):
                 return
             except Exception as exc:
                 exc_str = str(exc).lower()
-                retryable = any(code in exc_str for code in ("429", "408", "409", "500", "502", "503", "504"))
+                exc_class = getattr(exc, "__class__", None)
+                exc_name = exc_class.__name__.lower() if exc_class else ""
+                
+                retryable = any(code in exc_str for code in ("429", "408", "409", "500", "502", "503", "504", "timeout", "timed out", "connection error"))
+                if "timeout" in exc_name or "connection" in exc_name or "readerror" in exc_name or "ssl" in exc_name:
+                    retryable = True
                 if attempt >= self.max_retries or not retryable:
                     raise
                 wait = min(10.0, (2 ** (attempt - 1)) + random.uniform(0.0, 0.5))
@@ -220,12 +254,28 @@ class TurbopufferIngestionSink(BaseIngestionSink):
         if self.dry_run:
             return len(rows)
 
+        # Deduplicate rows by id to avoid turbopuffer 400 "duplicate document IDs" errors.
+        # This is a last-resort guard; upstream callers should also deduplicate.
+        seen_ids: set[str] = set()
+        deduped_rows: list[dict[str, Any]] = []
+        for row in rows:
+            row_id = str(row.get("id", ""))
+            if row_id and row_id in seen_ids:
+                logger.warning("Dropping duplicate row id=%s before turbopuffer write", row_id)
+                continue
+            if row_id:
+                seen_ids.add(row_id)
+            deduped_rows.append(row)
+        rows = deduped_rows
+
         with self._lock:
             written = 0
             for i in range(0, len(rows), self.batch_size):
+                self._pace_next_batch_if_needed()
                 batch_rows = rows[i : i + self.batch_size]
                 columns = self._rows_to_columns(batch_rows)
                 self._write_columns_with_retry(columns)
+                self._last_batch_write_at = time.monotonic()
                 written += len(batch_rows)
                 self.stats.batches_written += 1
             self.stats.rows_written += written

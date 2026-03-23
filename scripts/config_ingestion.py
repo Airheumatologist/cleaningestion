@@ -35,7 +35,7 @@ class IngestionConfig:
     VECTOR_BACKEND = os.getenv("VECTOR_BACKEND", "turbopuffer").strip().lower()
     TURBOPUFFER_API_KEY = os.getenv("TURBOPUFFER_API_KEY", "")
     TURBOPUFFER_REGION = os.getenv("TURBOPUFFER_REGION", "gcp-us-central1")
-    TURBOPUFFER_NAMESPACE_PMC = os.getenv("TURBOPUFFER_NAMESPACE_PMC", "medical_pmc")
+    TURBOPUFFER_NAMESPACE_PMC = os.getenv("TURBOPUFFER_NAMESPACE_PMC", "medical_database_pmc")
     TURBOPUFFER_NAMESPACE_PUBMED = os.getenv("TURBOPUFFER_NAMESPACE_PUBMED", "medical_pubmed")
     TURBOPUFFER_NAMESPACE_DAILYMED = os.getenv("TURBOPUFFER_NAMESPACE_DAILYMED", "medical_dailymed")
     TURBOPUFFER_WRITE_BATCH_SIZE = int(os.getenv("TURBOPUFFER_WRITE_BATCH_SIZE", "500"))

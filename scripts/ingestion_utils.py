@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # Track hard parse failures (malformed/unreadable XML) across a run.
 _PMC_PARSE_FAILURE_COUNT = 0
 _PMC_PARSE_FAILURE_LOCK = threading.Lock()
+_PMC_PARSE_SKIP_CONTEXT = threading.local()
 
 
 def reset_pmc_xml_parse_failure_count() -> None:
@@ -46,6 +47,16 @@ def _increment_pmc_xml_parse_failure_count() -> None:
     global _PMC_PARSE_FAILURE_COUNT
     with _PMC_PARSE_FAILURE_LOCK:
         _PMC_PARSE_FAILURE_COUNT += 1
+
+
+def _set_last_pmc_parse_skip_reason(reason: Optional[str]) -> None:
+    _PMC_PARSE_SKIP_CONTEXT.last_skip_reason = reason
+
+
+def pop_last_pmc_parse_skip_reason() -> Optional[str]:
+    reason = getattr(_PMC_PARSE_SKIP_CONTEXT, "last_skip_reason", None)
+    _PMC_PARSE_SKIP_CONTEXT.last_skip_reason = None
+    return reason
 
 # ============================================================================
 # PMC XML Parsing - PRD v1.0 Compliant
@@ -84,16 +95,146 @@ ISO_COUNTRY_CODES = {
     "CMR", "CAF", "TCD", "COG", "GAB", "GNQ", "STP", "BDI", "RWA", "COD",
 }
 
+
+def _load_deepinfra_api_keys() -> List[str]:
+    """Load DeepInfra API keys from env, preserving legacy single-key support."""
+    keys: List[str] = []
+    raw_multi_keys = os.getenv("DEEPINFRA_API_KEYS", "")
+    if raw_multi_keys:
+        keys.extend(part.strip() for part in raw_multi_keys.split(","))
+
+    raw_single_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
+    if raw_single_key:
+        keys.append(raw_single_key)
+
+    deduped_keys: List[str] = []
+    seen_keys = set()
+    for key in keys:
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        deduped_keys.append(key)
+
+    return deduped_keys
+
+
+def _load_ingestion_embedding_models(default_model: str) -> List[str]:
+    """Load ingestion embedding model chain with backward-compatible fallback."""
+    models: List[str] = []
+    raw_models = os.getenv("INGESTION_EMBEDDING_MODELS", "")
+    if raw_models:
+        models.extend(part.strip() for part in raw_models.split(","))
+    if not models:
+        models.append(default_model.strip())
+
+    deduped_models: List[str] = []
+    seen_models = set()
+    for model in models:
+        if not model or model in seen_models:
+            continue
+        seen_models.add(model)
+        deduped_models.append(model)
+    return deduped_models
+
+
+def _classify_deepinfra_retry(exc: Exception) -> Tuple[bool, bool]:
+    """Return (is_rate_limit, is_transient) for retry handling."""
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+
+    exc_str = str(exc)
+    exc_lower = exc_str.lower()
+    exc_type_lower = type(exc).__name__.lower()
+
+    is_rate_limit = status_code == 429 or (
+        "429" in exc_str
+        or "rate limit" in exc_lower
+        or "too many requests" in exc_lower
+    )
+    is_transient = status_code in {500, 502, 503, 504} or (
+        "500" in exc_str
+        or "502" in exc_str
+        or "503" in exc_str
+        or "504" in exc_str
+        or "connection" in exc_lower
+        or "timeout" in exc_lower
+        or "reset" in exc_lower
+        or "connection" in exc_type_lower
+        or "timeout" in exc_type_lower
+    )
+
+    return is_rate_limit, is_transient
+
+
+def _is_deepinfra_5xx(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status_code is None and response is not None:
+        status_code = getattr(response, "status_code", None)
+    if status_code in {500, 502, 503, 504}:
+        return True
+    exc_str = str(exc)
+    return any(code in exc_str for code in ("500", "502", "503", "504"))
+
+
+def _extract_retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Best-effort parse of Retry-After from provider exceptions."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    if retry_after is None:
+        return None
+    try:
+        return max(0.0, float(retry_after))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ordered_embeddings_from_response(response: Any, expected_count: int) -> List[List[float]]:
+    """Return embeddings in input order when the provider includes item indexes."""
+    data = list(getattr(response, "data", []))
+    if not data:
+        return []
+
+    ordered_embeddings: List[Optional[List[float]]] = [None] * expected_count
+    for position, item in enumerate(data):
+        item_index = getattr(item, "index", position)
+        if (
+            isinstance(item_index, int)
+            and 0 <= item_index < expected_count
+            and ordered_embeddings[item_index] is None
+        ):
+            ordered_embeddings[item_index] = item.embedding
+
+    if all(embedding is not None for embedding in ordered_embeddings):
+        return [embedding for embedding in ordered_embeddings if embedding is not None]
+
+    return [item.embedding for item in data]
+
+
 class EmbeddingProvider:
     """Support for DeepInfra embeddings with concurrent parallel requests."""
 
     def __init__(self) -> None:
         self.provider = IngestionConfig.EMBEDDING_PROVIDER.lower().strip()
         self.model = IngestionConfig.EMBEDDING_MODEL
+        self.models = _load_ingestion_embedding_models(self.model)
         self.openai_client = None
+        self.openai_clients: List[Any] = []
+        self._route_client_indices: List[int] = []
+        self._route_models: List[str] = []
+        self._route_model_ranks: List[int] = []
         self._rate_limiter: Optional[_RequestRateLimiter] = None
         self._request_log_lock = threading.Lock()
         self._request_timestamps: deque[float] = deque()
+        self._route_selection_lock = threading.Lock()
+        self._next_route_index = 0
         self._rate_log_enabled = os.getenv("EMBEDDING_RATE_LOG_ENABLED", "true").strip().lower() in {
             "1", "true", "yes", "on",
         }
@@ -112,6 +253,27 @@ class EmbeddingProvider:
         self._embed_max_retries = max(
             1, int(os.getenv("EMBEDDING_REQUEST_MAX_RETRIES", "6"))
         )
+        # Request shaping for embedding stability.
+        self._max_input_tokens_per_request = max(
+            1024, int(os.getenv("EMBEDDING_MAX_INPUT_TOKENS_PER_REQUEST", "24000"))
+        )
+        self._max_text_tokens = max(
+            512, int(os.getenv("EMBEDDING_MAX_TEXT_TOKENS", "30000"))
+        )
+        self._max_chars_per_text = max(
+            1024, int(os.getenv("EMBEDDING_MAX_CHARS_PER_TEXT", "120000"))
+        )
+        # Key health controls to reduce repeated 5xx bursts on a hot endpoint.
+        self._client_cooldown_seconds = max(
+            1.0, float(os.getenv("EMBEDDING_CLIENT_COOLDOWN_SECONDS", "15"))
+        )
+        self._client_failure_threshold = max(
+            1, int(os.getenv("EMBEDDING_CLIENT_FAILURE_THRESHOLD", "2"))
+        )
+        self._route_state_lock = threading.Lock()
+        self._route_failure_scores: List[float] = []
+        self._route_consecutive_5xx: List[int] = []
+        self._route_cooldown_until: List[float] = []
 
         if self.provider != "deepinfra":
             raise ValueError(
@@ -121,17 +283,31 @@ class EmbeddingProvider:
 
         from openai import OpenAI
 
-        api_key = os.getenv("DEEPINFRA_API_KEY")
-        if not api_key:
-            raise ValueError("DEEPINFRA_API_KEY not set - required for deepinfra embedding provider")
+        api_keys = _load_deepinfra_api_keys()
+        if not api_keys:
+            raise ValueError(
+                "DEEPINFRA_API_KEYS or DEEPINFRA_API_KEY not set - required for deepinfra embedding provider"
+            )
         deepinfra_base_url = os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
-        self.openai_client = OpenAI(
-            api_key=api_key,
-            base_url=deepinfra_base_url,
-            # Allow many concurrent connections from threadpool
-            max_retries=0,  # We handle retries ourselves with better backoff
-            timeout=120.0,
-        )
+        self.openai_clients = [
+            OpenAI(
+                api_key=api_key,
+                base_url=deepinfra_base_url,
+                # Allow many concurrent connections from threadpool
+                max_retries=0,  # We handle retries ourselves with better backoff
+                timeout=120.0,
+            )
+            for api_key in api_keys
+        ]
+        for model_rank, model_name in enumerate(self.models):
+            for client_index, _client in enumerate(self.openai_clients):
+                self._route_client_indices.append(client_index)
+                self._route_models.append(model_name)
+                self._route_model_ranks.append(model_rank)
+        self._route_failure_scores = [0.0 for _ in self._route_client_indices]
+        self._route_consecutive_5xx = [0 for _ in self._route_client_indices]
+        self._route_cooldown_until = [0.0 for _ in self._route_client_indices]
+        self.openai_client = self.openai_clients[0]
         max_requests_per_sec = int(os.getenv("EMBEDDING_MAX_REQUESTS_PER_SEC", "0") or "0")
         if max_requests_per_sec > 0:
             self._rate_limiter = _RequestRateLimiter(max_requests_per_sec=max_requests_per_sec)
@@ -140,9 +316,15 @@ class EmbeddingProvider:
                 max_requests_per_sec,
             )
         logger.info(
-            "✅ DeepInfra embedding provider initialized (model: %s, concurrency: %s)",
-            self.model,
+            (
+                "✅ DeepInfra embedding provider initialized "
+                "(models: %s, concurrency: %s, api_keys: %s, routes: %s, max_req_tokens: %s)"
+            ),
+            ",".join(self.models),
             self._embed_concurrency,
+            len(self.openai_clients),
+            len(self._route_client_indices),
+            self._max_input_tokens_per_request,
         )
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
@@ -196,76 +378,147 @@ class EmbeddingProvider:
     def _embed_deepinfra(self, texts: List[str]) -> List[List[float]]:
         """Embed using DeepInfra OpenAI-compatible API with sub-batching."""
         batch_size = IngestionConfig.EMBEDDING_BATCH_SIZE
+        shaped_batches = self._shape_embedding_request_batches(texts, batch_size=batch_size)
+        if len(shaped_batches) == 1:
+            return self._embed_deepinfra_single(shaped_batches[0])
 
-        if len(texts) <= batch_size:
-            return self._embed_deepinfra_single(texts)
-
-        # Sub-batch large requests
         all_embeddings: List[List[float]] = []
-        for i in range(0, len(texts), batch_size):
-            sub_batch = texts[i:i + batch_size]
+        for sub_batch in shaped_batches:
             embeddings = self._embed_deepinfra_single(sub_batch)
             all_embeddings.extend(embeddings)
         return all_embeddings
+
+    def _shape_embedding_request_batches(self, texts: List[str], *, batch_size: int) -> List[List[str]]:
+        """Split texts into request batches by item count and estimated token budget."""
+        if not texts:
+            return []
+        shaped_texts = [self._shape_single_text_for_embedding(text) for text in texts]
+        batches: List[List[str]] = []
+        current_batch: List[str] = []
+        current_tokens = 0
+
+        for text in shaped_texts:
+            text_tokens = self._estimate_tokens(text)
+            if current_batch and (
+                len(current_batch) >= batch_size
+                or (current_tokens + text_tokens) > self._max_input_tokens_per_request
+            ):
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+            current_batch.append(text)
+            current_tokens += text_tokens
+
+        if current_batch:
+            batches.append(current_batch)
+        return batches
+
+    def _shape_single_text_for_embedding(self, text: str) -> str:
+        """Bound text size to reduce provider-side failures on oversized payloads."""
+        if len(text) > self._max_chars_per_text:
+            text = text[: self._max_chars_per_text]
+        est_tokens = self._estimate_tokens(text)
+        if est_tokens <= self._max_text_tokens:
+            return text
+        keep_words = max(1, int(self._max_text_tokens * 0.75))
+        return " ".join(text.split()[:keep_words])
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        # Match existing project approximation used by Chunker.
+        return max(1, int(len(text.split()) / 0.75))
 
     def _embed_deepinfra_single(self, texts: List[str]) -> List[List[float]]:
         """Send a single embedding request to DeepInfra with retry/backoff."""
         import random as _random
 
         last_exc: Optional[Exception] = None
+        route_index = self._reserve_route_index()
         for attempt in range(1, self._embed_max_retries + 1):
+            route_index = self._await_healthy_route_index(route_index)
+            client_index = self._route_client_indices[route_index]
+            model_name = self._route_models[route_index]
+            client = self.openai_clients[client_index]
             try:
                 self._before_embedding_request()
-                response = self.openai_client.embeddings.create(
-                    model=self.model,
+                response = client.embeddings.create(
+                    model=model_name,
                     input=texts,
                     encoding_format="float",
                 )
-                return [data.embedding for data in response.data]
+                self._mark_route_success(route_index)
+                return _ordered_embeddings_from_response(response, expected_count=len(texts))
             except Exception as exc:
                 last_exc = exc
                 exc_str = str(exc)
-                is_rate_limit = (
-                    "429" in exc_str
-                    or "rate limit" in exc_str.lower()
-                    or "too many requests" in exc_str.lower()
-                )
-                is_transient = (
-                    "500" in exc_str
-                    or "502" in exc_str
-                    or "503" in exc_str
-                    or "504" in exc_str
-                    or "connection" in exc_str.lower()
-                    or "timeout" in exc_str.lower()
-                    or "reset" in exc_str.lower()
-                )
+                is_rate_limit, is_transient = _classify_deepinfra_retry(exc)
+                is_5xx = _is_deepinfra_5xx(exc)
 
                 if attempt >= self._embed_max_retries:
                     logger.error(
-                        "DeepInfra embedding failed after %s attempts: %s",
-                        attempt, exc_str[:300],
+                        "DeepInfra embedding failed after %s attempts (key_slot=%s model=%s): %s",
+                        attempt,
+                        client_index + 1,
+                        model_name,
+                        exc_str[:300],
                     )
                     raise
 
                 if is_rate_limit:
                     # Rate-limited: longer wait, then retry
+                    retry_after_wait = _extract_retry_after_seconds(exc)
                     base_wait = min(30.0, 2.0 * (2 ** (attempt - 1)))
                     jitter = _random.uniform(0.5, 1.5)
-                    wait = base_wait * jitter
-                    logger.warning(
-                        "DeepInfra rate-limited (attempt %s/%s), pausing %.1fs: %s",
-                        attempt, self._embed_max_retries, wait, exc_str[:120],
+                    wait = max(base_wait * jitter, retry_after_wait or 0.0)
+                    self._mark_route_failure(
+                        route_index,
+                        cooldown_seconds=max(wait, self._client_cooldown_seconds),
+                        is_5xx=False,
+                        is_rate_limit=True,
                     )
+                    next_route_index = self._peek_healthy_route_index()
+                    next_client_index = self._route_client_indices[next_route_index]
+                    next_model_name = self._route_models[next_route_index]
+                    logger.warning(
+                        "DeepInfra rate-limited (attempt %s/%s, route key_slot/model %s/%s -> %s/%s), pausing %.1fs: %s",
+                        attempt,
+                        self._embed_max_retries,
+                        client_index + 1,
+                        next_client_index + 1,
+                        model_name,
+                        next_model_name,
+                        wait,
+                        exc_str[:120],
+                    )
+                    route_index = next_route_index
                     time.sleep(wait)
                 elif is_transient:
                     # Transient 5xx: shorter backoff
+                    retry_after_wait = _extract_retry_after_seconds(exc)
                     base_wait = min(8.0, 1.0 * (2 ** (attempt - 1)))
                     jitter = _random.uniform(0.25, 1.25)
-                    wait = base_wait * jitter
-                    logger.warning(
-                        "DeepInfra transient error (attempt %s/%s), retrying in %.1fs: %s",
-                        attempt, self._embed_max_retries, wait, exc_str[:120],
+                    wait = max(base_wait * jitter, retry_after_wait or 0.0)
+                    self._mark_route_failure(
+                        route_index,
+                        cooldown_seconds=max(wait, self._client_cooldown_seconds),
+                        is_5xx=is_5xx,
+                        is_rate_limit=False,
                     )
+                    next_route_index = self._peek_healthy_route_index()
+                    next_client_index = self._route_client_indices[next_route_index]
+                    next_model_name = self._route_models[next_route_index]
+                    logger.warning(
+                        "DeepInfra transient error (attempt %s/%s, route key_slot/model %s/%s -> %s/%s), retrying in %.1fs: %s",
+                        attempt,
+                        self._embed_max_retries,
+                        client_index + 1,
+                        next_client_index + 1,
+                        model_name,
+                        next_model_name,
+                        wait,
+                        exc_str[:120],
+                    )
+                    route_index = next_route_index
                     time.sleep(wait)
                 else:
                     # Non-retriable error
@@ -281,6 +534,106 @@ class EmbeddingProvider:
         if self._rate_limiter is not None:
             self._rate_limiter.acquire()
         self._record_request_for_telemetry()
+
+    def _reserve_route_index(self) -> int:
+        with self._route_selection_lock:
+            route_index = self._next_route_index
+            route_count = max(1, len(self._route_client_indices))
+            self._next_route_index = (self._next_route_index + 1) % route_count
+            return route_index
+
+    def _await_healthy_route_index(self, preferred_index: int) -> int:
+        """Pick the healthiest non-cooled route, waiting if all routes are cooled down."""
+        while True:
+            now = time.monotonic()
+            with self._route_state_lock:
+                ready_indices = [
+                    idx for idx, cooldown_until in enumerate(self._route_cooldown_until) if cooldown_until <= now
+                ]
+                if ready_indices:
+                    return self._best_route_index_from_candidates(
+                        ready_indices,
+                        preferred_index=preferred_index,
+                    )
+                next_ready = min(self._route_cooldown_until) if self._route_cooldown_until else now
+            time.sleep(min(1.0, max(0.05, next_ready - now)))
+
+    def _best_route_index_from_candidates(
+        self,
+        ready_indices: List[int],
+        *,
+        preferred_index: int,
+    ) -> int:
+        best_score = min(self._route_failure_scores[idx] for idx in ready_indices)
+        lowest_model_rank = min(
+            self._route_model_ranks[idx]
+            for idx in ready_indices
+            if self._route_failure_scores[idx] == best_score
+        )
+        best_candidates = [
+            idx
+            for idx in ready_indices
+            if self._route_failure_scores[idx] == best_score
+            and self._route_model_ranks[idx] == lowest_model_rank
+        ]
+        if len(best_candidates) == 1:
+            return best_candidates[0]
+
+        candidate_set = set(best_candidates)
+        total_routes = len(self._route_client_indices)
+        if total_routes <= 0:
+            return preferred_index
+        start_index = preferred_index % total_routes
+        for offset in range(total_routes):
+            idx = (start_index + offset) % total_routes
+            if idx in candidate_set:
+                return idx
+        return best_candidates[0]
+
+    def _peek_healthy_route_index(self) -> int:
+        now = time.monotonic()
+        with self._route_state_lock:
+            ready_indices = [
+                idx for idx, cooldown_until in enumerate(self._route_cooldown_until) if cooldown_until <= now
+            ]
+            if ready_indices:
+                return self._best_route_index_from_candidates(
+                    ready_indices,
+                    preferred_index=self._next_route_index,
+                )
+            if not self._route_cooldown_until:
+                return 0
+            return min(range(len(self._route_cooldown_until)), key=lambda idx: self._route_cooldown_until[idx])
+
+    def _mark_route_success(self, route_index: int) -> None:
+        with self._route_state_lock:
+            self._route_failure_scores[route_index] = max(0.0, self._route_failure_scores[route_index] - 1.0)
+            self._route_consecutive_5xx[route_index] = 0
+            self._route_cooldown_until[route_index] = 0.0
+
+    def _mark_route_failure(
+        self,
+        route_index: int,
+        *,
+        cooldown_seconds: float,
+        is_5xx: bool,
+        is_rate_limit: bool,
+    ) -> None:
+        with self._route_state_lock:
+            self._route_failure_scores[route_index] += 2.0 if is_5xx else 1.0
+            if is_5xx:
+                self._route_consecutive_5xx[route_index] += 1
+            else:
+                self._route_consecutive_5xx[route_index] = 0
+
+            should_open_circuit = is_rate_limit or (
+                is_5xx and self._route_consecutive_5xx[route_index] >= self._client_failure_threshold
+            )
+            if should_open_circuit:
+                self._route_cooldown_until[route_index] = max(
+                    self._route_cooldown_until[route_index],
+                    time.monotonic() + max(0.0, cooldown_seconds),
+                )
 
     def _record_request_for_telemetry(self) -> None:
         if not self._rate_log_enabled:
@@ -742,29 +1095,34 @@ def _parse_pmc_xml_root(
     require_open_access: bool = True,
     require_commercial_license: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    # Get article and article-meta elements
-    # Handle both cases: root IS the article, or article is nested
+    # Get article and article-meta elements, with permissive fallbacks so we
+    # can still ingest records that have non-standard XML wrappers.
     if root.tag == "article" or root.tag.endswith("}article"):
         article_elem = root
     else:
         article_elem = root.find(".//article")
     if article_elem is None:
-        logger.debug("No article element found in %s", source_label)
-        return None
+        logger.debug("No article element found in %s; falling back to root", source_label)
+        article_elem = root
 
     article_meta = article_elem.find("front/article-meta")
     if article_meta is None:
-        logger.debug("No article-meta found in %s", source_label)
-        return None
+        article_meta = article_elem.find(".//article-meta")
+    if article_meta is None:
+        article_meta = root.find(".//article-meta")
+    if article_meta is None:
+        logger.debug("No article-meta found in %s; using empty metadata fallback", source_label)
+        article_meta = ET.Element("article-meta")
 
     # === 1. Document Metadata (PRD Section 1.1) ===
     article_type = _extract_article_type(root)
     language = _extract_language(root)
     identifiers = _extract_identifiers(article_meta)
 
-    # Hard Fail: PMID must exist
+    # Optional PMID requirement
     if require_pmid and not identifiers.get("pmid"):
         logger.debug("Skipping %s: No PMID found", source_label)
+        _set_last_pmc_parse_skip_reason("No PMID found")
         return None
 
     # Use PMCID from filename/url if not in XML
@@ -779,11 +1137,13 @@ def _parse_pmc_xml_root(
     # === 3. Content Structure (PRD Section 1.3) ===
     article_title = _extract_article_title(article_meta)
     if not article_title:
-        logger.debug("Skipping %s: No article title", source_label)
-        return None
+        article_title = f"Untitled {pmcid_from_file}"
+        logger.debug("No article title in %s; using fallback title '%s'", source_label, article_title)
 
     # Check for body and determine has_full_text
     body_elem = article_elem.find("body")
+    if body_elem is None:
+        body_elem = root.find(".//body")
     has_full_text = False
     body_text = ""
     if body_elem is not None:
@@ -796,10 +1156,12 @@ def _parse_pmc_xml_root(
 
     if require_open_access and not is_open_access:
         logger.info("Skipping %s: Not open access", source_label)
+        _set_last_pmc_parse_skip_reason("Not open access")
         return None
 
     if require_commercial_license and not _is_commercial_license(license_type):
         logger.info("Skipping %s: Non-commercial license (%s)", source_label, license_type)
+        _set_last_pmc_parse_skip_reason(f"Non-commercial license ({license_type})")
         return None
 
     # === 4. Controlled Vocabulary (PRD Section 1.4) ===
@@ -937,6 +1299,7 @@ def parse_pmc_xml(
         Article dict following PRD JSON structure, or None if invalid/skipped.
     """
     try:
+        _set_last_pmc_parse_skip_reason(None)
         xml_path = Path(xml_path)  # Accept both str and Path
         file_name = xml_path.name
         lowered_name = file_name.lower()
@@ -960,6 +1323,7 @@ def parse_pmc_xml(
 
     except Exception as e:
         _increment_pmc_xml_parse_failure_count()
+        _set_last_pmc_parse_skip_reason(str(e)[:300])
         logger.warning("Error parsing %s: %s", xml_path, e)
         logger.debug("PMC XML parse traceback for %s", xml_path, exc_info=True)
         return None
@@ -974,6 +1338,7 @@ def parse_pmc_xml_bytes(
 ) -> Optional[Dict[str, Any]]:
     """Parse PMC XML from in-memory bytes with the same behavior as parse_pmc_xml()."""
     try:
+        _set_last_pmc_parse_skip_reason(None)
         lowered_name = source_name.lower()
         pmcid_from_file = _base_name_from_archive_name(source_name, lowered_name, Path(source_name).stem)
 
@@ -992,6 +1357,7 @@ def parse_pmc_xml_bytes(
         )
     except Exception as e:
         _increment_pmc_xml_parse_failure_count()
+        _set_last_pmc_parse_skip_reason(str(e)[:300])
         logger.warning("Error parsing %s: %s", source_name, e)
         logger.debug("PMC XML parse traceback for %s", source_name, exc_info=True)
         return None
