@@ -41,6 +41,15 @@ class IngestionConfig:
     TURBOPUFFER_WRITE_BATCH_SIZE = int(os.getenv("TURBOPUFFER_WRITE_BATCH_SIZE", "500"))
     TURBOPUFFER_MAX_CONCURRENT_WRITES = int(os.getenv("TURBOPUFFER_MAX_CONCURRENT_WRITES", "4"))
     TURBOPUFFER_MAX_RETRIES = int(os.getenv("TURBOPUFFER_MAX_RETRIES", "5"))
+    TURBOPUFFER_SDK_MAX_RETRIES = int(os.getenv("TURBOPUFFER_SDK_MAX_RETRIES", "4"))
+    TURBOPUFFER_DISABLE_BACKPRESSURE = _as_bool(
+        os.getenv("TURBOPUFFER_DISABLE_BACKPRESSURE"),
+        default=False,
+    )
+    TURBOPUFFER_METADATA_POLL_INTERVAL_SECONDS = _as_float(
+        os.getenv("TURBOPUFFER_METADATA_POLL_INTERVAL_SECONDS"),
+        default=0.0,
+    )
     # Deprecated legacy knobs kept for compatibility with older utility scripts.
     SPARSE_ENABLED = _as_bool(os.getenv("SPARSE_ENABLED"), default=False)
     SPARSE_MODE = os.getenv("SPARSE_MODE", "disabled").strip().lower()

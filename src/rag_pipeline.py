@@ -435,18 +435,36 @@ class MedicalRAGPipeline:
         return year_now - self.final_recency_window_years + 1
 
     @staticmethod
-    def _is_dailymed_row(row: Any) -> bool:
-        pmcid = str(row.get("pmcid", "") or row.get("corpus_id", "")).lower()
-        article_type = str(row.get("article_type", "")).lower()
-        source = str(row.get("source", "")).lower()
-        venue = str(row.get("venue", "") or row.get("journal", "")).lower()
-        return (
-            pmcid.startswith("dailymed_")
-            or article_type == "drug_label"
-            or source == "dailymed"
-            or "dailymed" in venue
-            or "fda drug label" in venue
-        )
+    def _normalized_text(value: Any) -> str:
+        import math
+
+        if value is None:
+            return ""
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+        return str(value).strip().lower()
+
+    @classmethod
+    def _is_dailymed_row(cls, row: Any) -> bool:
+        source = cls._normalized_text(row.get("source"))
+        source_family = cls._normalized_text(row.get("source_family"))
+        article_type = cls._normalized_text(row.get("article_type"))
+        content_type = cls._normalized_text(row.get("content_type"))
+        venue = cls._normalized_text(row.get("venue") or row.get("journal"))
+        title = cls._normalized_text(row.get("title"))
+        pmcid = cls._normalized_text(row.get("pmcid") or row.get("corpus_id"))
+        doc_id = cls._normalized_text(row.get("doc_id"))
+        set_id = cls._normalized_text(row.get("set_id"))
+
+        if source == "dailymed" or source_family == "dailymed":
+            return True
+        if article_type == "drug_label" or content_type == "drug_label":
+            return True
+        if pmcid.startswith("dailymed_") or doc_id.startswith("dailymed_"):
+            return True
+        if set_id:
+            return True
+        return False
 
     @staticmethod
     def _attach_sort_score(papers_df):
@@ -830,16 +848,8 @@ class MedicalRAGPipeline:
         non_dailymed_indices = []
         
         for idx, row in papers_df.iterrows():
-            pmcid = str(row.get('pmcid', '') or row.get('corpus_id', ''))
-            article_type = str(row.get('article_type', ''))
-            venue = str(row.get('venue', '') or row.get('journal', ''))
-            
-            is_dailymed = (
-                pmcid.startswith('dailymed_') or 
-                article_type == 'drug_label' or
-                'dailymed' in venue.lower() or
-                'fda drug label' in venue.lower()
-            )
+            is_dailymed = self._is_dailymed_row(row)
+            pmcid = str(row.get('pmcid', '') or row.get('corpus_id', '') or row.get('doc_id', '') or f"row_{idx}")
             
             if is_dailymed:
                 # Extract and normalize drug name from title
@@ -1076,10 +1086,17 @@ class MedicalRAGPipeline:
         priority_journal_papers = []
         other_papers = []
 
+        def _safe_str(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, float) and math.isnan(value):
+                return ""
+            return str(value).strip()
+
         for idx, row in papers_df.head(MAX_ABSTRACTS).iterrows():
-            journal = row.get('journal', '') or row.get('venue', '')
-            corpus_id = str(row.get('corpus_id', '')).strip()
-            nlm_unique_id = str(row.get('nlm_unique_id', '')).strip() if row.get('nlm_unique_id') else ''
+            journal = _safe_str(row.get('journal')) or _safe_str(row.get('venue'))
+            corpus_id = _safe_str(row.get('corpus_id'))
+            nlm_unique_id = _safe_str(row.get('nlm_unique_id'))
             normalized_journal = re.sub(r'[^a-z0-9]+', ' ', str(journal).lower()).strip()
             
             # Priority check: NLM Unique ID (most reliable), then corpus_id, then journal name
@@ -1089,7 +1106,7 @@ class MedicalRAGPipeline:
                 or journal in PRIORITY_JOURNALS
                 or normalized_journal in PRIORITY_JOURNALS
             )
-            article_type = row.get('article_type', 'other')
+            article_type = _safe_str(row.get('article_type')) or 'other'
             is_high_value = article_type in HIGH_VALUE_TYPES
 
             if is_priority_journal or is_high_value:
@@ -1108,15 +1125,9 @@ class MedicalRAGPipeline:
             "recent_cutoff_year": recent_cutoff_year,
         }
 
-        def _safe_str(value: Any) -> str:
-            if value is None:
-                return ""
-            if isinstance(value, float) and math.isnan(value):
-                return ""
-            return str(value).strip()
-
         for i, (idx, row) in enumerate(all_papers[:MAX_ABSTRACTS]):
-            article_type = row.get('article_type', 'other')
+            is_dailymed = self._is_dailymed_row(row)
+            article_type = _safe_str(row.get('article_type')) or ('drug_label' if is_dailymed else 'other')
             source_num = len(context_parts) + 1
             
             if hasattr(row, 'to_dict'):
@@ -1125,6 +1136,18 @@ class MedicalRAGPipeline:
                 paper_dict = dict(row)
             # Preserve canonical citation index so UI/reference ordering is stable.
             paper_dict["citation_index"] = source_num
+            if is_dailymed:
+                if not _safe_str(paper_dict.get("source")):
+                    paper_dict["source"] = "dailymed"
+                if not _safe_str(paper_dict.get("source_family")):
+                    paper_dict["source_family"] = "dailymed"
+                if not _safe_str(paper_dict.get("article_type")):
+                    paper_dict["article_type"] = article_type
+                if not _safe_str(paper_dict.get("content_type")):
+                    paper_dict["content_type"] = "drug_label"
+                if not _safe_str(paper_dict.get("journal")) and not _safe_str(paper_dict.get("venue")):
+                    paper_dict["journal"] = "DailyMed"
+                    paper_dict["venue"] = "DailyMed"
             used_papers.append(paper_dict)
 
             paper_info = f"**[{source_num}]** {row.get('title', 'Untitled')}"
@@ -1135,7 +1158,7 @@ class MedicalRAGPipeline:
             paper_info += f" [{article_type}]"
 
             # DailyMed: Intelligent section selection
-            if article_type == "drug_label" or row.get("source") == "dailymed":
+            if is_dailymed:
                 sections = []
                 section_map = row.get("dailymed_sections", {})
                 if not isinstance(section_map, dict):
@@ -1525,9 +1548,19 @@ Please provide a comprehensive clinical response based on your medical knowledge
                     if pdf_url:
                         return pdf_url
 
-            is_open_access = article.get("isOpenAccess") == "Y"
-            in_epmc = article.get("inEPMC") == "Y"
-            has_pdf = article.get("hasPDF") == "Y"
+            def _flag_is_yes(*names: str) -> bool:
+                for name in names:
+                    value = article.get(name)
+                    if isinstance(value, str):
+                        if value.strip().upper() == "Y":
+                            return True
+                    elif value:
+                        return True
+                return False
+
+            is_open_access = _flag_is_yes("isOpenAccess", "is_open_access")
+            in_epmc = _flag_is_yes("inEPMC", "in_epmc")
+            has_pdf = _flag_is_yes("hasPDF", "has_pdf")
             if has_pdf and (is_open_access or in_epmc):
                 article_pmcid = _normalize_pmcid(article.get("pmcid") or article.get("id"))
                 if article_pmcid:
@@ -1653,21 +1686,6 @@ Please provide a comprehensive clinical response based on your medical knowledge
         else:
             p = dict(paper)
 
-        pmcid = p.get("pmcid") or p.get("corpus_id", "")
-        source_type = p.get("source", "")
-        
-        # Detect DailyMed articles
-        is_dailymed = (
-            source_type == "dailymed" or 
-            p.get("article_type") == "drug_label" or
-            str(pmcid).startswith("dailymed_")
-        )
-        
-        # Extract set_id for DailyMed articles
-        set_id = p.get("set_id", "")
-        if is_dailymed and not set_id and str(pmcid).startswith("dailymed_"):
-            set_id = pmcid.replace("dailymed_", "")
-
         # Helper to sanitize NaN values (pandas can return float('nan') which breaks JSON)
         def sanitize(val, default=""):
             import math
@@ -1677,22 +1695,38 @@ Please provide a comprehensive clinical response based on your medical knowledge
                 return default
             return val
 
+        pmcid = sanitize(p.get("pmcid"), "") or sanitize(p.get("corpus_id"), "")
+        source_type = sanitize(p.get("source"), "")
+        
+        # Detect DailyMed articles
+        is_dailymed = self._is_dailymed_row(p)
+        
+        # Extract set_id for DailyMed articles
+        set_id = sanitize(p.get("set_id"), "")
+        if is_dailymed and not set_id:
+            if str(pmcid).startswith("dailymed_"):
+                set_id = str(pmcid).replace("dailymed_", "", 1)
+            else:
+                set_id = sanitize(p.get("doc_id"), "") or sanitize(p.get("corpus_id"), "")
+        if is_dailymed and not pmcid and set_id:
+            pmcid = f"dailymed_{set_id}"
+
         return {
             "pmcid": pmcid,
             "pmid": sanitize(p.get("pmid"), ""),
             "title": sanitize(p.get("title"), "Untitled"),
             "authors": p.get("authors", []),
-            "journal": sanitize(p.get("venue") or p.get("journal"), ""),
+            "journal": sanitize(p.get("venue"), "") or sanitize(p.get("journal"), "") or ("DailyMed" if is_dailymed else ""),
             "year": sanitize(p.get("year")),
             "doi": sanitize(p.get("doi"), ""),
-            "article_type": sanitize(p.get("article_type"), ""),
+            "article_type": sanitize(p.get("article_type"), "") or ("drug_label" if is_dailymed else ""),
             "evidence_grade": sanitize(p.get("evidence_grade"), None),
             "evidence_level": sanitize(p.get("evidence_level"), None),
             "evidence_term": sanitize(p.get("evidence_term"), None),
             "evidence_source": sanitize(p.get("evidence_source"), None),
             "relevance_score": sanitize(p.get("relevance_judgement", p.get("relevance_score", 0)), 0),
             "pdf_url": sanitize(p.get("pdf_url")), # Preserve if already present
-            "source": source_type,
+            "source": source_type or ("dailymed" if is_dailymed else ""),
             "set_id": set_id,
             "dailymed_url": f"https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm?setid={set_id}" if set_id else None,
             "citation_index": sanitize(p.get("citation_index"), None),

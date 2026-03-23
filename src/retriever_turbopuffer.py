@@ -135,6 +135,38 @@ class TurbopufferRetriever:
             return [str(value)]
         return []
 
+    @staticmethod
+    def _normalized_text(value: Any) -> str:
+        import math
+
+        if value is None:
+            return ""
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+        return str(value).strip().lower()
+
+    @classmethod
+    def _is_dailymed_row(cls, row: Dict[str, Any]) -> bool:
+        source = cls._normalized_text(row.get("source"))
+        source_family = cls._normalized_text(row.get("source_family"))
+        article_type = cls._normalized_text(row.get("article_type"))
+        content_type = cls._normalized_text(row.get("content_type"))
+        title = cls._normalized_text(row.get("title"))
+        venue = cls._normalized_text(row.get("venue") or row.get("journal"))
+        pmcid = cls._normalized_text(row.get("pmcid") or row.get("corpus_id"))
+        doc_id = cls._normalized_text(row.get("doc_id"))
+        set_id = cls._normalized_text(row.get("set_id"))
+
+        if source == "dailymed" or source_family == "dailymed":
+            return True
+        if article_type == "drug_label" or content_type == "drug_label":
+            return True
+        if pmcid.startswith("dailymed_") or doc_id.startswith("dailymed_"):
+            return True
+        if set_id:
+            return True
+        return False
+
     def _rrf_scores(self, rows: List[Dict[str, Any]], weight: float) -> Dict[str, float]:
         scores: Dict[str, float] = {}
         for rank, row in enumerate(rows, 1):
@@ -185,9 +217,7 @@ class TurbopufferRetriever:
             return []
 
     def _row_to_passage(self, row: Dict[str, Any], score: float, stype: str) -> Dict[str, Any]:
-        source = row.get("source", "")
-        article_type = row.get("article_type", "")
-        if source == "dailymed" or article_type == "drug_label":
+        if self._is_dailymed_row(row):
             return self._transform_dailymed_payload(row, score)
         doc_id = self._doc_id_from_row(row)
         return {
@@ -304,16 +334,34 @@ class TurbopufferRetriever:
         return base
 
     def _transform_dailymed_payload(self, payload: Dict[str, Any], score: float) -> Dict[str, Any]:
-        set_id = payload.get("set_id") or payload.get("doc_id") or ""
+        def _safe_text(value: Any) -> str:
+            import math
+
+            if value is None:
+                return ""
+            if isinstance(value, float) and math.isnan(value):
+                return ""
+            return str(value).strip()
+
+        set_id = self._normalized_text(payload.get("set_id")) or self._normalized_text(payload.get("doc_id"))
+        corpus_id = f"dailymed_{set_id}" if set_id else _safe_text(payload.get("corpus_id") or payload.get("pmcid"))
+        title = _safe_text(payload.get("title") or payload.get("drug_name")) or "Untitled"
+        venue = _safe_text(payload.get("venue") or payload.get("journal")) or "DailyMed"
         return {
-            "corpus_id": f"dailymed_{set_id}",
-            "pmcid": f"dailymed_{set_id}",
+            "corpus_id": corpus_id or f"dailymed_{set_id}",
+            "pmcid": corpus_id or f"dailymed_{set_id}",
             "set_id": set_id,
-            "title": payload.get("title") or payload.get("drug_name", ""),
+            "title": title,
             "text": payload.get("page_content") or payload.get("text", ""),
             "abstract": payload.get("abstract", ""),
             "source": "dailymed",
+            "source_family": "dailymed",
+            "content_type": "drug_label",
             "article_type": "drug_label",
+            "journal": venue,
+            "venue": venue,
+            "doc_id": payload.get("doc_id") or set_id,
+            "publication_type": self._normalize_publication_type_list(payload.get("publication_type")) or ["drug_label"],
             "dailymed_sections": payload.get("dailymed_sections", {}),
             "score": score,
             "stype": "dailymed_lookup",

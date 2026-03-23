@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 # Initialize logger FIRST before any imports that might fail
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -357,7 +359,6 @@ def _parse_spl_xml_with_status(xml_path: Path) -> Tuple[Optional[Dict[str, Any]]
             "sections": sections,
             "source": "dailymed",
             "source_family": "dailymed",
-            "article_type": "drug_label",
         }, "ok"
     except Exception as e:
         logger.warning("Failed to parse %s: %s", xml_path, e)
@@ -385,7 +386,6 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
     manufacturer = drug.get("manufacturer", "")
     active_ingredients = drug.get("active_ingredients", [])
     sections = drug.get("sections", {})
-    publication_type = ["Drug Label"]
     
     # Helper to generate section_id
     def generate_section_id(doc_id: str, section_title: str) -> str:
@@ -395,35 +395,16 @@ def create_chunks(drug: Dict[str, Any], chunker, validate_chunks: bool = True) -
     base_metadata = {
         "doc_id": set_id,
         "set_id": set_id,
-        "pmcid": "",
-        "pmid": "",
         "doi": "",
-        "pii": None,
         "other_ids": {},
         "title": label_title,
         "abstract": "",
         "full_text": "",
-        "journal": "DailyMed",
-        "nlm_unique_id": None,
-        "year": None,
-        "country": "",
-        "keywords": [],
-        "mesh_terms": [],
-        "publication_type": publication_type,
-        "evidence_grade": "",
-        "evidence_level": None,
-        "evidence_term": None,
-        "evidence_source": None,
         "source": "dailymed",
         "source_family": "dailymed",
-        "content_type": "drug_label",
-        "article_type": "drug_label",
         "label_type_code": drug.get("label_type_code", ""),
         "label_type_display": drug.get("label_type_display", ""),
         "has_full_text": True,
-        "is_open_access": None,
-        "is_author_manuscript": False,
-        "nihms_id": None,
     }
     
     # Process ONLY whitelisted sections
@@ -604,16 +585,13 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
             
             vector = {"dense": embeddings[i]}
             
-            # Build canonical payload aligned with PMC/PubMed schemas
+            # Build the DailyMed payload with only the fields we want to retain
             payload = {
                 # Core identifiers (doc_id mapped from set_id for index consistency)
                 "doc_id": chunk.get("doc_id", chunk.get("set_id", "")),
                 "chunk_id": chunk["chunk_id"],
                 "set_id": chunk.get("set_id", ""),
-                "pmcid": chunk.get("pmcid", ""),
-                "pmid": chunk.get("pmid", ""),
                 "doi": chunk.get("doi", ""),
-                "pii": chunk.get("pii"),
                 "other_ids": chunk.get("other_ids", {}),
                 
                 # Content
@@ -630,7 +608,6 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
                 "table_type": chunk.get("table_type", ""),
                 "table_caption": chunk.get("table_caption", ""),
                 "table_id": chunk.get("table_id", ""),
-                "section_weight": chunk.get("section_weight", 1.0),
                 "has_tables": chunk.get("has_tables", False),
                 "full_section_text": chunk.get("full_section_text", chunk.get("page_content", chunk["text"])),
                 "section_id": chunk.get("section_id", ""),
@@ -643,20 +620,6 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
                 "label_type_code": chunk.get("label_type_code", ""),
                 "label_type_display": chunk.get("label_type_display", ""),
 
-                # Publication metadata
-                "journal": chunk.get("journal", "DailyMed"),
-                "nlm_unique_id": chunk.get("nlm_unique_id"),
-                "year": chunk.get("year"),
-                "country": chunk.get("country", ""),
-                "keywords": chunk.get("keywords", []),
-                "mesh_terms": chunk.get("mesh_terms", []),
-                "article_type": chunk.get("article_type", "drug_label"),
-                "publication_type": chunk.get("publication_type", ["Drug Label"]),
-                "evidence_grade": chunk.get("evidence_grade", ""),
-                "evidence_level": chunk.get("evidence_level"),
-                "evidence_term": chunk.get("evidence_term"),
-                "evidence_source": chunk.get("evidence_source"),
-
                 # Chunk metadata
                 "chunk_index": chunk.get("chunk_index", 0),
                 "total_chunks": chunk.get("total_chunks", 1),
@@ -665,12 +628,8 @@ def build_points(chunks: List[Dict[str, Any]], embedding_provider: EmbeddingProv
                 # Source info
                 "source": chunk.get("source", "dailymed"),
                 "source_family": chunk.get("source_family", "dailymed"),
-                "content_type": chunk.get("content_type", "drug_label"),
                 "has_full_text": chunk.get("has_full_text", True),
                 "table_count": chunk.get("table_count", 0),
-                "is_open_access": chunk.get("is_open_access"),
-                "is_author_manuscript": bool(chunk.get("is_author_manuscript", False)),
-                "nihms_id": chunk.get("nihms_id"),
                 
                 # Ingestion metadata
                 "ingestion_timestamp": time.time(),
@@ -694,6 +653,18 @@ CHECKPOINT_FILE = IngestionConfig.DAILYMED_CHECKPOINT_FILE
 
 # Namespace for DailyMed checkpoint IDs to prevent collision with PMC/PubMed
 DAILYMED_CHECKPOINT_NAMESPACE = "dailymed"
+
+AUDIT_REQUIRED_NONEMPTY_FIELDS = (
+    "doc_id",
+    "chunk_id",
+    "set_id",
+    "page_content",
+    "title",
+    "source",
+    "source_family",
+    "drug_name",
+    "section_type",
+)
 
 
 def _checkpoint_id(set_id: str) -> str:
@@ -723,6 +694,102 @@ def load_checkpoint_namespaced(path: Path) -> set[str]:
         if (resolved := _resolve_checkpoint_line(line)) is not None
     }
 
+
+class IngestionAuditCollector:
+    """Thread-safe collector for optional DailyMed ingestion audit output."""
+
+    def __init__(
+        self,
+        *,
+        namespace: str,
+        checkpoint_file: Path,
+        audit_path: Path,
+        expected_vector_size: int,
+    ) -> None:
+        self.namespace = namespace
+        self.checkpoint_file = checkpoint_file
+        self.audit_path = audit_path
+        self.expected_vector_size = expected_vector_size
+        self._lock = threading.Lock()
+        self._rows: List[Dict[str, Any]] = []
+        self._attempted_set_ids: Set[str] = set()
+        self._checkpointed_set_ids: Set[str] = set()
+
+    @staticmethod
+    def _extract_dense_vector(point: Any) -> List[float]:
+        vector = getattr(point, "vector", {})
+        if isinstance(vector, dict):
+            dense = vector.get("dense")
+            if isinstance(dense, list):
+                return [float(v) for v in dense]
+            return []
+        if isinstance(vector, list):
+            return [float(v) for v in vector]
+        return []
+
+    def record_attempted_set_ids(self, set_ids: Iterable[str]) -> None:
+        clean_ids = {value.strip() for value in set_ids if value and value.strip()}
+        if not clean_ids:
+            return
+        with self._lock:
+            self._attempted_set_ids.update(clean_ids)
+
+    def record_success(self, points: List[Any], checkpoint_ids: Iterable[str]) -> None:
+        checkpoint_id_list = [value.strip() for value in checkpoint_ids if value and value.strip()]
+        row_entries: List[Dict[str, Any]] = []
+        for point in points:
+            payload = dict(getattr(point, "payload", {}) or {})
+            dense_vector = self._extract_dense_vector(point)
+            row_entries.append(
+                {
+                    "point_id": str(getattr(point, "id", "")),
+                    "vector_is_dense_list": isinstance(dense_vector, list),
+                    "vector_dim": len(dense_vector),
+                    "payload": payload,
+                }
+            )
+
+        with self._lock:
+            self._rows.extend(row_entries)
+            self._checkpointed_set_ids.update(checkpoint_id_list)
+
+    def write(
+        self,
+        *,
+        total_inserted_rows: int,
+        total_skipped_files: int,
+        total_input_files: int,
+        selected_input_files: int,
+        elapsed_seconds: float,
+    ) -> None:
+        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            audit_data = {
+                "summary": {
+                    "namespace": self.namespace,
+                    "checkpoint_file": str(self.checkpoint_file),
+                    "expected_vector_size": int(self.expected_vector_size),
+                    "labels_attempted": len(self._attempted_set_ids),
+                    "labels_checkpointed": len(self._checkpointed_set_ids),
+                    "attempted_checkpoint_ids": sorted(self._attempted_set_ids),
+                    "checkpointed_ids": sorted(self._checkpointed_set_ids),
+                    "rows_written": int(total_inserted_rows),
+                    "rows_audited": len(self._rows),
+                    "total_input_files": int(total_input_files),
+                    "selected_input_files": int(selected_input_files),
+                    "total_skipped_files": int(total_skipped_files),
+                    "elapsed_seconds": round(float(elapsed_seconds), 3),
+                    "required_nonempty_fields": list(AUDIT_REQUIRED_NONEMPTY_FIELDS),
+                },
+                "rows": self._rows,
+            }
+        temp_path = self.audit_path.with_suffix(self.audit_path.suffix + ".tmp")
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(audit_data, handle, ensure_ascii=True, indent=2)
+            handle.write("\n")
+        temp_path.replace(self.audit_path)
+
+
 def process_batch(
     client: Any,
     batch_files: List[Path],
@@ -730,9 +797,11 @@ def process_batch(
     processed_ids: set[str],
     processed_lock: threading.Lock,
     chunker: Any,
+    checkpoint_file: Path = CHECKPOINT_FILE,
     refresh: bool = False,
     delete_source: bool = False,
     sink: Optional[BaseIngestionSink] = None,
+    audit_collector: Optional[IngestionAuditCollector] = None,
 ) -> Tuple[int, int]:
     """Process a batch of DailyMed XML files in a single thread."""
     inserted = 0
@@ -742,6 +811,7 @@ def process_batch(
     
     drugs = []
     new_ids = []
+    attempted_set_ids: Set[str] = set()
     processed_files: List[Path] = []
     
     # 1. Parse and filter
@@ -777,6 +847,7 @@ def process_batch(
             
             drugs.append(drug)
             new_ids.append(set_id_checkpoint)
+            attempted_set_ids.add(set_id_checkpoint)
             processed_files.append(xml_file)
             
         except Exception as e:
@@ -789,6 +860,9 @@ def process_batch(
 
     if not drugs:
         return 0, len(batch_files)
+
+    if audit_collector is not None:
+        audit_collector.record_attempted_set_ids(attempted_set_ids)
 
     # 2. Chunk and Embedding
     all_chunks = []
@@ -811,9 +885,11 @@ def process_batch(
             if written > 0:
                 # Update checkpoints only after a successful write.
                 # new_ids are already namespaced via _checkpoint_id() above
-                append_checkpoint_file(CHECKPOINT_FILE, new_ids)
+                append_checkpoint_file(checkpoint_file, new_ids)
                 with processed_lock:
                     processed_ids.update(new_ids)
+                if audit_collector is not None:
+                    audit_collector.record_success(points, new_ids)
 
                 # Delete source XML only after successful upsert + checkpoint update
                 if delete_source:
@@ -833,18 +909,41 @@ def process_batch(
 def run_ingestion(
     xml_dir: Path,
     embedding_provider: EmbeddingProvider,
+    *,
+    max_files: Optional[int] = None,
+    namespace_override: Optional[str] = None,
+    checkpoint_file: Optional[Path] = None,
+    audit_json: Optional[Path] = None,
+    file_batch_size: Optional[int] = None,
+    max_workers: Optional[int] = None,
+    disable_backpressure: bool = True,
     refresh: bool = False,
     delete_source: bool = False,
 ) -> None:
     ensure_data_dirs()
+    target_checkpoint_file = checkpoint_file or CHECKPOINT_FILE
+    target_namespace = (namespace_override or IngestionConfig.TURBOPUFFER_NAMESPACE_DAILYMED).strip()
+    if not target_namespace:
+        raise ValueError("DailyMed namespace must not be empty")
+    if max_files is not None and max_files <= 0:
+        raise ValueError("--max-files must be greater than 0 when provided")
+    if file_batch_size is not None and file_batch_size <= 0:
+        raise ValueError("--file-batch-size must be greater than 0 when provided")
+    if max_workers is not None and max_workers <= 0:
+        raise ValueError("--max-workers must be greater than 0 when provided")
 
     if delete_source:
         logger.warning("Source file deletion enabled: XML files will be deleted after successful ingestion")
+    if disable_backpressure:
+        logger.info(
+            "Turbopuffer disable_backpressure is enabled for ingestion writes; "
+            "use eventual consistency for read-after-write checks while indexing catches up."
+        )
     
     # In refresh mode, clear checkpoint to allow re-ingestion
-    if refresh and CHECKPOINT_FILE.exists():
+    if refresh and target_checkpoint_file.exists():
         logger.info("Refresh mode: clearing checkpoint file")
-        CHECKPOINT_FILE.unlink()
+        target_checkpoint_file.unlink()
     
     # Preload shared chunker (uses SemanticChunker if available)
     logger.info("Preloading shared chunker...")
@@ -860,25 +959,49 @@ def run_ingestion(
         logger.warning("Shared chunker preload failed: %s", e)
 
     # Use rglob to find all XMLs
-    xml_files = sorted(xml_dir.rglob("*.xml"))
+    all_xml_files = sorted(xml_dir.rglob("*.xml"))
     
-    if not xml_files:
+    if not all_xml_files:
         logger.warning("No XML files found in %s", xml_dir)
         return
+    if max_files is not None:
+        xml_files = all_xml_files[:max_files]
+        logger.info(
+            "Deterministic file selection enabled: selected first %s/%s XML files",
+            len(xml_files),
+            len(all_xml_files),
+        )
+    else:
+        xml_files = all_xml_files
 
     client = None
-    sink = build_ingestion_sink(namespace_override=IngestionConfig.TURBOPUFFER_NAMESPACE_DAILYMED)
-    logger.info("DailyMed ingestion sink backend=turbopuffer dry_run=%s", IngestionConfig.INGEST_DRY_RUN)
+    sink = build_ingestion_sink(
+        namespace_override=target_namespace,
+        disable_backpressure=disable_backpressure,
+    )
+    logger.info(
+        "DailyMed ingestion sink backend=turbopuffer namespace=%s dry_run=%s",
+        target_namespace,
+        IngestionConfig.INGEST_DRY_RUN,
+    )
 
-    processed_ids = load_checkpoint_namespaced(CHECKPOINT_FILE)
+    processed_ids = load_checkpoint_namespaced(target_checkpoint_file)
     processed_lock = threading.Lock()
-    logger.info("DailyMed checkpoint size=%s", len(processed_ids))
+    logger.info("DailyMed checkpoint size=%s file=%s", len(processed_ids), target_checkpoint_file)
 
     logger.info("Starting ingestion of %d files...", len(xml_files))
+    audit_collector = None
+    if audit_json is not None:
+        audit_collector = IngestionAuditCollector(
+            namespace=target_namespace,
+            checkpoint_file=target_checkpoint_file,
+            audit_path=audit_json,
+            expected_vector_size=IngestionConfig.get_vector_size(),
+        )
     
-    # Batching config
-    THREAD_BATCH_SIZE = IngestionConfig.BATCH_SIZE
-    MAX_WORKERS = IngestionConfig.MAX_WORKERS  # Standardized to use config value (default: 8)
+    # DailyMed-specific batching defaults (fall back to global config when not provided)
+    THREAD_BATCH_SIZE = file_batch_size or int(os.getenv("DAILYMED_FILE_BATCH_SIZE", str(IngestionConfig.BATCH_SIZE)))
+    MAX_WORKERS = max_workers or int(os.getenv("DAILYMED_MAX_WORKERS", str(IngestionConfig.MAX_WORKERS)))
     
     # If preload failed, initialize chunker once here.
     if chunker is None:
@@ -890,6 +1013,12 @@ def run_ingestion(
     
     file_batches = [xml_files[i:i + THREAD_BATCH_SIZE] for i in range(0, len(xml_files), THREAD_BATCH_SIZE)]
     total_batches = len(file_batches)
+    logger.info(
+        "DailyMed batching config file_batch_size=%s workers=%s total_batches=%s",
+        THREAD_BATCH_SIZE,
+        MAX_WORKERS,
+        total_batches,
+    )
     
     total_inserted = 0
     total_skipped = 0
@@ -911,9 +1040,11 @@ def run_ingestion(
                     processed_ids,
                     processed_lock,
                     chunker,
+                    target_checkpoint_file,
                     refresh,
                     delete_source,
                     sink,
+                    audit_collector,
                 ): batch
                 for batch in current_super_batch
             }
@@ -939,12 +1070,71 @@ def run_ingestion(
         total_skipped,
         time.time() - start_time,
     )
+    if audit_collector is not None:
+        elapsed = time.time() - start_time
+        audit_collector.write(
+            total_inserted_rows=total_inserted,
+            total_skipped_files=total_skipped,
+            total_input_files=len(all_xml_files),
+            selected_input_files=len(xml_files),
+            elapsed_seconds=elapsed,
+        )
+        logger.info("Wrote ingestion audit to %s", audit_json)
 
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Ingest DailyMed into self-hosted Qdrant with improved section handling")
     parser.add_argument("--xml-dir", type=Path, default=IngestionConfig.DAILYMED_XML_DIR)
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Ingest only the first N XML files from deterministic sorted order",
+    )
+    parser.add_argument(
+        "--namespace",
+        type=str,
+        default=None,
+        help="Override DailyMed turbopuffer namespace for this run",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        type=Path,
+        default=None,
+        help="Override checkpoint file path for this run",
+    )
+    parser.add_argument(
+        "--audit-json",
+        type=Path,
+        default=None,
+        help="Write ingestion audit rows and run summary to JSON",
+    )
+    parser.add_argument(
+        "--file-batch-size",
+        type=int,
+        default=None,
+        help="Number of XML files to process per worker batch (defaults to DAILYMED_FILE_BATCH_SIZE or BATCH_SIZE)",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Number of worker threads for DailyMed ingestion (defaults to DAILYMED_MAX_WORKERS or MAX_WORKERS)",
+    )
+    parser.add_argument(
+        "--disable-backpressure",
+        dest="disable_backpressure",
+        action="store_true",
+        default=True,
+        help="Set turbopuffer disable_backpressure=true for bulk ingestion writes (default: enabled)",
+    )
+    parser.add_argument(
+        "--respect-backpressure",
+        dest="disable_backpressure",
+        action="store_false",
+        help="Keep turbopuffer backpressure enabled (may increase 429 retries during bulk loads)",
+    )
     parser.add_argument("--refresh", action="store_true", help="Force re-ingestion of all labels (clears checkpoint)")
     parser.add_argument("--delete-source", action="store_true", help="Delete XML file after successful ingestion")
     args = parser.parse_args()
@@ -955,7 +1145,19 @@ if __name__ == "__main__":
 
     try:
         provider = EmbeddingProvider()
-        run_ingestion(args.xml_dir, provider, refresh=args.refresh, delete_source=args.delete_source)
+        run_ingestion(
+            args.xml_dir,
+            provider,
+            max_files=args.max_files,
+            namespace_override=args.namespace,
+            checkpoint_file=args.checkpoint_file,
+            audit_json=args.audit_json,
+            file_batch_size=args.file_batch_size,
+            max_workers=args.max_workers,
+            disable_backpressure=args.disable_backpressure,
+            refresh=args.refresh,
+            delete_source=args.delete_source,
+        )
     except Exception as e:
         logger.error("Ingestion failed: %s", e)
         sys.exit(1)
