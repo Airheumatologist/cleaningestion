@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import httpx
 import json
 import logging
 import os
@@ -99,6 +100,7 @@ class TurbopufferIngestionSink(BaseIngestionSink):
         self.max_retries = max(1, int(IngestionConfig.TURBOPUFFER_MAX_RETRIES))
         self.max_concurrent_writes = max(1, int(IngestionConfig.TURBOPUFFER_MAX_CONCURRENT_WRITES))
         self.sdk_max_retries = max(0, int(IngestionConfig.TURBOPUFFER_SDK_MAX_RETRIES))
+        self.timeout_seconds = max(1, int(IngestionConfig.TURBOPUFFER_TIMEOUT_SECONDS))
         self.disable_backpressure = (
             bool(disable_backpressure)
             if disable_backpressure is not None
@@ -121,19 +123,27 @@ class TurbopufferIngestionSink(BaseIngestionSink):
         self._last_batch_write_at: float | None = None
         self._last_metadata_logged_at: float | None = None
         self.stats = IngestionSinkStats()
+        
+        # Explicit connection options for Mac stability with large payloads
+        # Disabling HTTP/2 avoids SSLV3_ALERT_BAD_RECORD_MAC / PAC errors on macOS Default TLS provider
+        http_client = httpx.Client(http2=False, timeout=self.timeout_seconds)
+        
         client = tpuf.Turbopuffer(
             api_key=IngestionConfig.TURBOPUFFER_API_KEY,
             region=IngestionConfig.TURBOPUFFER_REGION,
             max_retries=self.sdk_max_retries,
+            timeout=self.timeout_seconds,
+            http_client=http_client,
         )
         self.ns = client.namespace(namespace)
         logger.info(
-            "Initialized turbopuffer sink namespace=%s batch_size=%s concurrency=%s disable_backpressure=%s sdk_max_retries=%s",
+            "Initialized turbopuffer sink namespace=%s batch_size=%s concurrency=%s disable_backpressure=%s sdk_max_retries=%s timeout=%ss",
             namespace,
             self.batch_size,
             self.max_concurrent_writes,
             self.disable_backpressure,
             self.sdk_max_retries,
+            self.timeout_seconds,
         )
 
     def _pace_next_batch_if_needed(self) -> None:
@@ -299,8 +309,22 @@ class TurbopufferIngestionSink(BaseIngestionSink):
                 exc_class = getattr(exc, "__class__", None)
                 exc_name = exc_class.__name__.lower() if exc_class else ""
                 
-                retryable = any(code in exc_str for code in ("429", "408", "409", "500", "502", "503", "504", "timeout", "timed out", "connection error"))
-                if "timeout" in exc_name or "connection" in exc_name or "readerror" in exc_name or "ssl" in exc_name:
+                # Check for 413 specifically to provide a better error message
+                if "413" in exc_str or "length limit exceeded" in exc_str:
+                    logger.error("HTTP 413: Request Entity Too Large. REDUCE TURBOPUFFER_WRITE_BATCH_SIZE in .env")
+                    raise ValueError("Payload too large for Turbopuffer. Try reducing batch size.") from exc
+
+                retryable = any(
+                    code in exc_str 
+                    for code in ("429", "408", "409", "500", "502", "503", "504", "timeout", "timed out", "connection error")
+                )
+                if (
+                    "timeout" in exc_name 
+                    or "connection" in exc_name 
+                    or "readerror" in exc_name 
+                    or "ssl" in exc_name
+                    or "apiconnectionerror" in exc_name
+                ):
                     retryable = True
                 if attempt >= self.max_retries or not retryable:
                     raise

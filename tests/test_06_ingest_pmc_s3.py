@@ -11,7 +11,7 @@ import requests
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-PMC_S3_INGEST_PATH = REPO_ROOT / "scripts" / "06_ingest_pmc_s3.py"
+PMC_S3_INGEST_PATH = REPO_ROOT / "scripts" / "baseline" / "ingest_pmc_s3.py"
 
 
 def load_pmc_s3_module():

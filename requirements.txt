@@ -1,46 +1,25 @@
-# RAG Pipeline Dependencies - Groq LLM + DeepInfra Embed/Rerank Configuration
+# Cleaningestion — pure Turbopuffer ingestion dependencies.
 # Install with: pip install -r requirements.txt
-#
-# NOTE: This is a MINIMAL configuration using:
-#       - Groq API for GPT-OSS generation/query decomposition
-#       - DeepInfra API for embeddings & reranking
-#       and BM25 for sparse search. Local ML packages (torch, transformers, etc.) are excluded.
 
-# Core API & Server
-fastapi>=0.109.0
-uvicorn>=0.27.0
-gunicorn>=23.0.0
-pydantic>=2.12.0
-starlette>=0.49.0
-annotated-types>=0.7.0
-bcrypt>=4.1.0
-
-# Vector Database
-qdrant-client>=1.16.0
+# Vector database
 turbopuffer>=0.10.0
+qdrant-client>=1.16.0   # transitively imported by ingestion_utils + updates/weekly_update; cleanup tracked separately
 grpcio>=1.78.0
 protobuf>=6.0.0
-portalocker>=3.0.0
 
-# LLM/Provider SDKs
-openai>=2.21.0
-groq>=0.11.0
-distro>=1.9.0
-jiter>=0.13.0
-
-# Data Processing
+# Data processing
 pandas>=2.3.0
 lxml>=6.0.0
-anyascii>=0.3.0
 numpy>=2.0.0
 python-dateutil>=2.9.0
 pytz>=2025.0
 tzdata>=2025.0
 
-# HTTP & Networking
+# HTTP & networking
 requests>=2.32.0
 httpx>=0.28.0
 httpcore>=1.0.0
+h11>=0.14.0
 h2>=4.3.0
 hpack>=4.1.0
 hyperframe>=6.1.0
@@ -56,6 +35,9 @@ tqdm>=4.67.0
 packaging>=26.0
 six>=1.17.0
 
+# Config validation
+pydantic>=2.12.0
+
 # Async support
 anyio>=4.12.0
 sniffio>=1.3.0
@@ -64,40 +46,3 @@ sniffio>=1.3.0
 typing-extensions>=4.15.0
 typing-inspection>=0.4.0
 exceptiongroup>=1.3.0
-
-# Click for CLI
-click>=8.1.0
-
-# Required by openai/pydantic (transitive but needed)
-annotated-doc>=0.0.4
-
-# =============================================================================
-# REMOVED PACKAGES (saved ~3GB)
-# =============================================================================
-# These were removed because you're using DeepInfra API instead of local models:
-#
-# ~2GB saved:
-#   - torch>=2.0.0
-#   - torchvision, torchaudio
-#
-# ~500MB saved:
-#   - transformers>=4.57.0
-#
-# ~200MB saved:
-#   - sentence-transformers>=5.1.0
-#
-# ~100MB saved:
-#   - cohere>=5.20.0
-#   - scikit-learn>=1.6.0
-#   - scipy>=1.13.0
-#   - fastavro>=1.12.0
-#
-# Other removed:
-#   - safetensors, accelerate
-#   - huggingface-hub, hf-xet, fsspec, filelock
-#   - mpmath, networkx, sympy, joblib, regex
-#   - pillow, Jinja2, MarkupSafe, threadpoolctl
-#   - types-requests
-#
-# To restore local ML support, uncomment and run:
-#   pip install torch transformers sentence-transformers cohere scikit-learn scipy

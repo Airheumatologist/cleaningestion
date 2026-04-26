@@ -1,28 +1,35 @@
+# Secrets
 .env
 .env.example
 api_keys.json
+
+# Local SSH keys
+.ssh/
+
+# Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 **/__pycache__/
 **/*.py[cod]
-.DS_Store
-*.xml
 
-# macOS metadata
+# Editor / OS
+.DS_Store
 ._*
 **/._*
-.DS_Store
 
-# Separate projects
-elixir-ai/
-
-# Logs and checkpoints
+# Runtime data, checkpoints, logs (never committed)
+data/
 *.log
+*.pid
 *checkpoint*.txt
-backend.log
+*_dump.txt
 
-# Test outputs and temporary files
+# XML payloads (we stream from upstream)
+*.xml
+
+# Test scratch
 *_response*.json
 test_*.py
 check_*.py
@@ -30,20 +37,7 @@ count_*.py
 debug_*.py
 verify_*.py
 fix_*.py
-*_dump.txt
 
 # Keep real unit tests under /tests tracked
 !tests/
 !tests/test_*.py
-
-# Node modules (frontend has its own .gitignore)
-node_modules/
-frontend/.next/
-.claude/
-
-# Runtime cache databases
-data/cache/*.db*
-data/cache_review_tmp*/
-
-# Local SSH keys
-.ssh/

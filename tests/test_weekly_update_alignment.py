@@ -8,7 +8,7 @@ from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-WEEKLY_UPDATE_PATH = REPO_ROOT / "scripts" / "08_weekly_update.py"
+WEEKLY_UPDATE_PATH = REPO_ROOT / "scripts" / "updates" / "weekly_update.py"
 
 
 def load_weekly_module():
