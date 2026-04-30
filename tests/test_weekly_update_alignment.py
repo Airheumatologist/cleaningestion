@@ -22,23 +22,15 @@ def load_weekly_module():
 
 
 class WeeklyUpdateAlignmentTests(unittest.TestCase):
-    def test_dailymed_refresh_runs_lookup_after_ingest(self):
+    def test_dailymed_refresh_runs_direct_update(self):
         module = load_weekly_module()
-        with mock.patch.object(module.subprocess, "run") as run_mock:
-            module.run_dailymed_refresh(weeks_back=2)
+        with mock.patch.object(module, "run_dailymed_direct_update", return_value=7) as run_mock:
+            module.run_dailymed_refresh()
 
-        scripts = [Path(call.args[0][1]).name for call in run_mock.call_args_list]
-        self.assertEqual(
-            scripts,
-            [
-                "03_download_dailymed.py",
-                "04_prepare_dailymed_updates.py",
-                "07_ingest_dailymed.py",
-                "generate_drug_lookup.py",
-            ],
+        run_mock.assert_called_once_with(
+            namespace=module.IngestionConfig.TURBOPUFFER_NAMESPACE_DAILYMED,
+            checkpoint_file=module.IngestionConfig.DAILYMED_CHECKPOINT_FILE,
         )
-        self.assertIn("2", run_mock.call_args_list[0].args[0])
-        self.assertIn("--delete-source", run_mock.call_args_list[2].args[0])
 
     def test_pmc_refresh_downloads_both_datasets_and_deletes_source(self):
         module = load_weekly_module()
@@ -51,16 +43,11 @@ class WeeklyUpdateAlignmentTests(unittest.TestCase):
         self.assertIn("pmc_oa,author_manuscript", pmc_download_cmd)
         self.assertIn("--delete-source", pmc_ingest_cmd)
 
-    def test_dailymed_refresh_fails_when_lookup_generation_fails(self):
+    def test_dailymed_refresh_fails_when_direct_update_fails(self):
         module = load_weekly_module()
-        with mock.patch.object(module.subprocess, "run") as run_mock:
-            run_mock.side_effect = [
-                None,
-                None,
-                None,
-                subprocess.CalledProcessError(returncode=1, cmd="generate_drug_lookup.py"),
-            ]
-            with self.assertRaises(subprocess.CalledProcessError):
+        with mock.patch.object(module, "run_dailymed_direct_update") as run_mock:
+            run_mock.side_effect = RuntimeError("direct update failed")
+            with self.assertRaises(RuntimeError):
                 module.run_dailymed_refresh()
 
     def test_qdrant_dns_success_path(self):
@@ -112,13 +99,7 @@ class WeeklyUpdateAlignmentTests(unittest.TestCase):
 
     def test_enforce_hnsw_indexing_uses_threshold_10000(self):
         module = load_weekly_module()
-        client = mock.Mock()
-        module.enforce_hnsw_indexing(client, "rag_pipeline")
-
-        self.assertTrue(client.update_collection.called)
-        kwargs = client.update_collection.call_args.kwargs
-        self.assertEqual(kwargs["collection_name"], "rag_pipeline")
-        self.assertEqual(kwargs["optimizers_config"].indexing_threshold, 10000)
+        module.enforce_hnsw_indexing("turbopuffer", indexing_threshold=10000)
 
     def test_main_enforces_hnsw_after_stages(self):
         module = load_weekly_module()
@@ -128,7 +109,6 @@ class WeeklyUpdateAlignmentTests(unittest.TestCase):
             skip_dailymed=True,
             skip_pmc=True,
             min_year=2015,
-            dailymed_weeks_back=1,
             throttle_seconds=0.5,
             batch_size=0,
         )
@@ -144,13 +124,11 @@ class WeeklyUpdateAlignmentTests(unittest.TestCase):
             mock.patch.object(module.IngestionConfig, "COLLECTION_NAME", "rag_pipeline"),
             mock.patch.object(module, "_resolve_qdrant_url_for_weekly", return_value="http://127.0.0.1:6333"),
             mock.patch.object(module, "EmbeddingProvider", return_value=object()),
-            mock.patch.object(module, "QdrantClient", return_value=client),
+            mock.patch.object(module, "enforce_hnsw_indexing") as enforce_mock,
         ):
             module.main()
 
-        kwargs = client.update_collection.call_args.kwargs
-        self.assertEqual(kwargs["collection_name"], "rag_pipeline")
-        self.assertEqual(kwargs["optimizers_config"].indexing_threshold, 10000)
+        enforce_mock.assert_called_once_with("turbopuffer", indexing_threshold=10000)
 
 
 if __name__ == "__main__":

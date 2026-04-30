@@ -32,7 +32,9 @@ class TurbopufferIngestionSinkTests(unittest.TestCase):
         sink = TurbopufferIngestionSink(namespace="medical_pmc", dry_run=False)
         point = _Point("11111111-1111-1111-1111-111111111111", [0.1, 0.2], {"page_content": "hello"})
 
-        mock_tpuf_cls.assert_called_once_with(api_key="test-key", region="test-region")
+        mock_tpuf_cls.assert_called_once()
+        self.assertEqual(mock_tpuf_cls.call_args.kwargs["api_key"], "test-key")
+        self.assertEqual(mock_tpuf_cls.call_args.kwargs["region"], "test-region")
         client.namespace.assert_called_once_with("medical_pmc")
         sink.write_points([point])
         sink.write_points([point])

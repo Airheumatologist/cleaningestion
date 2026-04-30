@@ -50,6 +50,7 @@ from ingestion_utils import (
     extract_gov_affiliations_from_pubmed_xml,
 )
 from turbopuffer_ingestion_sink import build_ingestion_sink
+from updates.ingest_dailymed_updates_direct import run_direct_update as run_dailymed_direct_update
 from pubmed_publication_filters import (
     is_target_article,
     map_publication_type,
@@ -80,12 +81,6 @@ PUBMED_CHECKPOINT_NAMESPACE = "pubmed"
 
 # PubMed filtering constants
 DEFAULT_MIN_YEAR = 2015
-
-# Default number of DailyMed weekly files to download per run.
-# 1 = only the most recently completed week (appropriate for a weekly job).
-# Increase to 2-4 if a run is skipped and you need to catch up.
-DEFAULT_DAILYMED_WEEKS_BACK = 1
-
 
 def _checkpoint_id(pmid: str) -> str:
     """Generate namespaced checkpoint ID for PubMed abstracts."""
@@ -1000,40 +995,22 @@ def ingest_pubmed_updates(
     return inserted
 
 
-def run_dailymed_refresh(weeks_back: int = DEFAULT_DAILYMED_WEEKS_BACK) -> None:
-    """Run DailyMed incremental update using the most recent weekly update file(s).
+def run_dailymed_refresh() -> None:
+    """Run DailyMed incremental update by streaming daily ZIPs into TurboPuffer.
 
-    Uses DailyMed's weekly update ZIPs (dm_spl_weekly_update_*.zip) rather than
-    the monthly ZIP so that label changes are picked up within the same week they
-    are published.  For a weekly job, ``weeks_back=1`` (the default) is sufficient.
-    Pass a higher value (e.g. 2–4) after a missed run to catch up.
+    The start date is derived from TurboPuffer namespace ``last_write_at`` so the
+    job catches up every DailyMed daily update published after the most recent
+    successful write.
     """
-    logger.info("Starting DailyMed incremental refresh (weeks_back=%d)", weeks_back)
-    set_id_manifest = IngestionConfig.DAILYMED_SET_ID_MANIFEST
-    scripts_dir = PROJECT_ROOT / "scripts"
-    subprocess.run([
-        sys.executable, str(scripts_dir / "03_download_dailymed.py"),
-        "--output-dir", str(IngestionConfig.DAILYMED_XML_DIR),
-        "--update-type", "weekly",
-        "--weeks-back", str(weeks_back),
-        "--set-id-manifest", str(set_id_manifest),
-    ], check=True, cwd=PROJECT_ROOT)
-    # Clear checkpoint entries for updated labels so they get re-ingested
-    subprocess.run([
-        sys.executable, str(scripts_dir / "04_prepare_dailymed_updates.py"),
-        "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR),
-        "--set-id-manifest", str(set_id_manifest),
-    ], check=True, cwd=PROJECT_ROOT)
-    # Ingest - updated labels will now be processed
-    subprocess.run([
-        sys.executable, str(scripts_dir / "07_ingest_dailymed.py"),
-        "--xml-dir", str(IngestionConfig.DAILYMED_XML_DIR),
-        "--delete-source",
-    ], check=True, cwd=PROJECT_ROOT)
-    # Regenerate lookup cache immediately after ingestion to avoid stale routing.
-    subprocess.run([
-        sys.executable, str(scripts_dir / "generate_drug_lookup.py"),
-    ], check=True, cwd=PROJECT_ROOT)
+    logger.info(
+        "Starting DailyMed direct incremental refresh (namespace=%s)",
+        IngestionConfig.TURBOPUFFER_NAMESPACE_DAILYMED,
+    )
+    rows_written = run_dailymed_direct_update(
+        namespace=IngestionConfig.TURBOPUFFER_NAMESPACE_DAILYMED,
+        checkpoint_file=IngestionConfig.DAILYMED_CHECKPOINT_FILE,
+    )
+    logger.info("DailyMed direct incremental refresh wrote %d rows", rows_written)
 
 
 def run_pmc_refresh() -> None:
@@ -1084,15 +1061,6 @@ def main() -> None:
         help=f"Minimum publication year (default: {DEFAULT_MIN_YEAR})"
     )
     parser.add_argument(
-        "--dailymed-weeks-back",
-        type=int,
-        default=DEFAULT_DAILYMED_WEEKS_BACK,
-        help=(
-            f"Number of DailyMed weekly update ZIPs to download (default: {DEFAULT_DAILYMED_WEEKS_BACK}). "
-            "Increase to 2-4 after a missed run to catch up."
-        ),
-    )
-    parser.add_argument(
         "--throttle-seconds",
         type=float,
         default=IngestionConfig.WEEKLY_UPDATE_THROTTLE_SECONDS,
@@ -1139,7 +1107,7 @@ def main() -> None:
         )
 
     if not args.skip_dailymed:
-        run_dailymed_refresh(weeks_back=args.dailymed_weeks_back)
+        run_dailymed_refresh()
 
     if not args.skip_pmc:
         run_pmc_refresh()

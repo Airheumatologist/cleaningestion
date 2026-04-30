@@ -229,6 +229,20 @@ class TurbopufferIngestionSink(BaseIngestionSink):
             }
         if "title" in schema:
             schema["title"] = {"type": "string", "full_text_search": True, "filterable": False}
+        if "drug_name" in schema:
+            schema["drug_name"] = {"type": "string", "full_text_search": True, "filterable": True}
+        for key in (
+            "full_section_text",
+            "section_id",
+            "section_title",
+            "table_caption",
+            "text_preview",
+            "abstract",
+        ):
+            if key in schema:
+                schema[key] = {"type": "string", "filterable": False}
+        if "other_ids" in schema:
+            schema["other_ids"] = {"type": "string", "filterable": False}
         return schema
 
     def _point_to_row(self, point: Any) -> dict[str, Any]:

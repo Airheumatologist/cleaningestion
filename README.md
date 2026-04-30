@@ -12,22 +12,18 @@ scripts/
 │   ├── download_pubmed_baseline.py
 │   ├── ingest_pubmed_ftp_stream.py
 │   ├── run_pubmed_ftp_stream_supervisor.sh
-│   ├── ingest_pmc_s3.py
-│   ├── download_dailymed.py
-│   └── ingest_dailymed_direct.py
+│   └── ingest_pmc_s3.py
 ├── updates/                               # recurring refreshes
 │   ├── weekly_update.py
-│   └── prepare_dailymed_updates.py
+│   └── ingest_dailymed_updates_direct.py
 ├── maintenance/                           # namespace ops + QA gates
-│   ├── delete_turbopuffer_namespace.py
-│   ├── validate_dailymed_namespace.py
-│   └── run_dailymed_1k_test_gate.sh
+│   └── delete_turbopuffer_namespace.py
 ├── config_ingestion.py                    # shared config (env-driven)
 ├── ingestion_utils.py                     # chunking, embeddings, parsing
 ├── turbopuffer_ingestion_sink.py          # write sink
 ├── pubmed_publication_filters.py
 ├── dailymed_rx_filters.py
-└── dailymed_ingest_lib.py                 # legacy DailyMed XML→tpuf entry point used by 1k gate
+└── dailymed_ingest_lib.py                 # shared DailyMed SPL parsing/chunking helpers
 tests/
 ├── test_06_ingest_pmc_s3.py
 ├── test_turbopuffer_ingestion_sink.py
@@ -61,16 +57,8 @@ scripts/baseline/run_pubmed_ftp_stream_supervisor.sh
 # PMC — stream OA + author manuscripts from the AWS S3 inventory
 python3 scripts/baseline/ingest_pmc_s3.py
 
-# DailyMed — direct path (HTTPS ZIPs, in-memory parsing)
-python3 scripts/baseline/ingest_dailymed_direct.py
-```
-
-The legacy XML-on-disk DailyMed flow (download → ingest) is still available
-for the 1k QA gate:
-
-```bash
-python3 scripts/baseline/download_dailymed.py
-python3 scripts/dailymed_ingest_lib.py --xml-dir "$DAILYMED_XML_DIR"
+# DailyMed baseline was already loaded. Ongoing DailyMed ingestion uses
+# the direct update streamer below.
 ```
 
 ## Updates
@@ -79,25 +67,16 @@ python3 scripts/dailymed_ingest_lib.py --xml-dir "$DAILYMED_XML_DIR"
 # Cron-driven weekly refresh (PubMed + DailyMed deltas)
 python3 scripts/updates/weekly_update.py
 
-# Clear DailyMed checkpoint entries before re-ingesting an update batch
-python3 scripts/updates/prepare_dailymed_updates.py \
-  --set-id-manifest "$DAILYMED_SET_ID_MANIFEST"
+# DailyMed-only direct refresh, streaming DailyMed daily ZIPs into Turbopuffer
+python3 scripts/updates/ingest_dailymed_updates_direct.py
 ```
 
 ## Maintenance
 
 ```bash
-# Delete a turbopuffer namespace (refuses production namespaces by default)
+# Delete a Turbopuffer namespace (refuses production namespaces by default)
 python3 scripts/maintenance/delete_turbopuffer_namespace.py \
   --namespace medical_database_dailymed_test_1000_a --confirm-delete
-
-# Validate a DailyMed namespace against an audit JSON
-python3 scripts/maintenance/validate_dailymed_namespace.py \
-  --namespace medical_database_dailymed_test_1000_a \
-  --audit-json /path/to/audit.json --report-json /path/to/report.json
-
-# Full 1k ingest → validate → delete gate
-scripts/maintenance/run_dailymed_1k_test_gate.sh
 ```
 
 ## Tests
