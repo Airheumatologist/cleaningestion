@@ -12,22 +12,22 @@ runs immediately after this script exits successfully.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ftplib
 import gzip
-import importlib.util
 import json
 import logging
 import os
 import re
-import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
-from urllib.parse import urlparse, urlunparse
 
 from qdrant_client.models import PointStruct
 
@@ -55,6 +55,7 @@ from pubmed_publication_filters import (
     is_target_article,
     map_publication_type,
 )
+import turbopuffer as tpuf
 
 # Import enhanced utilities for semantic chunking
 try:
@@ -76,78 +77,21 @@ PROCESSED_TRACKER = IngestionConfig.DATA_DIR / "processed_updates.json"
 # Shared checkpoint with the baseline ingestion script (21_ingest_pubmed_abstracts.py).
 # Format: "pubmed:{pmid}" per line — consistent with PUBMED_CHECKPOINT_NAMESPACE below.
 CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
-UPDATE_DOWNLOAD_DIR = IngestionConfig.DATA_DIR / "pubmed_updatefiles"
 PUBMED_CHECKPOINT_NAMESPACE = "pubmed"
 
 # PubMed filtering constants
 DEFAULT_MIN_YEAR = 2015
+PUBMED_LEAN_DROP_FIELDS = {
+    "token_count",
+    "source_family",
+    "full_section_text",
+    "full_text",
+    "text_preview",
+}
 
 def _checkpoint_id(pmid: str) -> str:
     """Generate namespaced checkpoint ID for PubMed abstracts."""
     return f"{PUBMED_CHECKPOINT_NAMESPACE}:{pmid.strip()}"
-
-
-def _replace_url_host(url: str, host: str) -> str:
-    parsed = urlparse(url)
-    userinfo = ""
-    if parsed.username:
-        userinfo = parsed.username
-        if parsed.password:
-            userinfo += f":{parsed.password}"
-        userinfo += "@"
-    port = f":{parsed.port}" if parsed.port else ""
-    return urlunparse(parsed._replace(netloc=f"{userinfo}{host}{port}"))
-
-
-def _resolve_qdrant_url_for_weekly(raw_url: str, container_name: str) -> str:
-    """Resolve Qdrant URL for host cron jobs when docker DNS 'qdrant' is unavailable."""
-    parsed = urlparse(raw_url)
-    host = parsed.hostname
-    if not host or host != "qdrant":
-        return raw_url
-
-    try:
-        socket.gethostbyname(host)
-        logger.info("Qdrant DNS resolved for weekly update host=%s url=%s", host, raw_url)
-        return raw_url
-    except OSError as dns_exc:
-        logger.warning("Qdrant DNS resolution failed for host=%s (%s); trying docker inspect fallback", host, dns_exc)
-
-    inspect_result = subprocess.run(
-        [
-            "docker",
-            "inspect",
-            "-f",
-            "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-            container_name,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    container_ip = inspect_result.stdout.strip()
-    if inspect_result.returncode != 0 or not container_ip:
-        stderr = (inspect_result.stderr or "").strip()
-        raise RuntimeError(
-            "Unable to resolve Qdrant host 'qdrant'. DNS lookup failed and docker inspect did not return a container IP "
-            f"for '{container_name}'. Set QDRANT_URL explicitly or ensure container '{container_name}' is running. "
-            f"docker inspect exit_code={inspect_result.returncode} stderr={stderr!r}"
-        )
-
-    resolved_url = _replace_url_host(raw_url, container_ip)
-    logger.warning(
-        "Resolved Qdrant URL via docker inspect fallback container=%s ip=%s url=%s",
-        container_name,
-        container_ip,
-        resolved_url,
-    )
-    return resolved_url
-
-
-def enforce_hnsw_indexing(collection_name: str, indexing_threshold: int = 10000) -> None:
-    _ = collection_name, indexing_threshold
-    # Turbopuffer indexes asynchronously without manual HNSW thresholds.
-    return
 
 def load_processed_files() -> Set[str]:
     if not PROCESSED_TRACKER.exists():
@@ -194,81 +138,123 @@ def load_baseline_pmids(path: Path) -> Set[str]:
     return {pmid for line in lines if (pmid := _resolve_checkpoint_pmid(line)) is not None}
 
 
-def list_pubmed_update_files(max_files: Optional[int]) -> List[str]:
-    ftp = ftplib.FTP(PUBMED_FTP_HOST, timeout=120)
-    ftp.login()
-    ftp.cwd(PUBMED_UPDATE_DIR)
-    files = sorted(f for f in ftp.nlst() if f.endswith(".xml.gz"))
-    ftp.quit()
-    if max_files:
-        files = files[-max_files:]
-    return files
-
-
-def _is_valid_gzip(path: Path) -> bool:
-    """Return True when a local .gz file can be opened and read."""
-    if not path.exists() or path.stat().st_size <= 0:
-        return False
+def get_pubmed_namespace_last_write_at() -> Optional[datetime]:
+    """Return PubMed namespace last_write_at timestamp from TurboPuffer metadata."""
     try:
-        with gzip.open(path, "rb") as handle:
-            while handle.read(1024 * 1024):
-                pass
-        return True
-    except Exception:
-        return False
+        client = tpuf.Turbopuffer(
+            api_key=IngestionConfig.TURBOPUFFER_API_KEY,
+            region=IngestionConfig.TURBOPUFFER_REGION,
+        )
+        metadata = client.namespace(IngestionConfig.TURBOPUFFER_NAMESPACE_PUBMED).metadata()
+        last_write_at = getattr(metadata, "last_write_at", None)
+        if not last_write_at:
+            return None
+        return datetime.fromisoformat(str(last_write_at).replace("Z", "+00:00"))
+    except Exception as exc:
+        logger.warning("Failed to fetch PubMed namespace last_write_at: %s", exc)
+        return None
 
 
-def download_pubmed_file(file_name: str, output_dir: Path) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    local_path = output_dir / file_name
-    temp_path = local_path.with_suffix(local_path.suffix + ".tmp")
-    max_attempts = 3
+def _parse_ftp_modify(value: str) -> Optional[datetime]:
+    """Parse MLSD modify timestamps (YYYYMMDDHHMMSS[.sss])."""
+    if not value:
+        return None
+    raw = value.split(".", 1)[0]
+    try:
+        return datetime.strptime(raw, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
-    if _is_valid_gzip(local_path):
-        return local_path
 
-    if local_path.exists():
-        logger.warning("Found invalid/incomplete PubMed update file, re-downloading: %s", local_path)
-        local_path.unlink(missing_ok=True)
-
+def list_pubmed_update_files(max_files: Optional[int], since: Optional[datetime] = None) -> List[str]:
     last_error: Optional[Exception] = None
-    for attempt in range(1, max_attempts + 1):
-        ftp = None
-        temp_path.unlink(missing_ok=True)
+    for attempt in range(1, 6):
+        ftp: Optional[ftplib.FTP] = None
         try:
             ftp = ftplib.FTP(PUBMED_FTP_HOST, timeout=120)
             ftp.login()
             ftp.cwd(PUBMED_UPDATE_DIR)
-            with temp_path.open("wb") as f:
-                ftp.retrbinary(f"RETR {file_name}", f.write, blocksize=1024 * 1024)
+            files: List[tuple[str, Optional[datetime]]] = []
+            try:
+                for name, facts in ftp.mlsd(facts=["modify"]):
+                    if not name.endswith(".xml.gz"):
+                        continue
+                    modified = _parse_ftp_modify(facts.get("modify", ""))
+                    files.append((name, modified))
+            except Exception:
+                logger.warning("FTP MLSD listing unavailable; falling back to NLST without timestamp filtering")
+                files = [(name, None) for name in ftp.nlst() if name.endswith(".xml.gz")]
 
-            if not _is_valid_gzip(temp_path):
-                raise RuntimeError(f"Downloaded file is not a valid gzip archive: {file_name}")
-
-            temp_path.replace(local_path)
-            return local_path
+            files = sorted(files, key=lambda item: item[0])
+            if since is not None:
+                since_utc = since.astimezone(timezone.utc)
+                files = [(name, modified) for name, modified in files if modified is None or modified > since_utc]
+            selected = [name for name, _ in files]
+            if max_files:
+                selected = selected[-max_files:]
+            return selected
         except Exception as exc:
             last_error = exc
-            logger.warning(
-                "Failed to download PubMed update file %s (attempt %d/%d): %s",
-                file_name,
-                attempt,
-                max_attempts,
-                exc,
-            )
-            if attempt < max_attempts:
-                time.sleep(min(2 ** (attempt - 1), 5))
+            if attempt < 5:
+                wait = min(2 ** (attempt - 1), 8)
+                logger.warning("PubMed FTP file listing failed attempt %d/5: %s (retrying in %ss)", attempt, exc, wait)
+                time.sleep(wait)
         finally:
             if ftp is not None:
                 try:
                     ftp.quit()
                 except Exception:
                     pass
-            temp_path.unlink(missing_ok=True)
+    raise RuntimeError(f"Failed to list PubMed update files after retries: {last_error}")
 
-    raise RuntimeError(
-        f"Failed to download PubMed update file after {max_attempts} attempts: {file_name}"
-    ) from last_error
+
+def _iter_pubmed_articles_from_ftp(file_name: str, min_year: int = DEFAULT_MIN_YEAR) -> Iterable[Dict[str, Any]]:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, 4):
+        ftp: Optional[ftplib.FTP] = None
+        conn = None
+        try:
+            ftp = ftplib.FTP(PUBMED_FTP_HOST, timeout=120)
+            ftp.login()
+            ftp.cwd(PUBMED_UPDATE_DIR)
+            conn = ftp.transfercmd(f"RETR {file_name}")
+            with conn.makefile("rb") as stream, gzip.GzipFile(fileobj=stream, mode="rb") as handle:
+                context = ET.iterparse(handle, events=("end",))
+                for _, elem in context:
+                    if elem.tag != "PubmedArticle":
+                        continue
+                    for article in parse_pubmed_article_element(elem, min_year=min_year):
+                        yield article
+                    elem.clear()
+            ftp.voidresp()
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                wait = min(2 ** (attempt - 1), 6)
+                logger.warning(
+                    "PubMed FTP stream failed file=%s attempt %d/3: %s (retrying in %ss)",
+                    file_name,
+                    attempt,
+                    exc,
+                    wait,
+                )
+                time.sleep(wait)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if ftp is not None:
+                try:
+                    ftp.quit()
+                except Exception:
+                    try:
+                        ftp.close()
+                    except Exception:
+                        pass
+    raise RuntimeError(f"Failed to stream PubMed FTP file after retries: {file_name} ({last_error})")
 
 
 def parse_pubmed_date(pub_date_elem: Optional[ET.Element]) -> Dict[str, Any]:
@@ -517,133 +503,100 @@ def extract_publication_types(article_elem: ET.Element) -> List[Dict[str, Any]]:
     return pub_types
 
 
-def parse_pubmed_update_xml(
-    xml_gz_path: Path, min_year: int = DEFAULT_MIN_YEAR
-) -> Iterable[Dict[str, Any]]:
-    with gzip.open(xml_gz_path, "rb") as handle:
-        context = ET.iterparse(handle, events=("end",))
-        for event, elem in context:
-            if elem.tag != "PubmedArticle":
-                continue
+def parse_pubmed_article_element(elem: ET.Element, min_year: int = DEFAULT_MIN_YEAR) -> Iterable[Dict[str, Any]]:
+    article_ids = extract_article_ids(elem)
+    pmid = str(article_ids.get("pmid") or "").strip()
+    if not pmid:
+        return
 
-            article_ids = extract_article_ids(elem)
-            pmid = str(article_ids.get("pmid") or "").strip()
-            if not pmid:
-                elem.clear()
-                continue
+    title_elem = elem.find(".//ArticleTitle")
+    title = "".join(title_elem.itertext()).strip() if title_elem is not None else ""
+    abstract_data = extract_abstract(elem)
+    abstract = str(abstract_data.get("abstract_text") or "").strip()
 
-            title_elem = elem.find(".//ArticleTitle")
-            title = "".join(title_elem.itertext()).strip() if title_elem is not None else ""
-            abstract_data = extract_abstract(elem)
-            abstract = str(abstract_data.get("abstract_text") or "").strip()
+    if not pmid or not title or not abstract:
+        return
+    if len(abstract) < 50:
+        return
 
-            # Basic presence check (line 132 equivalent)
-            if not pmid or not title or not abstract:
-                elem.clear()
-                continue
+    pub_types_data = extract_publication_types(elem)
+    pub_types_flat = [pt["type"] for pt in pub_types_data]
+    if not is_target_article(pub_types_flat):
+        return
 
-            # Filter: Abstract length check (matches baseline line 748-749)
-            if len(abstract) < 50:
-                elem.clear()
-                continue
+    journal_info = extract_journal_info(elem)
+    pub_date = journal_info.get("pub_date", {})
 
-            # Extract publication types early for filtering
-            pub_types_data = extract_publication_types(elem)
-            pub_types_flat = [pt["type"] for pt in pub_types_data]
+    year: Optional[int] = None
+    year_str = pub_date.get("year")
+    if year_str is not None:
+        try:
+            year = int(str(year_str))
+        except ValueError:
+            year = None
+    if year is None or year < min_year:
+        return
 
-            # Filter: Target publication types (matches baseline line 726)
-            if not is_target_article(pub_types_flat):
-                elem.clear()
-                continue
+    journal = journal_info.get("title") or journal_info.get("iso_abbreviation") or ""
+    article_type = map_publication_type(pub_types_flat)
+    if not article_type:
+        return
+    evidence = classify_evidence_metadata(
+        article_type=article_type,
+        pub_types=pub_types_flat,
+        abstract=abstract,
+    )
+    mesh_terms = extract_mesh_terms(elem)
+    keywords = extract_keywords(elem)
+    is_gov_affiliated, gov_agencies = extract_gov_affiliations_from_pubmed_xml(elem)
 
-            journal_info = extract_journal_info(elem)
-            pub_date = journal_info.get("pub_date", {})
-
-            year: Optional[int] = None
-            year_str = pub_date.get("year")
-            if year_str is not None:
-                try:
-                    year = int(str(year_str))
-                except ValueError:
-                    year = None
-
-            # Filter: Minimum year check (matches baseline line 740)
-            if year is None or year < min_year:
-                elem.clear()
-                continue
-
-            journal = (
-                journal_info.get("title")
-                or journal_info.get("iso_abbreviation")
-                or ""
-            )
-
-            article_type = map_publication_type(pub_types_flat)
-            if not article_type:
-                elem.clear()
-                continue
-            evidence = classify_evidence_metadata(
-                article_type=article_type,
-                pub_types=pub_types_flat,
-                abstract=abstract,
-            )
-            evidence_grade = evidence["grade"]
-            evidence_level = evidence["level_1_4"]
-            evidence_term = evidence["matched_term"]
-            evidence_source = evidence["matched_from"]
-
-            mesh_terms = extract_mesh_terms(elem)
-            keywords = extract_keywords(elem)
-
-            # Extract government affiliations
-            is_gov_affiliated, gov_agencies = extract_gov_affiliations_from_pubmed_xml(elem)
-
-            yield {
-                "pmid": pmid,
-                "doi": article_ids.get("doi"),
-                "pmc": article_ids.get("pmc"),
-                "pii": article_ids.get("pii"),
-                "other_ids": article_ids.get("other_ids", {}),
-                "title": title,
-                "abstract": abstract,
-                "abstract_structured": abstract_data.get("abstract_structured", []),
-                "has_structured_abstract": abstract_data.get("has_structured_abstract", False),
-                "year": year,
-                "journal": journal,
-                "journal_full": {
-                    "title": journal_info.get("title"),
-                    "iso_abbreviation": journal_info.get("iso_abbreviation"),
-                    "issn": journal_info.get("issn"),
-                    "issn_type": journal_info.get("issn_type"),
-                    "volume": journal_info.get("volume"),
-                    "issue": journal_info.get("issue"),
-                    "cited_medium": journal_info.get("cited_medium"),
-                    "nlm_unique_id": journal_info.get("nlm_unique_id"),
-                },
-                "publication_date": pub_date,
-                "mesh_terms": mesh_terms,
-                "mesh_terms_flat": [m["descriptor"] for m in mesh_terms],
-                "keywords": keywords,
-                "keywords_flat": [k["keyword"] for k in keywords],
-                "publication_types": pub_types_data,
-                "publication_types_flat": pub_types_flat,
-                "article_type": article_type,
-                "evidence_grade": evidence_grade,
-                "evidence_level": evidence_level,
-                "evidence_term": evidence_term,
-                "evidence_source": evidence_source,
-                "source": "pubmed_abstract",
-                "has_full_text": False,
-                "content_type": "abstract",
-                "is_gov_affiliated": is_gov_affiliated,
-                "gov_agencies": gov_agencies,
-            }
-
-            elem.clear()
+    yield {
+        "pmid": pmid,
+        "doi": article_ids.get("doi"),
+        "pmc": article_ids.get("pmc"),
+        "pii": article_ids.get("pii"),
+        "other_ids": article_ids.get("other_ids", {}),
+        "title": title,
+        "abstract": abstract,
+        "abstract_structured": abstract_data.get("abstract_structured", []),
+        "has_structured_abstract": abstract_data.get("has_structured_abstract", False),
+        "year": year,
+        "journal": journal,
+        "journal_full": {
+            "title": journal_info.get("title"),
+            "iso_abbreviation": journal_info.get("iso_abbreviation"),
+            "issn": journal_info.get("issn"),
+            "issn_type": journal_info.get("issn_type"),
+            "volume": journal_info.get("volume"),
+            "issue": journal_info.get("issue"),
+            "cited_medium": journal_info.get("cited_medium"),
+            "nlm_unique_id": journal_info.get("nlm_unique_id"),
+        },
+        "publication_date": pub_date,
+        "mesh_terms": mesh_terms,
+        "mesh_terms_flat": [m["descriptor"] for m in mesh_terms],
+        "keywords": keywords,
+        "keywords_flat": [k["keyword"] for k in keywords],
+        "publication_types": pub_types_data,
+        "publication_types_flat": pub_types_flat,
+        "article_type": article_type,
+        "evidence_grade": evidence["grade"],
+        "evidence_level": evidence["level_1_4"],
+        "evidence_term": evidence["matched_term"],
+        "evidence_source": evidence["matched_from"],
+        "source": "pubmed_abstract",
+        "has_full_text": False,
+        "content_type": "abstract",
+        "is_gov_affiliated": is_gov_affiliated,
+        "gov_agencies": gov_agencies,
+    }
 
 
-def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvider,
-                 validate_chunks: bool = True, dedup_chunks: bool = True) -> tuple[List[PointStruct], List[str]]:
+def build_points(
+    batch: List[Dict[str, Any]],
+    embedding_provider: EmbeddingProvider,
+    drop_fields: Optional[Set[str]] = None,
+) -> tuple[List[PointStruct], List[str]]:
     """Build Qdrant points from article batch with semantic chunking.
 
     Point IDs are generated as uuid5(NAMESPACE_DNS, "pubmed:{chunk_id}"), which
@@ -653,8 +606,6 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
     Args:
         batch: List of parsed articles
         embedding_provider: Provider for generating embeddings
-        validate_chunks: Whether to validate chunk quality before ingestion
-        dedup_chunks: Whether to deduplicate chunks within batch
     """
     # Use shared chunker instance (SemanticChunker if available)
     chunker = get_shared_chunker(
@@ -829,6 +780,9 @@ def build_points(batch: List[Dict[str, Any]], embedding_provider: EmbeddingProvi
                 # Preview for dashboard
                 "text_preview": chunk_text[:500],
             }
+            if drop_fields:
+                for field in drop_fields:
+                    payload.pop(field, None)
 
             chunk_metadata.append(payload)
 
@@ -861,6 +815,10 @@ def ingest_pubmed_updates(
     min_year: int = DEFAULT_MIN_YEAR,
     batch_size: Optional[int] = None,
     throttle_seconds: Optional[float] = None,
+    file_workers: int = 1,
+    checkpoint_flush_size: int = 200,
+    since_override: Optional[datetime] = None,
+    lean_payload: bool = False,
 ) -> int:
     effective_batch_size = (
         batch_size
@@ -878,9 +836,12 @@ def ingest_pubmed_updates(
     )
 
     logger.info(
-        "Weekly PubMed QoS settings: batch_size=%d throttle_seconds=%.3f",
+        "Weekly PubMed QoS settings: batch_size=%d throttle_seconds=%.3f file_workers=%d checkpoint_flush_size=%d lean_payload=%s",
         effective_batch_size,
         effective_throttle,
+        max(1, file_workers),
+        max(1, checkpoint_flush_size),
+        lean_payload,
     )
 
     processed = load_processed_files()
@@ -891,8 +852,15 @@ def ingest_pubmed_updates(
         CHECKPOINT_FILE,
     )
 
-    all_files = list_pubmed_update_files(max_files=max_files)
+    namespace_last_write_at = since_override if since_override is not None else get_pubmed_namespace_last_write_at()
+    if namespace_last_write_at is not None:
+        logger.info(
+            "PubMed namespace last_write_at=%s (UTC) - selecting FTP updates newer than this timestamp",
+            namespace_last_write_at.astimezone(timezone.utc).isoformat(),
+        )
+    all_files = list_pubmed_update_files(max_files=max_files, since=namespace_last_write_at)
     new_files = [f for f in all_files if f not in processed]
+    drop_fields = PUBMED_LEAN_DROP_FIELDS if lean_payload else None
 
     logger.info("PubMed update files total=%s new=%s", len(all_files), len(new_files))
 
@@ -910,67 +878,71 @@ def ingest_pubmed_updates(
     inserted = 0
     total_articles_processed = 0
     total_batches_upserted = 0
+    checkpoint_buffer: List[str] = []
+    state_lock = threading.Lock()
+    checkpoint_lock = threading.Lock()
     pubmed_started = time.time()
-    for file_name in new_files:
+
+    def flush_checkpoint_buffer(force: bool = False) -> None:
+        ids_to_flush: List[str] = []
+        with checkpoint_lock:
+            if not checkpoint_buffer:
+                return
+            if not force and len(checkpoint_buffer) < max(1, checkpoint_flush_size):
+                return
+            ids_to_flush = list(checkpoint_buffer)
+            checkpoint_buffer.clear()
+        append_checkpoint_file(CHECKPOINT_FILE, ids_to_flush)
+
+    def process_single_file(file_name: str) -> tuple[int, int, int]:
         file_started = time.time()
         logger.info("Processing update file: %s", file_name)
-        local_file = download_pubmed_file(file_name, UPDATE_DOWNLOAD_DIR)
-
         batch: List[Dict[str, Any]] = []
         file_inserted = 0
         file_articles_processed = 0
         file_batches_upserted = 0
-        for article in parse_pubmed_update_xml(local_file, min_year=min_year):
-            batch.append(article)
-            file_articles_processed += 1
-            total_articles_processed += 1
-            if len(batch) < effective_batch_size:
-                continue
+
+        def process_article_batch(articles: List[Dict[str, Any]]) -> None:
+            nonlocal file_inserted, file_batches_upserted
+            nonlocal inserted, total_batches_upserted
             points, ingested_pmids = build_points(
-                batch,
+                articles,
                 embedding_provider,
-                validate_chunks=ENHANCED_UTILS_AVAILABLE,
-                dedup_chunks=ENHANCED_UTILS_AVAILABLE,
+                drop_fields=drop_fields,
             )
-            if points:
-                sink.write_points(points)
+            if not points:
+                return
+            sink.write_points(points)
+            with state_lock:
                 new_checkpoint_pmids = [pmid for pmid in ingested_pmids if pmid not in baseline_pmids]
                 checkpoint_ids = [_checkpoint_id(pmid) for pmid in new_checkpoint_pmids]
                 if checkpoint_ids:
-                    append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
+                    with checkpoint_lock:
+                        checkpoint_buffer.extend(checkpoint_ids)
                 baseline_pmids.update(ingested_pmids)
                 inserted += len(points)
+                total_batches_upserted += 1
                 file_inserted += len(points)
                 file_batches_upserted += 1
-                total_batches_upserted += 1
-                if effective_throttle > 0:
-                    time.sleep(effective_throttle)
+            flush_checkpoint_buffer(force=False)
+            if effective_throttle > 0:
+                time.sleep(effective_throttle)
+
+        for article in _iter_pubmed_articles_from_ftp(file_name, min_year=min_year):
+            batch.append(article)
+            file_articles_processed += 1
+            if len(batch) < effective_batch_size:
+                continue
+            process_article_batch(batch)
             batch.clear()
 
         if batch:
-            points, ingested_pmids = build_points(
-                batch,
-                embedding_provider,
-                validate_chunks=ENHANCED_UTILS_AVAILABLE,
-                dedup_chunks=ENHANCED_UTILS_AVAILABLE,
-            )
-            if points:
-                sink.write_points(points)
-                new_checkpoint_pmids = [pmid for pmid in ingested_pmids if pmid not in baseline_pmids]
-                checkpoint_ids = [_checkpoint_id(pmid) for pmid in new_checkpoint_pmids]
-                if checkpoint_ids:
-                    append_checkpoint_file(CHECKPOINT_FILE, checkpoint_ids)
-                baseline_pmids.update(ingested_pmids)
-                inserted += len(points)
-                file_inserted += len(points)
-                file_batches_upserted += 1
-                total_batches_upserted += 1
-                if effective_throttle > 0:
-                    time.sleep(effective_throttle)
+            process_article_batch(batch)
 
-        processed.add(file_name)
-        save_processed_files(processed)
-        local_file.unlink(missing_ok=True)
+        with state_lock:
+            total_articles_processed += file_articles_processed
+            processed.add(file_name)
+            save_processed_files(processed)
         file_elapsed = max(0.001, time.time() - file_started)
         logger.info(
             "Completed file: %s inserted=%d articles=%d batches=%d elapsed=%.1fs throughput_points_per_s=%.2f",
@@ -981,6 +953,33 @@ def ingest_pubmed_updates(
             file_elapsed,
             file_inserted / file_elapsed,
         )
+        return file_inserted, file_articles_processed, file_batches_upserted
+
+    workers = max(1, int(file_workers))
+    failed_files: List[str] = []
+    if workers == 1:
+        for file_name in new_files:
+            try:
+                process_single_file(file_name)
+            except Exception:
+                failed_files.append(file_name)
+                logger.exception("Failed processing PubMed update file: %s", file_name)
+    else:
+        logger.info("PubMed file-level parallelism enabled workers=%d", workers)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(process_single_file, name): name for name in new_files}
+            for future in as_completed(futures):
+                file_name = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    failed_files.append(file_name)
+                    logger.exception("Failed processing PubMed update file: %s", file_name)
+
+    flush_checkpoint_buffer(force=True)
+
+    if failed_files:
+        logger.warning("PubMed files failed=%d files=%s", len(failed_files), ",".join(sorted(failed_files)))
 
     pubmed_elapsed = max(0.001, time.time() - pubmed_started)
     logger.info(
@@ -1051,6 +1050,12 @@ def run_pmc_refresh() -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Weekly incremental update for self-hosted Medical RAG")
     parser.add_argument("--max-files", type=int, default=None, help="Process at most N newest PubMed update files")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Override ingestion data directory (defaults to DATA_DIR env / config).",
+    )
     parser.add_argument("--skip-pubmed", action="store_true")
     parser.add_argument("--skip-dailymed", action="store_true")
     parser.add_argument("--skip-pmc", action="store_true")
@@ -1059,6 +1064,12 @@ def main() -> None:
         type=int,
         default=DEFAULT_MIN_YEAR,
         help=f"Minimum publication year (default: {DEFAULT_MIN_YEAR})"
+    )
+    parser.add_argument(
+        "--since-date",
+        type=str,
+        default=None,
+        help="Override PubMed update start date in YYYY-MM-DD (UTC); bypasses namespace last_write_at.",
     )
     parser.add_argument(
         "--throttle-seconds",
@@ -1078,7 +1089,41 @@ def main() -> None:
             "Set <=0 to use BATCH_SIZE."
         ),
     )
+    parser.add_argument(
+        "--file-workers",
+        type=int,
+        default=1,
+        help="Parallel PubMed file workers (default: 1). Increase to improve throughput.",
+    )
+    parser.add_argument(
+        "--checkpoint-flush-size",
+        type=int,
+        default=200,
+        help="Number of checkpoint IDs to buffer before appending to disk (default: 200).",
+    )
+    parser.add_argument(
+        "--lean-pubmed-payload",
+        action="store_true",
+        help=(
+            "Drop non-essential PubMed payload fields for lower write volume: "
+            f"{', '.join(sorted(PUBMED_LEAN_DROP_FIELDS))}"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.data_dir:
+        data_dir = Path(args.data_dir).expanduser().resolve()
+        IngestionConfig.DATA_DIR = data_dir
+        IngestionConfig.PMC_XML_DIR = Path(str(data_dir / "pmc_xml"))
+        IngestionConfig.DAILYMED_CHECKPOINT_FILE = Path(str(data_dir / "dailymed_ingested_ids.txt"))
+        IngestionConfig.PUBMED_BASELINE_DIR = Path(str(data_dir / "pubmed_baseline"))
+        IngestionConfig.PUBMED_ABSTRACTS_FILE = Path(
+            str(IngestionConfig.PUBMED_BASELINE_DIR / "filtered" / "pubmed_abstracts.jsonl")
+        )
+        global PROCESSED_TRACKER, CHECKPOINT_FILE
+        PROCESSED_TRACKER = IngestionConfig.DATA_DIR / "processed_updates.json"
+        CHECKPOINT_FILE = IngestionConfig.DATA_DIR / "pubmed_ingested_ids.txt"
+        logger.info("Overrode data directory for weekly update: %s", IngestionConfig.DATA_DIR)
 
     ensure_data_dirs()
 
@@ -1093,6 +1138,13 @@ def main() -> None:
 
     embedding_provider = EmbeddingProvider()
     sink = build_ingestion_sink(namespace_override=IngestionConfig.TURBOPUFFER_NAMESPACE_PUBMED)
+    since_override_dt: Optional[datetime] = None
+    if args.since_date:
+        try:
+            since_override_dt = datetime.strptime(args.since_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            logger.error("Invalid --since-date value %r (expected YYYY-MM-DD)", args.since_date)
+            sys.exit(2)
 
     started = time.time()
     total_inserted = 0
@@ -1104,6 +1156,10 @@ def main() -> None:
             min_year=args.min_year,
             batch_size=args.batch_size,
             throttle_seconds=args.throttle_seconds,
+            file_workers=args.file_workers,
+            checkpoint_flush_size=args.checkpoint_flush_size,
+            since_override=since_override_dt,
+            lean_payload=args.lean_pubmed_payload,
         )
 
     if not args.skip_dailymed:
@@ -1112,7 +1168,6 @@ def main() -> None:
     if not args.skip_pmc:
         run_pmc_refresh()
 
-    enforce_hnsw_indexing("turbopuffer", indexing_threshold=10000)
     logger.info(
         "Weekly update complete inserted=%s elapsed=%.1fs",
         total_inserted, time.time() - started,

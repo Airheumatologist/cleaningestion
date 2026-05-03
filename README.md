@@ -64,8 +64,35 @@ python3 scripts/baseline/ingest_pmc_s3.py
 ## Updates
 
 ```bash
-# Cron-driven weekly refresh (PubMed + DailyMed deltas)
-python3 scripts/updates/weekly_update.py
+# Cron-driven weekly refresh (PubMed + DailyMed + PMC deltas)
+python3 scripts/updates/weekly_update.py \
+  --data-dir /Volumes/Vibing/cleaningestion/data/ingestion
+
+# PubMed-only optimized run (parallel files, no per-batch throttle)
+python3 scripts/updates/weekly_update.py \
+  --data-dir /Volumes/Vibing/cleaningestion/data/ingestion \
+  --skip-dailymed --skip-pmc \
+  --file-workers 4 \
+  --batch-size 50 \
+  --throttle-seconds 0 \
+  --checkpoint-flush-size 500
+
+# PubMed catch-up from a fixed UTC date (ignores namespace last_write_at)
+python3 scripts/updates/weekly_update.py \
+  --data-dir /Volumes/Vibing/cleaningestion/data/ingestion \
+  --skip-dailymed --skip-pmc \
+  --since-date 2026-01-01 \
+  --file-workers 4 \
+  --batch-size 50 \
+  --throttle-seconds 0 \
+  --checkpoint-flush-size 500
+
+# PubMed lean payload mode (drops: token_count, source_family,
+# full_section_text, full_text, text_preview)
+python3 scripts/updates/weekly_update.py \
+  --data-dir /Volumes/Vibing/cleaningestion/data/ingestion \
+  --skip-dailymed --skip-pmc \
+  --lean-pubmed-payload
 
 # DailyMed-only direct refresh, streaming DailyMed daily ZIPs into Turbopuffer
 python3 scripts/updates/ingest_dailymed_updates_direct.py
